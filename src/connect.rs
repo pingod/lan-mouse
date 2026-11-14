@@ -138,6 +138,7 @@ impl LanMouseConnection {
 
     /// Handle of the first active client. Hotkeys use this to pick a peer
     /// without a capture barrier.
+    #[cfg(all(unix, not(target_os = "macos")))]
     pub(crate) fn first_active_client(&self) -> Option<ClientHandle> {
         self.client_manager.first_active_client()
     }

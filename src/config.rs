@@ -75,6 +75,7 @@ struct ConfigToml {
 
 /// A global hotkey: pressing `from` while typing locally sends `to` to the peer.
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
 struct TomlHotkey {
     from: Vec<scancode::Linux>,
     to: Vec<scancode::Linux>,
