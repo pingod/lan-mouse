@@ -151,6 +151,7 @@ impl ListenTask {
                             ProtoEvent::Enter(pos) => {
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
+                                    self.emulation_proxy.enter(addr);
                                     self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                                     self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
@@ -237,6 +238,8 @@ pub(crate) struct EmulationProxy {
 
 enum ProxyRequest {
     Input(Event, SocketAddr),
+    /// the peer entered this device again; clears any prior `Leave` latch
+    Enter(SocketAddr),
     Remove(SocketAddr),
     Terminate,
     Reenable,
@@ -254,6 +257,7 @@ impl EmulationProxy {
             request_rx,
             event_tx,
             handles: Default::default(),
+            left: Default::default(),
             next_id: 0,
         };
         let task = spawn_local(emulation_task.run());
@@ -286,6 +290,12 @@ impl EmulationProxy {
         }
     }
 
+    fn enter(&self, addr: SocketAddr) {
+        self.request_tx
+            .send(ProxyRequest::Enter(addr))
+            .expect("channel closed");
+    }
+
     fn remove(&self, addr: SocketAddr) {
         self.request_tx
             .send(ProxyRequest::Remove(addr))
@@ -313,6 +323,14 @@ struct EmulationTask {
     request_rx: Receiver<ProxyRequest>,
     event_tx: Sender<EmulationEvent>,
     handles: HashMap<SocketAddr, EmulationHandle>,
+    /// Peers that sent `Leave` and have not sent a new `Enter` since.
+    ///
+    /// Without this, an `Input` that arrives after `Leave` silently recreates
+    /// a handle and keeps injecting: the sender believes it released the
+    /// pointer while the receiver keeps typing into this machine (issue #542,
+    /// "release not taking effect"). Events from a left peer are dropped until
+    /// it enters again.
+    left: std::collections::HashSet<SocketAddr>,
     next_id: EmulationHandle,
 }
 
@@ -331,6 +349,7 @@ impl EmulationTask {
                     ProxyRequest::Reenable => break,
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::Enter(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
                 }
             }
@@ -385,6 +404,10 @@ impl EmulationTask {
             tokio::select! {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     ProxyRequest::Input(event, addr) => {
+                        if self.left.contains(&addr) {
+                            log::debug!("dropping input from {addr}: peer has left");
+                            continue;
+                        }
                         let handle = match self.handles.get(&addr) {
                             Some(&handle) => handle,
                             None => {
@@ -397,7 +420,11 @@ impl EmulationTask {
                         };
                         emulation.consume(event, handle).await?;
                     },
+                    ProxyRequest::Enter(addr) => {
+                        self.left.remove(&addr);
+                    }
                     ProxyRequest::Remove(addr) => {
+                        self.left.insert(addr);
                         if let Some(handle) = self.handles.remove(&addr) {
                             emulation.destroy(handle).await;
                         }
@@ -424,6 +451,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
         match rx.recv().await.expect("channel closed") {
             ProxyRequest::Terminate => return,
             ProxyRequest::Input(_, _) => continue,
+            ProxyRequest::Enter(_) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
         }
