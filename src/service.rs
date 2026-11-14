@@ -43,6 +43,8 @@ pub struct Service {
     capture: Capture,
     /// global hotkeys (work while the pointer stays local)
     hotkeys: Hotkeys,
+    /// whether the pointer is currently captured by a remote client
+    capturing: bool,
     /// input emulation
     emulation: Emulation,
     /// dns resolver
@@ -121,6 +123,7 @@ impl Service {
             config,
             capture,
             hotkeys,
+            capturing: false,
             emulation,
             frontend_listener,
             resolver,
@@ -158,7 +161,7 @@ impl Service {
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
-                keys = self.hotkeys.next() => self.hotkeys.send(keys).await,
+                keys = self.hotkeys.next() => self.hotkeys.send(keys, self.capturing).await,
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 _ = self.config.changed() => self.handle_config_change(),
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
@@ -368,10 +371,12 @@ impl Service {
             }
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
+                self.capturing = true;
                 self.spawn_hook_command(handle, HookKind::Enter);
             }
             ICaptureEvent::ClientLeft(handle) => {
                 log::info!("leaving client {handle} ...");
+                self.capturing = false;
                 self.spawn_hook_command(handle, HookKind::Leave);
             }
         }

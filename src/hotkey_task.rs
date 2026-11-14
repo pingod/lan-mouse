@@ -102,7 +102,14 @@ mod imp {
             }
         }
 
-        pub(crate) async fn send(&self, keys: Vec<u32>) {
+        /// `capture_active` reports whether the pointer is currently captured
+        /// by a remote client. While it is, the capture path already forwards
+        /// every keystroke, so firing here would send the chord twice.
+        pub(crate) async fn send(&self, keys: Vec<u32>, capture_active: bool) {
+            if capture_active {
+                log::trace!("hotkey suppressed: capture is forwarding input");
+                return;
+            }
             let Some(handle) = self.conn.first_active_client() else {
                 log::debug!("hotkey fired but no active client to receive it");
                 return;
@@ -153,6 +160,9 @@ mod imp {
         let dev = Arc::new(dev);
         let mut buf = [0u8; hotkey::EVENT_SIZE * 64];
         loop {
+            // `readable()` resolves when the fd has data; `try_io` then performs
+            // the read and re-arms readiness automatically. Returning `Err` from
+            // the closure means "would block" — the only expected non-event.
             let mut guard = match dev.readable().await {
                 Ok(g) => g,
                 Err(e) => {
@@ -160,10 +170,15 @@ mod imp {
                     return;
                 }
             };
-            match guard.try_io(|inner| {
+
+            let read = guard.try_io(|inner| {
                 use std::io::Read;
                 inner.get_ref().read(&mut buf)
-            }) {
+            });
+
+            match read {
+                // would block: readiness was a false positive, just retry
+                Err(_) => continue,
                 Ok(Ok(0)) => return,
                 Ok(Ok(n)) => {
                     let mut closed = false;
@@ -180,9 +195,7 @@ mod imp {
                     log::warn!("hotkeys: read error on {}: {e}", path.display());
                     return;
                 }
-                Err(_would_block) => {}
             }
-            guard.clear_ready();
         }
     }
 }
@@ -209,6 +222,6 @@ mod noop {
             unreachable!()
         }
 
-        pub(crate) async fn send(&self, _keys: Vec<u32>) {}
+        pub(crate) async fn send(&self, _keys: Vec<u32>, _capture_active: bool) {}
     }
 }

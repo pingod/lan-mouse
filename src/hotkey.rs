@@ -78,11 +78,34 @@ pub(crate) fn open_keyboards() -> Vec<(PathBuf, AsyncFd<File>)> {
 }
 
 fn open_device(path: &Path) -> std::io::Result<AsyncFd<File>> {
-    let file = std::fs::OpenOptions::new()
+    let mut file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)?;
+
+    // Discard whatever the kernel already queued for this device.
+    //
+    // Opening an evdev node can hand back events that were pending before we
+    // opened it (the service starting up, a key held during boot, a device
+    // that just re-appeared). Feeding those to the hotkey matcher makes it
+    // fire on keystrokes the user never performed while we were listening —
+    // observed as a burst of spurious triggers right after login.
+    drain(&mut file);
+
     AsyncFd::new(file)
+}
+
+/// Read until the device reports nothing more.
+fn drain(file: &mut File) {
+    let mut buf = [0u8; EVENT_SIZE * 64];
+    loop {
+        match std::io::Read::read(file, &mut buf) {
+            Ok(0) => return,
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(_) => return,
+        }
+    }
 }
 
 /// Whether the device reports keys (a keyboard, a mouse with buttons, …).
