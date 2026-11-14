@@ -69,6 +69,14 @@ struct ConfigToml {
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
+    remap: Option<Vec<TomlRule>>,
+}
+
+/// A chord rule: pressing all keys in `from` emits `to` on the peer.
+#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+struct TomlRule {
+    from: Vec<scancode::Linux>,
+    to: Vec<scancode::Linux>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -500,6 +508,20 @@ impl Config {
             .unwrap_or(Vec::from_iter(DEFAULT_RELEASE_KEYS.iter().cloned()))
     }
 
+    /// chord remapping rules applied to captured keyboard events
+    pub(crate) fn remap_rules(&self) -> Vec<crate::remap::Rule> {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.remap.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| crate::remap::Rule {
+                from: r.from.into_iter().map(|k| k as u32).collect(),
+                to: r.to.into_iter().map(|k| k as u32).collect(),
+            })
+            .collect()
+    }
+
     /// set configured clients
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
         if clients.is_empty() {
@@ -582,5 +604,58 @@ impl Config {
         let _ = self.watch();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remap_rules_are_parsed_from_toml() {
+        let toml = r#"
+[[remap]]
+from = ["KeyLeftShift", "KeyLeftAlt", "KeyS"]
+to = ["KeyS"]
+
+[[remap]]
+from = ["KeyLeftMeta", "KeyC"]
+to = ["KeyLeftCtrl", "KeyC"]
+"#;
+        let config: ConfigToml = toml::from_str(toml).expect("valid config");
+        let remap = config.remap.expect("remap section");
+        assert_eq!(remap.len(), 2);
+        assert_eq!(
+            remap[0].from,
+            vec![
+                scancode::Linux::KeyLeftShift,
+                scancode::Linux::KeyLeftAlt,
+                scancode::Linux::KeyS
+            ]
+        );
+        assert_eq!(remap[0].to, vec![scancode::Linux::KeyS]);
+        assert_eq!(
+            remap[1].to,
+            vec![scancode::Linux::KeyLeftCtrl, scancode::Linux::KeyC]
+        );
+    }
+
+    #[test]
+    fn config_without_remap_still_parses() {
+        let config: ConfigToml = toml::from_str("port = 4242").expect("valid config");
+        assert!(config.remap.is_none());
+    }
+
+    #[test]
+    fn remap_round_trips_through_serialization() {
+        let toml = r#"
+[[remap]]
+from = ["KeyLeftShift", "KeyLeftAlt", "KeyS"]
+to = ["KeyS"]
+"#;
+        let config: ConfigToml = toml::from_str(toml).expect("valid config");
+        let out = toml_edit::ser::to_string_pretty(&config).expect("serialize");
+        let parsed: ConfigToml = toml::from_str(&out).expect("reparse");
+        assert_eq!(parsed, config);
     }
 }
