@@ -22,6 +22,13 @@ pub(crate) struct Capture {
     request_tx: Sender<CaptureRequest>,
     task: JoinHandle<()>,
     event_rx: Receiver<ICaptureEvent>,
+    /// whether the pointer is currently captured by a remote client
+    ///
+    /// Updated by the capture task itself rather than derived from the
+    /// `ClientEntered`/`ClientLeft` event stream: those are hints for hooks,
+    /// and a single missed or duplicated one left the service believing the
+    /// pointer was captured when it was not.
+    active: Rc<Cell<bool>>,
 }
 
 pub(crate) enum ICaptureEvent {
@@ -83,6 +90,7 @@ impl Capture {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let cancellation_token = CancellationToken::new();
+        let active = Rc::new(Cell::new(false));
         let capture_task = CaptureTask {
             active_client: None,
             backend,
@@ -92,6 +100,7 @@ impl Capture {
             event_tx,
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
+            active: active.clone(),
             remap: Remap::new(remap_rules),
             entered_at: None,
             state: Default::default(),
@@ -102,6 +111,7 @@ impl Capture {
             request_tx,
             task,
             event_rx,
+            active,
         }
     }
 
@@ -151,6 +161,11 @@ impl Capture {
         let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
     }
 
+    /// Whether a remote client currently holds the pointer.
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.get()
+    }
+
     pub(crate) fn set_remap_rules(&mut self, rules: Vec<Rule>) {
         let _ = self.request_tx.send(CaptureRequest::SetRemapRules(rules));
     }
@@ -182,6 +197,8 @@ struct CaptureTask {
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     remap: Remap,
+    /// mirror of `Capture::active`, kept in sync by this task
+    active: Rc<Cell<bool>>,
     /// when the active client acknowledged the connection
     entered_at: Option<Instant>,
     request_rx: Receiver<CaptureRequest>,
@@ -402,6 +419,7 @@ impl CaptureTask {
         if event == CaptureEvent::Begin && Some(handle) != self.active_client {
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
+            self.active.set(true);
             self.event_tx
                 .send(ICaptureEvent::ClientEntered(handle))
                 .expect("channel closed");
@@ -440,6 +458,7 @@ impl CaptureTask {
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
         // If we have an active client, notify them we're leaving
+        self.active.set(false);
         if let Some(handle) = self.active_client.take() {
             // Surface the leave to the service layer so it can fire
             // the per-client leave_hook. Sent before the network
