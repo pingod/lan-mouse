@@ -70,6 +70,14 @@ struct ConfigToml {
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
     remap: Option<Vec<TomlRule>>,
+    hotkey: Option<Vec<TomlHotkey>>,
+}
+
+/// A global hotkey: pressing `from` while typing locally sends `to` to the peer.
+#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+struct TomlHotkey {
+    from: Vec<scancode::Linux>,
+    to: Vec<scancode::Linux>,
 }
 
 /// A chord rule: pressing all keys in `from` emits `to` on the peer.
@@ -518,6 +526,20 @@ impl Config {
             .map(|r| crate::remap::Rule {
                 from: r.from.into_iter().map(|k| k as u32).collect(),
                 to: r.to.into_iter().map(|k| k as u32).collect(),
+            })
+            .collect()
+    }
+
+    /// global hotkeys that fire even while the pointer stays local
+    pub(crate) fn hotkeys(&self) -> Vec<crate::hotkey::Hotkey> {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.hotkey.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|h| crate::hotkey::Hotkey {
+                from: h.from.into_iter().map(|k| k as u32).collect(),
+                to: h.to.into_iter().map(|k| k as u32).collect(),
             })
             .collect()
     }

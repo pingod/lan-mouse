@@ -6,6 +6,7 @@ use crate::{
     crypto,
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
+    hotkey_task::HotkeyTask,
     listen::{LanMouseListener, ListenerCreationError},
 };
 use futures::StreamExt;
@@ -40,6 +41,8 @@ pub struct Service {
     config: Config,
     /// input capture
     capture: Capture,
+    /// global hotkeys (work while the pointer stays local)
+    hotkeys: HotkeyTask,
     /// input emulation
     emulation: Emulation,
     /// dns resolver
@@ -95,6 +98,9 @@ impl Service {
         let listener =
             LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
         let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
+        // global hotkeys: these must fire while the pointer is still local, so
+        // they read evdev directly instead of going through the capture backend
+        let hotkeys = HotkeyTask::new(config.hotkeys(), conn.clone());
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -114,6 +120,7 @@ impl Service {
         let service = Self {
             config,
             capture,
+            hotkeys,
             emulation,
             frontend_listener,
             resolver,
@@ -151,6 +158,7 @@ impl Service {
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
+                keys = self.hotkeys.next() => self.hotkeys.send(&keys).await,
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 _ = self.config.changed() => self.handle_config_change(),
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
@@ -265,6 +273,7 @@ impl Service {
         let release_bind = self.config.release_bind();
         self.capture.set_release_bind(release_bind);
         self.capture.set_remap_rules(self.config.remap_rules());
+        self.hotkeys.set_hotkeys(self.config.hotkeys());
         let authorized_keys = self.config.authorized_fingerprints();
         self.authorized_keys
             .write()

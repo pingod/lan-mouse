@@ -92,14 +92,34 @@ async fn connect_any(
     }
 }
 
+/// Shared handle to the connection set. Cloning yields another handle to the
+/// same connections and client state — used by the hotkey task, which must be
+/// able to send without owning the capture side.
 pub(crate) struct LanMouseConnection {
     cert: Certificate,
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
+    /// Only the primary handle owns the receiving end; clones created for
+    /// other tasks (hotkeys) get `None` so events cannot be split between two
+    /// readers.
+    recv_rx: Option<Receiver<(ClientHandle, ProtoEvent)>>,
     recv_tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+}
+
+impl Clone for LanMouseConnection {
+    fn clone(&self) -> Self {
+        Self {
+            cert: self.cert.clone(),
+            client_manager: self.client_manager.clone(),
+            conns: self.conns.clone(),
+            connecting: self.connecting.clone(),
+            recv_rx: None,
+            recv_tx: self.recv_tx.clone(),
+            ping_response: self.ping_response.clone(),
+        }
+    }
 }
 
 impl LanMouseConnection {
@@ -110,14 +130,25 @@ impl LanMouseConnection {
             client_manager,
             conns: Default::default(),
             connecting: Default::default(),
-            recv_rx,
+            recv_rx: Some(recv_rx),
             recv_tx,
             ping_response: Default::default(),
         }
     }
 
+    /// Handle of the first active client. Hotkeys use this to pick a peer
+    /// without a capture barrier.
+    pub(crate) fn first_active_client(&self) -> Option<ClientHandle> {
+        self.client_manager.first_active_client()
+    }
+
     pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
-        self.recv_rx.recv().await.expect("channel closed")
+        self.recv_rx
+            .as_mut()
+            .expect("recv() on a cloned connection handle")
+            .recv()
+            .await
+            .expect("channel closed")
     }
 
     pub(crate) async fn send(
