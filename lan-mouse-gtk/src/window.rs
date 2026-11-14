@@ -307,6 +307,116 @@ impl Window {
         }
     }
 
+    /// Render the daemon's hotkey rules.
+    pub(super) fn set_hotkeys(&self, rules: Vec<(String, String)>) {
+        let list = self.imp().hotkey_list.get();
+        while let Some(child) = list.first_child() {
+            list.remove(&child);
+        }
+
+        for (idx, (from, to)) in rules.iter().enumerate() {
+            let row = adw::ActionRow::builder()
+                .title(from.as_str())
+                .subtitle(format!("sends {to}"))
+                .build();
+
+            let delete = gtk::Button::builder()
+                .icon_name("user-trash-symbolic")
+                .valign(gtk::Align::Center)
+                .tooltip_text("remove this hotkey")
+                .build();
+            let window = self.clone();
+            delete.connect_clicked(move |_| {
+                window.request(FrontendRequest::RemoveHotkey(idx));
+            });
+            row.add_suffix(&delete);
+
+            list.append(&row);
+        }
+
+        self.imp()
+            .hotkey_placeholder_row
+            .set_visible(rules.is_empty());
+    }
+
+    /// Ask the daemon for the hotkey rules, version and autostart state.
+    pub(super) fn request_initial_state(&self) {
+        self.request(FrontendRequest::EnumerateHotkeys);
+        self.request(FrontendRequest::EnumerateVersion);
+    }
+
+    pub(super) fn set_version(&self, version: &str, commit: &str) {
+        self.imp()
+            .version_row
+            .set_subtitle(&format!("{version} ({commit})"));
+    }
+
+    pub(super) fn set_autostart(&self, enabled: bool) {
+        let imp = self.imp();
+        imp.autostart_updating.set(true);
+        imp.autostart_switch.set_active(enabled);
+        imp.autostart_updating.set(false);
+    }
+
+    pub(super) fn request_autostart(&self, enabled: bool) {
+        self.request(FrontendRequest::SetAutostart(enabled));
+    }
+
+    /// Prompt for `from` and `to`, then add the rule.
+    pub(super) fn open_hotkey_dialog(&self) {
+        let dialog = gtk::Dialog::builder()
+            .transient_for(self)
+            .modal(true)
+            .title("Add hotkey")
+            .build();
+
+        let from_entry = gtk::Entry::builder()
+            .placeholder_text("Shift+Alt+Z")
+            .text("Shift+Alt+Z")
+            .build();
+        let to_entry = gtk::Entry::builder()
+            .placeholder_text("Z")
+            .text("Z")
+            .build();
+
+        let box_ = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        box_.set_margin_top(12);
+        box_.set_margin_bottom(12);
+        box_.set_margin_start(12);
+        box_.set_margin_end(12);
+        box_.append(
+            &gtk::Label::builder()
+                .label("Local keys — sent to the other machine, your own keystroke still works")
+                .xalign(0.0)
+                .wrap(true)
+                .build(),
+        );
+        box_.append(&from_entry);
+        box_.append(
+            &gtk::Label::builder()
+                .label("Keys sent to the peer")
+                .xalign(0.0)
+                .build(),
+        );
+        box_.append(&to_entry);
+
+        dialog.content_area().append(&box_);
+        dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+        dialog.add_button("Add", gtk::ResponseType::Accept);
+        dialog.set_default_response(gtk::ResponseType::Accept);
+
+        let window = self.clone();
+        dialog.connect_response(move |dialog, response| {
+            if response == gtk::ResponseType::Accept {
+                let from = from_entry.text().to_string();
+                let to = to_entry.text().to_string();
+                window.request(FrontendRequest::AddHotkey(from, to));
+            }
+            dialog.close();
+        });
+        dialog.present();
+    }
+
     pub(super) fn update_port(&self, port: u16, msg: Option<String>) {
         if let Some(msg) = msg {
             self.show_toast(msg.as_str());

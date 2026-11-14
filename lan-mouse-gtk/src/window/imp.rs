@@ -45,6 +45,14 @@ pub struct Window {
     pub input_capture_button: TemplateChild<Button>,
     #[template_child]
     pub authorized_list: TemplateChild<ListBox>,
+    #[template_child]
+    pub hotkey_list: TemplateChild<ListBox>,
+    #[template_child]
+    pub hotkey_placeholder_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub version_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub autostart_switch: TemplateChild<gtk::Switch>,
     pub clients: RefCell<Option<gio::ListStore>>,
     pub authorized: RefCell<Option<gio::ListStore>>,
     pub frontend_request_writer: RefCell<Option<FrontendRequestWriter>>,
@@ -52,6 +60,8 @@ pub struct Window {
     pub capture_active: Cell<bool>,
     pub emulation_active: Cell<bool>,
     pub authorization_window: RefCell<Option<AuthorizationWindow>>,
+    /// set while the autostart switch is being updated from the daemon
+    pub autostart_updating: Cell<bool>,
 }
 
 #[glib::object_subclass]
@@ -75,6 +85,23 @@ impl ObjectSubclass for Window {
 
 #[gtk::template_callbacks]
 impl Window {
+    #[template_callback]
+    fn handle_add_hotkey_pressed(&self, _button: &Button) {
+        self.obj().open_hotkey_dialog();
+    }
+
+    /// `notify::active` delivers a `GParamSpec`, not the switch itself.
+    #[template_callback]
+    fn handle_autostart_toggled(&self, _param: glib::ParamSpec) {
+        // Setting the state from the daemon also emits `notify::active`;
+        // only forward real user toggles.
+        if self.autostart_updating.get() {
+            return;
+        }
+        let active = self.autostart_switch.is_active();
+        self.obj().request_autostart(active);
+    }
+
     #[template_callback]
     fn handle_add_client_pressed(&self, _button: &Button) {
         self.obj().request_client_create();

@@ -40,6 +40,11 @@ pub fn local_commit() -> [u8; 8] {
     out
 }
 
+/// Short commit hash of this build, for the GUI's version line.
+pub fn local_commit_string() -> String {
+    build::SHORT_COMMIT.to_owned()
+}
+
 const CONFIG_FILE_NAME: &str = "config.toml";
 const CERT_FILE_NAME: &str = "lan-mouse.pem";
 
@@ -74,15 +79,9 @@ struct ConfigToml {
 }
 
 /// A global hotkey: pressing `from` while typing locally sends `to` to the peer.
-///
-/// Parsed on every platform (the field is part of the config schema) but only
-/// read by the Linux evdev listener, hence the `dead_code` allowance elsewhere.
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
-#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
 struct TomlHotkey {
-    #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
     from: Vec<scancode::Linux>,
-    #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
     to: Vec<scancode::Linux>,
 }
 
@@ -537,18 +536,48 @@ impl Config {
     }
 
     /// global hotkeys that fire even while the pointer stays local
-    #[cfg(all(unix, not(target_os = "macos")))]
-    pub(crate) fn hotkeys(&self) -> Vec<crate::hotkey::Hotkey> {
+    ///
+    /// Parsed on every platform so the GUI can display and edit the rules; only
+    /// the Linux evdev listener acts on them.
+    pub(crate) fn hotkeys(&self) -> Vec<crate::hotkey_task::Hotkey> {
         self.config_toml
             .as_ref()
             .and_then(|c| c.hotkey.clone())
             .unwrap_or_default()
             .into_iter()
-            .map(|h| crate::hotkey::Hotkey {
+            .map(|h| crate::hotkey_task::Hotkey {
                 from: h.from.into_iter().map(|k| k as u32).collect(),
                 to: h.to.into_iter().map(|k| k as u32).collect(),
             })
             .collect()
+    }
+
+    /// replace the persisted global hotkey rules
+    pub(crate) fn set_hotkeys(&mut self, hotkeys: Vec<crate::hotkey_task::Hotkey>) {
+        if self.config_toml.is_none() {
+            self.config_toml = Some(Default::default());
+        }
+        let rules = hotkeys
+            .into_iter()
+            .map(|h| TomlHotkey {
+                from: h
+                    .from
+                    .into_iter()
+                    .filter_map(|k| scancode::Linux::try_from(k).ok())
+                    .collect(),
+                to: h
+                    .to
+                    .into_iter()
+                    .filter_map(|k| scancode::Linux::try_from(k).ok())
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let cfg = self.config_toml.as_mut().expect("config");
+        if rules.is_empty() {
+            cfg.hotkey = None;
+        } else {
+            cfg.hotkey = Some(rules);
+        }
     }
 
     /// set configured clients

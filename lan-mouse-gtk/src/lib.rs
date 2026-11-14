@@ -246,6 +246,9 @@ fn build_ui(app: &Application) {
     });
 
     let window = Window::new(app, frontend_tx);
+    // Ask the daemon for the hotkey rules, version and autostart state as soon
+    // as the window exists, so the UI is populated before the first event.
+    window.request_initial_state();
     #[cfg(target_os = "macos")]
     {
         window.connect_close_request(|window| {
@@ -324,6 +327,16 @@ fn build_ui(app: &Application) {
                     FrontendEvent::IncomingDisconnected(addr) => {
                         window.show_toast(format!("{addr} disconnected").as_str());
                     }
+                    FrontendEvent::Hotkeys(rules) => window.set_hotkeys(rules),
+                    FrontendEvent::Version {
+                        version,
+                        commit,
+                        autostart,
+                    } => {
+                        window.set_version(&version, &commit);
+                        window.set_autostart(autostart);
+                    }
+                    FrontendEvent::Autostart(enabled) => window.set_autostart(enabled),
                 }
             }
         }

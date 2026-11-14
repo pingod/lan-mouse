@@ -226,6 +226,17 @@ pub enum FrontendEvent {
     IncomingDisconnected(SocketAddr),
     /// failed connection attempt (approval for fingerprint required)
     ConnectionAttempt { fingerprint: String },
+    /// current global hotkey rules
+    Hotkeys(Vec<(String, String)>),
+    /// version information of this build
+    Version {
+        version: String,
+        commit: String,
+        /// whether the autostart entry is currently installed
+        autostart: bool,
+    },
+    /// whether autostart is installed (sent after a toggle)
+    Autostart(bool),
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
@@ -266,6 +277,16 @@ pub enum FrontendRequest {
     UpdateLeaveHook(u64, Option<String>),
     /// save config file
     SaveConfiguration,
+    /// request the current hotkey rules
+    EnumerateHotkeys,
+    /// add a global hotkey (from, to) as human-readable key names
+    AddHotkey(String, String),
+    /// remove the global hotkey with this index
+    RemoveHotkey(usize),
+    /// request version information
+    EnumerateVersion,
+    /// enable or disable starting with the session
+    SetAutostart(bool),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

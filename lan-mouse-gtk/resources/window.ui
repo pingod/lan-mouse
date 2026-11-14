@@ -196,6 +196,61 @@
                             </child>
                           </object>
                         </child>
+                        <child>
+                          <object class="AdwActionRow" id="autostart_row">
+                            <property name="title" translatable="yes">start with session</property>
+                            <property name="subtitle" translatable="yes">launch lan-mouse automatically at login</property>
+                            <property name="icon-name">system-run-symbolic</property>
+                            <child>
+                              <object class="GtkSwitch" id="autostart_switch">
+                                <property name="valign">center</property>
+                                <signal name="notify::active" handler="handle_autostart_toggled" swapped="true"/>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="AdwActionRow" id="version_row">
+                            <property name="title" translatable="yes">version</property>
+                            <property name="subtitle">-</property>
+                            <property name="icon-name">help-about-symbolic</property>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="AdwPreferencesGroup">
+                        <property name="title" translatable="yes">Hotkeys</property>
+                        <property name="description" translatable="yes">Fire a key on the other machine while you keep typing here. The local keystroke is not intercepted.</property>
+                        <property name="header-suffix">
+                          <object class="GtkButton" id="add_hotkey_button">
+                            <signal name="clicked" handler="handle_add_hotkey_pressed" swapped="true"/>
+                            <property name="child">
+                              <object class="AdwButtonContent">
+                                <property name="icon-name">list-add-symbolic</property>
+                                <property name="label" translatable="yes">Add</property>
+                              </object>
+                            </property>
+                            <style>
+                              <class name="flat"/>
+                            </style>
+                          </object>
+                        </property>
+                        <child>
+                          <object class="GtkListBox" id="hotkey_list">
+                            <property name="selection-mode">none</property>
+                            <property name="show-separators">true</property>
+                            <style>
+                              <class name="boxed-list"/>
+                            </style>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="AdwActionRow" id="hotkey_placeholder_row">
+                            <property name="title" translatable="yes">No hotkeys</property>
+                            <property name="subtitle" translatable="yes">add a rule with the + button</property>
+                          </object>
+                        </child>
                       </object>
                     </child>
                     <child>

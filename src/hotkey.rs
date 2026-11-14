@@ -29,12 +29,7 @@ pub(crate) const EVENT_SIZE: usize = 24;
 const EV_KEY: u16 = 0x01;
 const EV_SYN: u16 = 0x00;
 
-/// A hotkey rule: pressing every key in `from` sends `to` to the peer.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Hotkey {
-    pub from: Vec<u32>,
-    pub to: Vec<u32>,
-}
+pub(crate) use crate::hotkey_task::Hotkey;
 
 /// One key event read from a device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

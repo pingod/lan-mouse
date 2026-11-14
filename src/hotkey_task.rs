@@ -15,6 +15,16 @@ pub(crate) use imp::Hotkeys;
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 pub(crate) use noop::Hotkeys;
 
+/// A global hotkey rule: pressing every key in `from` sends `to` to the peer.
+///
+/// Defined here rather than in `hotkey` because the config and the GUI need it
+/// on every platform, while the evdev listener does not exist off Linux.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Hotkey {
+    pub from: Vec<u32>,
+    pub to: Vec<u32>,
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 mod imp {
     use std::{path::PathBuf, sync::Arc};
@@ -22,6 +32,7 @@ mod imp {
     use tokio::io::unix::AsyncFd;
     use tokio::sync::mpsc;
 
+    use super::Hotkey;
     use crate::{
         config::Config,
         connect::{LanMouseConnection, LanMouseConnectionError},
@@ -75,6 +86,17 @@ mod imp {
                 .into_iter()
                 .map(|(path, dev)| tokio::task::spawn_local(read_device(path, dev, key_tx.clone())))
                 .collect()
+        }
+
+        /// Replace the rules from the GUI.
+        pub(crate) fn set_hotkeys(&mut self, hotkeys: Vec<Hotkey>) {
+            let was_empty = self.state.is_empty();
+            self.state.set_hotkeys(hotkeys.clone());
+            if was_empty && !hotkeys.is_empty() && self.readers.is_empty() {
+                let (key_tx, key_rx) = mpsc::unbounded_channel();
+                self.key_rx = key_rx;
+                self.readers = Self::spawn_readers(key_tx);
+            }
         }
 
         pub(crate) fn reload(&mut self, config: &Config) {
@@ -214,6 +236,8 @@ mod noop {
         pub(crate) fn new(_config: &Config, _conn: LanMouseConnection) -> Self {
             Self
         }
+
+        pub(crate) fn set_hotkeys(&mut self, _hotkeys: Vec<super::Hotkey>) {}
 
         pub(crate) fn reload(&mut self, _config: &Config) {}
 

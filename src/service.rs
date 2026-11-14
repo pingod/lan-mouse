@@ -231,7 +231,93 @@ impl Service {
                 self.update_leave_hook(handle, leave_hook)
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
+            FrontendRequest::EnumerateHotkeys => self.notify_hotkeys(),
+            FrontendRequest::AddHotkey(from, to) => self.add_hotkey(&from, &to),
+            FrontendRequest::RemoveHotkey(idx) => self.remove_hotkey(idx),
+            FrontendRequest::EnumerateVersion => self.notify_version(),
+            FrontendRequest::SetAutostart(enabled) => self.set_autostart(enabled),
         }
+    }
+
+    /// Add a hotkey rule from human-readable key names (`"Shift+Alt+Z"`).
+    fn add_hotkey(&mut self, from: &str, to: &str) {
+        let from_keys = match parse_keys(from) {
+            Ok(k) if !k.is_empty() => k,
+            Ok(_) => return self.hotkey_error("no keys given"),
+            Err(e) => return self.hotkey_error(&e),
+        };
+        let to_keys = match parse_keys(to) {
+            Ok(k) if !k.is_empty() => k,
+            Ok(_) => return self.hotkey_error("no target keys given"),
+            Err(e) => return self.hotkey_error(&e),
+        };
+
+        let mut rules = self.config.hotkeys();
+        if rules.iter().any(|r| r.from == from_keys && r.to == to_keys) {
+            return self.notify_hotkeys();
+        }
+        rules.push(crate::hotkey_task::Hotkey {
+            from: from_keys,
+            to: to_keys,
+        });
+        self.apply_hotkeys(rules);
+    }
+
+    fn remove_hotkey(&mut self, idx: usize) {
+        let mut rules = self.config.hotkeys();
+        if idx >= rules.len() {
+            return self.hotkey_error("no such hotkey");
+        }
+        rules.remove(idx);
+        self.apply_hotkeys(rules);
+    }
+
+    /// Persist `rules`, push them to the live listener and refresh the UI.
+    fn apply_hotkeys(&mut self, rules: Vec<crate::hotkey_task::Hotkey>) {
+        self.config.set_hotkeys(rules.clone());
+        self.hotkeys.set_hotkeys(rules);
+        self.save_config();
+        self.notify_hotkeys();
+    }
+
+    fn hotkey_error(&mut self, msg: &str) {
+        log::warn!("hotkey: {msg}");
+        self.notify_frontend(FrontendEvent::Error(msg.to_owned()));
+        self.notify_hotkeys();
+    }
+
+    /// Send the current hotkey rules to the frontend.
+    fn notify_hotkeys(&mut self) {
+        let rules = self
+            .config
+            .hotkeys()
+            .into_iter()
+            .map(|h| (format_keys(&h.from), format_keys(&h.to)))
+            .collect();
+        self.notify_frontend(FrontendEvent::Hotkeys(rules));
+    }
+
+    fn notify_version(&mut self) {
+        self.notify_frontend(FrontendEvent::Version {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            commit: crate::config::local_commit_string(),
+            autostart: crate::autostart::is_enabled(),
+        });
+    }
+
+    fn set_autostart(&mut self, enabled: bool) {
+        match crate::autostart::set_enabled(enabled) {
+            Ok(()) => {
+                log::info!("autostart {}", if enabled { "enabled" } else { "disabled" });
+            }
+            Err(e) => {
+                log::warn!("failed to change autostart: {e}");
+                self.notify_frontend(FrontendEvent::Error(format!(
+                    "could not change autostart: {e}"
+                )));
+            }
+        }
+        self.notify_frontend(FrontendEvent::Autostart(crate::autostart::is_enabled()));
     }
 
     fn save_config(&mut self) {
@@ -652,4 +738,63 @@ impl std::fmt::Display for HookKind {
             HookKind::Leave => f.write_str("leave"),
         }
     }
+}
+
+/// Render scancodes as the human-readable names used by the GUI (`"Shift+Alt+Z"`).
+fn format_keys(keys: &[u32]) -> String {
+    keys.iter()
+        .map(|&k| match input_event::scancode::Linux::try_from(k) {
+            Ok(s) => format!("{s:?}"),
+            Err(_) => format!("0x{k:x}"),
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+/// Parse `"Shift+Alt+Z"` into scancodes.
+///
+/// Names follow the `scancode::Linux` variants so the GUI, the config file and
+/// the logs all use one vocabulary. A leading `Key` may be omitted, and the
+/// side modifiers accept both `Shift` and `LeftShift`.
+fn parse_keys(spec: &str) -> Result<Vec<u32>, String> {
+    use input_event::scancode::Linux;
+
+    let mut out = Vec::new();
+    for raw in spec.split('+') {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let canonical = match name.to_ascii_lowercase().as_str() {
+            "shift" | "lshift" | "leftshift" => "KeyLeftShift".to_string(),
+            "rshift" | "rightshift" => "KeyRightShift".to_string(),
+            "ctrl" | "control" | "lctrl" | "leftctrl" => "KeyLeftCtrl".to_string(),
+            "rctrl" | "rightctrl" => "KeyRightCtrl".to_string(),
+            "alt" | "lalt" | "leftalt" => "KeyLeftAlt".to_string(),
+            "ralt" | "rightalt" | "altgr" => "KeyRightalt".to_string(),
+            "super" | "meta" | "win" | "lmeta" => "KeyLeftMeta".to_string(),
+            "rmeta" => "KeyRightmeta".to_string(),
+            other => {
+                // accept `KeyA` and bare `A`, case-insensitively
+                let stripped = other.strip_prefix("key").unwrap_or(other);
+                if stripped.chars().count() == 1 {
+                    let c = stripped.to_ascii_uppercase();
+                    format!("Key{c}")
+                } else {
+                    let mut chars = stripped.chars();
+                    match chars.next() {
+                        Some(first) => {
+                            format!("Key{}{}", first.to_ascii_uppercase(), chars.as_str())
+                        }
+                        None => continue,
+                    }
+                }
+            }
+        };
+        match toml::from_str::<Linux>(&format!("\"{canonical}\"")) {
+            Ok(k) => out.push(k as u32),
+            Err(_) => return Err(format!("unknown key `{name}`")),
+        }
+    }
+    Ok(out)
 }
