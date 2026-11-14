@@ -1,5 +1,4 @@
-#[cfg(all(unix, not(target_os = "macos")))]
-use crate::hotkey_task::HotkeyTask;
+use crate::hotkey_task::Hotkeys;
 use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
@@ -43,8 +42,7 @@ pub struct Service {
     /// input capture
     capture: Capture,
     /// global hotkeys (work while the pointer stays local)
-    #[cfg(all(unix, not(target_os = "macos")))]
-    hotkeys: HotkeyTask,
+    hotkeys: Hotkeys,
     /// input emulation
     emulation: Emulation,
     /// dns resolver
@@ -102,8 +100,7 @@ impl Service {
         let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
         // global hotkeys: these must fire while the pointer is still local, so
         // they read evdev directly instead of going through the capture backend
-        #[cfg(all(unix, not(target_os = "macos")))]
-        let hotkeys = HotkeyTask::new(config.hotkeys(), conn.clone());
+        let hotkeys = Hotkeys::new(&config, conn.clone());
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -123,7 +120,6 @@ impl Service {
         let service = Self {
             config,
             capture,
-            #[cfg(all(unix, not(target_os = "macos")))]
             hotkeys,
             emulation,
             frontend_listener,
@@ -162,7 +158,7 @@ impl Service {
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
-                keys = next_hotkey(&mut self.hotkeys) => send_hotkey(&self.hotkeys, keys).await,
+                keys = self.hotkeys.next() => self.hotkeys.send(keys).await,
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 _ = self.config.changed() => self.handle_config_change(),
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
@@ -277,8 +273,7 @@ impl Service {
         let release_bind = self.config.release_bind();
         self.capture.set_release_bind(release_bind);
         self.capture.set_remap_rules(self.config.remap_rules());
-        #[cfg(all(unix, not(target_os = "macos")))]
-        self.hotkeys.set_hotkeys(self.config.hotkeys());
+        self.hotkeys.reload(&self.config);
         let authorized_keys = self.config.authorized_fingerprints();
         self.authorized_keys
             .write()
@@ -658,27 +653,3 @@ impl std::fmt::Display for HookKind {
         }
     }
 }
-
-/// Wait for a global hotkey.
-///
-/// Takes the listener by field rather than `&mut self` so it can sit in the
-/// service's `select!` next to the other arms. Where the evdev listener does
-/// not exist this never resolves, leaving the arm idle.
-#[cfg(all(unix, not(target_os = "macos")))]
-async fn next_hotkey(task: &mut HotkeyTask) -> Vec<u32> {
-    task.next().await
-}
-
-#[cfg(not(all(unix, not(target_os = "macos"))))]
-async fn next_hotkey<T>(_: &mut T) -> Vec<u32> {
-    std::future::pending::<()>().await;
-    unreachable!()
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-async fn send_hotkey(task: &HotkeyTask, keys: Vec<u32>) {
-    task.send(&keys).await;
-}
-
-#[cfg(not(all(unix, not(target_os = "macos"))))]
-async fn send_hotkey<T>(_: &T, _keys: Vec<u32>) {}
