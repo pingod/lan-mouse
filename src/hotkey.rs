@@ -400,6 +400,33 @@ mod tests {
     }
 
     #[test]
+    fn stale_events_do_not_fire_after_drain() {
+        // Regression: opening an evdev node returns events queued *before* the
+        // open, which made the service fire chords on keystrokes the user never
+        // made while it was listening (observed as a burst right after boot).
+        // The drain helper consumes them, so the matcher starts clean.
+        let dir = std::env::temp_dir().join(format!("lm-hotkey-drain-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("stale");
+        let mut ev = vec![0u8; EVENT_SIZE];
+        ev[16..18].copy_from_slice(&EV_KEY.to_ne_bytes());
+        ev[18..20].copy_from_slice(&(KeyS as u16).to_ne_bytes());
+        ev[20..24].copy_from_slice(&1u32.to_ne_bytes());
+        std::fs::write(&path, &ev).expect("write");
+
+        let mut file = std::fs::File::open(&path).expect("open");
+        drain(&mut file);
+
+        // nothing left: a non-blocking read now returns nothing
+        use std::io::Read;
+        let mut buf = [0u8; EVENT_SIZE];
+        let n = file.read(&mut buf).expect("read");
+        assert_eq!(n, 0, "drain must consume everything");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn parses_input_event_struct() {
         let mut buf = Vec::new();
         // one EV_KEY press of KEY_S, one EV_SYN

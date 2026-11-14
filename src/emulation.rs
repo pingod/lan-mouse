@@ -404,7 +404,7 @@ impl EmulationTask {
             tokio::select! {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     ProxyRequest::Input(event, addr) => {
-                        if self.left.contains(&addr) {
+                        if !should_accept_input(&self.left, addr) {
                             log::debug!("dropping input from {addr}: peer has left");
                             continue;
                         }
@@ -476,5 +476,52 @@ impl<T> Drop for DropGuard<T> {
         self.tx
             .send(self.on_drop.take().expect("item"))
             .expect("channel closed");
+    }
+}
+
+/// Whether input from `addr` should be injected.
+///
+/// A peer that sent `Leave` gave the pointer back; late events must not be
+/// injected until it enters again (issue #542).
+fn should_accept_input(left: &std::collections::HashSet<SocketAddr>, addr: SocketAddr) -> bool {
+    !left.contains(&addr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([192, 168, 1, 5], port))
+    }
+
+    #[test]
+    fn input_accepted_before_leave() {
+        let left = HashSet::new();
+        assert!(should_accept_input(&left, addr(1)));
+    }
+
+    #[test]
+    fn input_dropped_after_leave() {
+        let mut left = HashSet::new();
+        left.insert(addr(1));
+        assert!(!should_accept_input(&left, addr(1)));
+    }
+
+    #[test]
+    fn leave_is_per_peer() {
+        let mut left = HashSet::new();
+        left.insert(addr(1));
+        // a different peer is unaffected
+        assert!(should_accept_input(&left, addr(2)));
+    }
+
+    #[test]
+    fn input_accepted_again_after_enter() {
+        let mut left = HashSet::new();
+        left.insert(addr(1));
+        left.remove(&addr(1));
+        assert!(should_accept_input(&left, addr(1)));
     }
 }
