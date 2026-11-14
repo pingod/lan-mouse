@@ -104,6 +104,7 @@ impl Remap {
 
         if let Some(rule) = self.rules.iter().find(|r| r.from == candidate) {
             let to = rule.to.clone();
+            log::info!("chord fired: {candidate:?} -> {to:?}");
             self.fired = Some(key);
             let mut out = self.release_peer_mods();
             out.extend(tap(&to));

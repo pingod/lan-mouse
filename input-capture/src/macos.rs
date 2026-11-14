@@ -58,6 +58,12 @@ struct InputCaptureState {
     bounds: Bounds,
     /// current state of modifier keys
     modifier_state: XMods,
+    /// barrier the cursor was last released from. While the cursor stays
+    /// inside the same edge band the latch suppresses a second crossing, so a
+    /// peer's injected cursor parked on the return edge cannot retrigger the
+    /// barrier on every 1px jitter (that produced an enter/leave fight
+    /// between the two machines: the controlled session could not slide back).
+    latched_barrier: Option<Position>,
 }
 
 #[derive(Debug)]
@@ -78,23 +84,47 @@ impl InputCaptureState {
             enter_position: None,
             bounds: Bounds::default(),
             modifier_state: Default::default(),
+            latched_barrier: None,
         };
         res.update_bounds()?;
         Ok(res)
     }
+
+    /// Distance (in points) the cursor must move away from an edge before the
+    /// same barrier may fire again. Without this hysteresis a cursor sitting
+    /// on the boundary re-triggers the barrier on every pixel of jitter.
+    const BARRIER_RELEASE_MARGIN: f64 = 24.0;
 
     fn crossed(&mut self, event: &CGEvent) -> Option<Position> {
         let location = event.location();
         let relative_x = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
         let relative_y = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
 
+        // Clear the latch once the cursor has moved away from the edge it was
+        // released from, so a deliberate second crossing still works.
+        if let Some(latched) = self.latched_barrier {
+            let away = match latched {
+                Position::Left => location.x > self.bounds.xmin + Self::BARRIER_RELEASE_MARGIN,
+                Position::Right => location.x < self.bounds.xmax - Self::BARRIER_RELEASE_MARGIN,
+                Position::Top => location.y > self.bounds.ymin + Self::BARRIER_RELEASE_MARGIN,
+                Position::Bottom => location.y < self.bounds.ymax - Self::BARRIER_RELEASE_MARGIN,
+            };
+            if away {
+                self.latched_barrier = None;
+            }
+        }
+
         for &position in self.active_clients.iter() {
+            if self.latched_barrier == Some(position) {
+                continue;
+            }
             if (position == Position::Left && (location.x + relative_x) <= self.bounds.xmin)
                 || (position == Position::Right && (location.x + relative_x) >= self.bounds.xmax)
                 || (position == Position::Top && (location.y + relative_y) <= self.bounds.ymin)
                 || (position == Position::Bottom && (location.y + relative_y) >= self.bounds.ymax)
             {
                 log::debug!("Crossed barrier into position: {position:?}");
+                self.latched_barrier = Some(position);
                 return Some(position);
             }
         }
@@ -158,6 +188,7 @@ impl InputCaptureState {
                     self.show_cursor()?;
                     self.current_pos = None;
                 }
+                self.latched_barrier = None;
             }
             ProducerEvent::Grab(pos) => {
                 if self.current_pos.is_none() {

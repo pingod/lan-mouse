@@ -342,7 +342,12 @@ impl XMods {
             let pressed_mask = match key {
                 scancode::Linux::KeyLeftShift | scancode::Linux::KeyRightShift => XMods::ShiftMask,
                 scancode::Linux::KeyLeftCtrl | scancode::Linux::KeyRightCtrl => XMods::ControlMask,
-                scancode::Linux::KeyLeftAlt | scancode::Linux::KeyRightalt => XMods::Mod1Mask,
+                // Right Alt is AltGr (ISO_Level3_Shift), which xkb places in
+                // Mod5 — not Mod1. Mapping it to Mod1 made AltGr+Q produce
+                // "q" instead of "@" on layouts that need level 3 (issue
+                // #486, #408).
+                scancode::Linux::KeyLeftAlt => XMods::Mod1Mask,
+                scancode::Linux::KeyRightalt => XMods::Mod5Mask,
                 scancode::Linux::KeyLeftMeta | scancode::Linux::KeyRightmeta => XMods::Mod4Mask,
                 _ => XMods::empty(),
             };

@@ -200,7 +200,12 @@ pub enum Linux {
     KeyI = 23,
     KeyO = 24,
     KeyP = 25,
+    // Historically serialized as `KeyLeftbrace`/`KeyRightbrace`; the
+    // conventional spelling is accepted too, since users copy the names from
+    // the Windows table (issue #403).
+    #[serde(alias = "KeyLeftBrace")]
     KeyLeftbrace = 26,
+    #[serde(alias = "KeyRightBrace")]
     KeyRightbrace = 27,
     KeyEnter = 28,
     KeyLeftCtrl = 29,

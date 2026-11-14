@@ -36,7 +36,8 @@ pub(crate) struct MacOSEmulation {
     /// global event source for all events
     event_source: CGEventSource,
     /// task handle for key repeats
-    repeat_task: Option<JoinHandle<()>>,
+    /// the key currently auto-repeating on the peer, if any
+    repeat_task: Option<(u16, JoinHandle<()>)>,
     /// current state of the mouse buttons (tracked by evdev button code)
     pressed_buttons: HashSet<u32>,
     /// button previously pressed (evdev button code)
@@ -105,10 +106,16 @@ impl MacOSEmulation {
         Some(event.location())
     }
 
+    /// Post a key-down for `key` and make it the auto-repeating key.
+    ///
+    /// Only the *newest* key repeats (that is what macOS does too), but the
+    /// previously repeating key must stay physically held: it is still down on
+    /// the sender, and sending a key-up for it here would make multi-key holds
+    /// impossible (press and hold `a`, then `b` — `a` silently went up; issue
+    /// #365). So the previous repeat task is stopped *without* emitting a
+    /// key-up; its key-up arrives later with the real release event.
     async fn spawn_repeat_task(&mut self, key: u16) {
-        // there can only be one repeating key and it's
-        // always the last to be pressed
-        self.cancel_repeat_task().await;
+        self.stop_repeat_task().await;
         // initial key event
         key_event(self.event_source.clone(), key, 1, self.modifier_state.get());
         // repeat task
@@ -129,10 +136,10 @@ impl MacOSEmulation {
                     }
                 }
             }
-            // Always release the key with the correct CGKeyCode, regardless of
-            // whether the repeat loop ran. This matches @feschber's review
-            // request: "still release the key repeat task but with the correct
-            // code."
+            // The key-up is emitted by `release_key` (the normal release
+            // path), not here: this task also ends when a *different*
+            // key starts repeating, and in that case `key` is still held down
+            // on the sender.
             //
             // Do NOT call update_modifiers here: `key` is a Mac CGKeyCode but
             // update_modifiers expects a Linux evdev scancode, and the two
@@ -142,16 +149,27 @@ impl MacOSEmulation {
             // is owned by the main consume() loop, which already calls
             // update_modifiers with the correct Linux scancode on the real key
             // release event from the client.
-            key_event(event_source.clone(), key, 0, modifiers.get());
         });
-        self.repeat_task = Some(repeat_task);
+        self.repeat_task = Some((key, repeat_task));
     }
 
-    async fn cancel_repeat_task(&mut self) {
-        if let Some(task) = self.repeat_task.take() {
+    /// Stop the repeating key *without* releasing it (it is still held).
+    async fn stop_repeat_task(&mut self) {
+        if let Some((_, task)) = self.repeat_task.take() {
             self.notify_repeat_task.notify_waiters();
             let _ = task.await;
         }
+    }
+
+    /// Post a key-up for `key`.
+    ///
+    /// Stops the repeat task only if `key` is the one repeating — releasing an
+    /// older held key must not release the newest one (issue #365).
+    async fn release_key(&mut self, key: u16) {
+        if matches!(&self.repeat_task, Some((repeating, _)) if *repeating == key) {
+            self.stop_repeat_task().await;
+        }
+        key_event(self.event_source.clone(), key, 0, self.modifier_state.get());
     }
 }
 
@@ -614,7 +632,7 @@ impl Emulation for MacOSEmulation {
                         match state {
                             // pressed
                             1 => self.spawn_repeat_task(code).await,
-                            _ => self.cancel_repeat_task().await,
+                            _ => self.release_key(code).await,
                         }
                     }
                 }

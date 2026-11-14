@@ -93,6 +93,7 @@ impl Capture {
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             remap: Remap::new(remap_rules),
+            entered_at: None,
             state: Default::default(),
         };
         let task = spawn_local(capture_task.run());
@@ -181,6 +182,8 @@ struct CaptureTask {
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     remap: Remap,
+    /// when the active client acknowledged the connection
+    entered_at: Option<Instant>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
 }
@@ -302,9 +305,30 @@ impl CaptureTask {
                         ProtoEvent::Ack(_) => {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
+                            self.entered_at.get_or_insert_with(Instant::now);
                         }
                         // client disconnected
                         ProtoEvent::Leave(_) => {
+                            // A peer that is itself in the middle of an
+                            // enter/leave fight sends Leave within
+                            // milliseconds of acknowledging our Enter. Acting
+                            // on it immediately tears down the session before
+                            // a single key is delivered — and it clears
+                            // `pressed_keys`, so the release-bind stops
+                            // working too. Require a short dwell before
+                            // honouring a remote Leave.
+                            const MIN_DWELL: Duration = Duration::from_millis(400);
+                            let dwell = self
+                                .entered_at
+                                .map(|t| t.elapsed())
+                                .unwrap_or(MIN_DWELL);
+                            if dwell < MIN_DWELL {
+                                log::debug!(
+                                    "ignoring Leave from client {handle}: \
+                                     only {dwell:?} after entering"
+                                );
+                                continue;
+                            }
                             log::info!("releasing capture: left remote client device region");
                             self.release_capture(capture).await?;
                         },
@@ -437,6 +461,7 @@ impl CaptureTask {
             // A chord that fired released its modifiers on the peer already;
             // forget the local chord state so a later capture cannot match it.
             self.remap.reset();
+            self.entered_at = None;
             for key in capture.take_pressed_keys() {
                 let key_up = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
                     time: 0,

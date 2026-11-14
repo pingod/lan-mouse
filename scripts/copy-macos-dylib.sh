@@ -304,6 +304,16 @@ fix_references() {
   # against the referencing binary before they can be copied.
   relative_libs=$(otool -L "$bin" | awk '$1 ~ /^@(rpath|loader_path|executable_path)\// {print $1}')
 
+  # Any other absolute path outside Homebrew. Formula dylibs are not always
+  # linked against the prefix: a library reached through an @rpath may embed an
+  # absolute install name pointing straight into the Cellar, or into a
+  # dependency's own directory. libsharpyuv.0.dylib (pulled in by libwebp) did
+  # exactly that, which is why the bundle launched fine on the build machine
+  # and died with "Library not loaded" everywhere else (issue #497). Treat
+  # these like Homebrew references: copy them and rewrite to @rpath.
+  system_libs=$(otool -L "$bin" | awk -v homebrew="$homebrew_path/" '
+    /^\t/ && $1 ~ /^\// && index($1, homebrew) != 1 && $1 !~ /^\/usr\/lib\// && $1 !~ /^\/System\// {print $1}')
+
   while IFS= read -r old_path; do
     if [ -z "$old_path" ]; then
       continue
@@ -322,6 +332,23 @@ fix_references() {
     echo "Updating $bin to reference @rpath/$base_name..."
     install_name_tool -change "$old_path" "@rpath/$base_name" "$bin"
   done <<< "$libs"
+
+  while IFS= read -r old_path; do
+    if [ -z "$old_path" ]; then
+      continue
+    fi
+
+    base_name="$(basename "$old_path")"
+
+    if ! bundle_lib "$base_name" "$old_path"; then
+      unresolved="$unresolved  $old_path (referenced by $bin)
+"
+      continue
+    fi
+
+    echo "Updating $bin to reference @rpath/$base_name..."
+    install_name_tool -change "$old_path" "@rpath/$base_name" "$bin"
+  done <<< "$system_libs"
 
   while IFS= read -r ref; do
     if [ -z "$ref" ]; then

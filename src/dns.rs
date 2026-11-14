@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io, net::IpAddr};
+use std::{collections::HashMap, io, net::IpAddr, time::Duration};
 
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::net::lookup_host;
@@ -99,9 +99,29 @@ impl DnsTask {
             let task = tokio::task::spawn_local(async move {
                 tokio::select! {
                     result = resolve_hostname(&hostname) => {
-                       event_tx
-                           .send(DnsEvent::Resolved(handle, hostname, result))
-                           .expect("channel closed");
+                        // A failed lookup is usually transient: mDNS/Avahi may
+                        // not have announced the peer yet, or the machine is
+                        // still booting. Retry with backoff instead of leaving
+                        // the client permanently unreachable (it used to stay
+                        // dead until the user re-saved the config).
+                        let mut attempt = 0u32;
+                        let mut result = result;
+                        while result.is_err() {
+                            let delay = retry_delay(attempt);
+                            log::debug!(
+                                "retrying dns lookup for {hostname} in {delay:?} (attempt {})",
+                                attempt + 1
+                            );
+                            tokio::select! {
+                                _ = tokio::time::sleep(delay) => {}
+                                _ = cancellation_token.cancelled() => return,
+                            }
+                            result = resolve_hostname(&hostname).await;
+                            attempt += 1;
+                        }
+                        event_tx
+                            .send(DnsEvent::Resolved(handle, hostname, result))
+                            .expect("channel closed");
                     }
                     _ = cancellation_token.cancelled() => {},
                 }
@@ -109,6 +129,11 @@ impl DnsTask {
             self.active_tasks.insert(handle, task);
         }
     }
+}
+
+/// Backoff between DNS retries: 1s, 2s, 4s, then every 8s.
+fn retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs(1u64 << attempt.min(3))
 }
 
 /// Resolve `hostname` via the operating system's full name-resolution
