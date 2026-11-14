@@ -74,10 +74,15 @@ struct ConfigToml {
 }
 
 /// A global hotkey: pressing `from` while typing locally sends `to` to the peer.
+///
+/// Parsed on every platform (the field is part of the config schema) but only
+/// read by the Linux evdev listener, hence the `dead_code` allowance elsewhere.
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
 #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
 struct TomlHotkey {
+    #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
     from: Vec<scancode::Linux>,
+    #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
     to: Vec<scancode::Linux>,
 }
 
