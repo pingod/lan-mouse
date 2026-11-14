@@ -15,6 +15,7 @@ use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
 use crate::connect::LanMouseConnection;
+use crate::remap::{Remap, Rule};
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -68,6 +69,8 @@ enum CaptureRequest {
     Reenable,
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
+    /// replace the chord remapping rules
+    SetRemapRules(Vec<Rule>),
 }
 
 impl Capture {
@@ -75,6 +78,7 @@ impl Capture {
         backend: Option<input_capture::Backend>,
         conn: LanMouseConnection,
         release_bind: Vec<scancode::Linux>,
+        remap_rules: Vec<Rule>,
     ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
@@ -88,6 +92,7 @@ impl Capture {
             event_tx,
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
+            remap: Remap::new(remap_rules),
             state: Default::default(),
         };
         let task = spawn_local(capture_task.run());
@@ -144,6 +149,10 @@ impl Capture {
     pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
         let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
     }
+
+    pub(crate) fn set_remap_rules(&mut self, rules: Vec<Rule>) {
+        let _ = self.request_tx.send(CaptureRequest::SetRemapRules(rules));
+    }
 }
 
 /// debounce a statement `$st`, i.e. the statement is executed only if the
@@ -171,6 +180,7 @@ struct CaptureTask {
     conn: LanMouseConnection,
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
+    remap: Remap,
     request_rx: Receiver<CaptureRequest>,
     state: State,
 }
@@ -221,6 +231,7 @@ impl CaptureTask {
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
+                        CaptureRequest::SetRemapRules(rules) => self.remap.set_rules(rules),
                     },
                     _ = self.cancellation_token.cancelled() => return,
                 }
@@ -324,6 +335,7 @@ impl CaptureTask {
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
+                    CaptureRequest::SetRemapRules(rules) => self.remap.set_rules(rules),
                 },
                 _ = self.cancellation_token.cancelled() => break,
             }
@@ -373,23 +385,31 @@ impl CaptureTask {
 
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
 
-        let event = match event {
-            CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),
+        let events: Vec<ProtoEvent> = match event {
+            CaptureEvent::Begin => vec![ProtoEvent::Enter(opposite_pos)],
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
-                State::WaitingForAck => ProtoEvent::Enter(opposite_pos),
-                State::Sending => ProtoEvent::Input(e),
+                State::WaitingForAck => vec![ProtoEvent::Enter(opposite_pos)],
+                State::Sending => self
+                    .remap
+                    .apply(e)
+                    .into_iter()
+                    .map(ProtoEvent::Input)
+                    .collect(),
             },
         };
 
-        if let Err(e) = self.conn.send(event, handle).await {
-            const DUR: Duration = Duration::from_millis(500);
-            debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
-            // Funnel through release_capture so the leave_hook
-            // fires and active_client is cleared (without this the
-            // active_client field would stay stale until the next
-            // Begin from a different handle).
-            self.release_capture(capture).await?;
+        for event in events {
+            if let Err(e) = self.conn.send(event, handle).await {
+                const DUR: Duration = Duration::from_millis(500);
+                debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
+                // Funnel through release_capture so the leave_hook
+                // fires and active_client is cleared (without this the
+                // active_client field would stay stale until the next
+                // Begin from a different handle).
+                self.release_capture(capture).await?;
+                break;
+            }
         }
         Ok(())
     }
@@ -414,6 +434,9 @@ impl CaptureTask {
             // then runs every subsequent keystroke through those held
             // mods until its watchdog times out (1+ s) or our Leave
             // arrives — and Leave can be lost over UDP/DTLS.
+            // A chord that fired released its modifiers on the peer already;
+            // forget the local chord state so a later capture cannot match it.
+            self.remap.reset();
             for key in capture.take_pressed_keys() {
                 let key_up = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
                     time: 0,
