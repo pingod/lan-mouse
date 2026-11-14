@@ -43,6 +43,7 @@ pub(crate) struct Remap {
 
 impl Remap {
     pub(crate) fn new(rules: Vec<Rule>) -> Self {
+        log::info!("chord remap: {} rule(s) configured", rules.len());
         Self {
             rules: rules
                 .into_iter()
