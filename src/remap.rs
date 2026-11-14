@@ -255,11 +255,7 @@ mod tests {
         // Shift+Alt still physically held: the next key must still be modified
         assert_eq!(
             run(&mut remap, vec![key(KeyA, 1)]),
-            vec![
-                key(KeyLeftShift, 1),
-                key(KeyLeftAlt, 1),
-                key(KeyA, 1)
-            ]
+            vec![key(KeyLeftShift, 1), key(KeyLeftAlt, 1), key(KeyA, 1)]
         );
         // ...and its release passes through normally
         assert_eq!(run(&mut remap, vec![key(KeyA, 0)]), vec![key(KeyA, 0)]);
