@@ -100,7 +100,7 @@ fn is_keyboard(path: &Path) -> bool {
 
     // EVIOCGBIT(0, …) — which event types the device produces.
     const EV_MAX: usize = 0x1f;
-    let mut types = [0u8; (EV_MAX + 7) / 8];
+    let mut types = [0u8; EV_MAX.div_ceil(8)];
     let ok = unsafe {
         libc::ioctl(
             fd,
@@ -123,7 +123,7 @@ fn is_keyboard(path: &Path) -> bool {
     // EVIOCGBIT(EV_KEY, …) — which key codes it can emit. Require KEY_A.
     const KEY_MAX: usize = 0x2ff;
     const KEY_A: usize = 30;
-    let mut keys = [0u8; (KEY_MAX + 7) / 8];
+    let mut keys = [0u8; KEY_MAX.div_ceil(8)];
     let ok = unsafe {
         libc::ioctl(
             fd,
@@ -155,7 +155,7 @@ fn eviocgbit(ev: usize, len: usize) -> libc::c_ulong {
 
 /// Parse the events contained in `buf`, calling `f` for every key event.
 pub(crate) fn parse_events(buf: &[u8], mut f: impl FnMut(KeySample)) {
-    for chunk in buf.chunks_exact(EVENT_SIZE) {
+    for chunk in buf.as_chunks::<EVENT_SIZE>().0 {
         let ty = u16::from_ne_bytes([chunk[16], chunk[17]]);
         if ty == EV_SYN {
             continue;

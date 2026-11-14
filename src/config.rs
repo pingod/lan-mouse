@@ -531,6 +531,7 @@ impl Config {
     }
 
     /// global hotkeys that fire even while the pointer stays local
+    #[cfg(all(unix, not(target_os = "macos")))]
     pub(crate) fn hotkeys(&self) -> Vec<crate::hotkey::Hotkey> {
         self.config_toml
             .as_ref()
