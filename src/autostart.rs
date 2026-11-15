@@ -6,7 +6,8 @@
 //! matches the copy the user is actually running.
 
 use std::io;
-#[cfg(unix)]
+// `PathBuf` is the return type of `entry_path` on every platform, including
+// the ones where that function only ever returns an error.
 use std::path::PathBuf;
 
 /// Name of the entry that starts lan-mouse with the session.
@@ -154,6 +155,10 @@ fn reload_systemd() {
 
 #[cfg(test)]
 mod tests {
+    // `use super::*` is only needed by the platform-specific tests below; on
+    // platforms where they are compiled out it would be an unused import and
+    // fail `-D warnings`.
+    #[allow(unused_imports)]
     use super::*;
 
     #[cfg(unix)]
