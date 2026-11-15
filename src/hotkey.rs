@@ -340,7 +340,9 @@ pub(crate) fn tap_events(keys: &[u32]) -> Vec<Event> {
     out
 }
 
-#[cfg(test)]
+// The helpers under test (`parse_events`, `drain`, `EVENT_SIZE`) are the evdev
+// ones, so these tests only exist on the platforms that compile them.
+#[cfg(all(test, unix, not(target_os = "macos")))]
 mod tests {
     use super::*;
     use input_event::scancode;

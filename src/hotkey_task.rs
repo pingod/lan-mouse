@@ -9,6 +9,7 @@
 //! everywhere. Linux reads evdev devices, macOS a passive Quartz event tap,
 //! and anything else falls back to a listener that never fires.
 
+#[cfg(unix)]
 use crate::connect::{LanMouseConnection, LanMouseConnectionError};
 #[cfg(unix)]
 use crate::hotkey;
@@ -67,7 +68,8 @@ const CONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(150)
 ///
 /// Shared by the evdev (Linux) and Quartz (macOS) listeners: the trigger comes
 /// from a different source on each platform, but delivering it is identical.
-#[cfg_attr(not(unix), allow(dead_code))]
+/// Windows has no listener yet, so it does not compile this.
+#[cfg(unix)]
 pub(crate) async fn deliver(conn: &LanMouseConnection, fire: HotkeyFire, capture_active: bool) {
     let HotkeyFire::Keys(keys) = fire else {
         // Local actions are handled by the service, which owns the capture and
