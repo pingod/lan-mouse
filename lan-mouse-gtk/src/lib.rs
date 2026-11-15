@@ -6,6 +6,18 @@ mod key_object;
 mod key_row;
 #[cfg(target_os = "macos")]
 mod macos_privacy;
+
+/// Whether the process must exit non-zero so launchd restarts the job after a
+/// permission grant. Always false off macOS.
+#[cfg(target_os = "macos")]
+pub fn exit_non_zero_for_relaunch() -> bool {
+    macos_privacy::exit_non_zero_for_relaunch()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn exit_non_zero_for_relaunch() -> bool {
+    false
+}
 #[cfg(target_os = "macos")]
 mod macos_status_item;
 mod window;

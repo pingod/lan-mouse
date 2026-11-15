@@ -115,6 +115,8 @@ WantedBy=graphical-session.target
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <!-- Restart after an unclean exit only, so a deliberate quit stays quit.
+         The post-grant relaunch exits non-zero on purpose to trigger this. -->
     <key>KeepAlive</key>
     <dict>
         <key>SuccessfulExit</key>

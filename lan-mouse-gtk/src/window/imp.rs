@@ -192,6 +192,9 @@ impl Window {
                     return;
                 };
                 match macos_privacy::relaunch_bundle() {
+                    // Quit through the normal path either way: `main` reaps
+                    // the daemon and only then picks the exit status launchd
+                    // needs to restart the job.
                     Ok(()) => app.quit(),
                     Err(error) => {
                         log::error!("failed to schedule app relaunch: {error}");

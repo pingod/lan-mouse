@@ -7,12 +7,13 @@
 //! user-facing action for any missing-capture or missing-emulation
 //! scenario is "re-toggle Accessibility" — we don't route elsewhere.
 
-use std::ffi::{c_uchar, c_void};
+use std::ffi::{OsStr, c_uchar, c_void};
 use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once};
 
 use gtk::glib;
@@ -21,6 +22,9 @@ use gtk::glib;
 // `-n` guarantees the scheduled one-shot starts a fresh process.
 const RELAUNCH_AFTER_EXIT_SCRIPT: &str = "while IFS= read -r _; do :; done; exec \"$1\" -n \"$2\"";
 static RELAUNCH_SIGNAL: Mutex<Option<UnixStream>> = Mutex::new(None);
+
+/// Set when launchd owns the restart and the process must exit non-zero.
+static EXIT_NON_ZERO_FOR_RELAUNCH: AtomicBool = AtomicBool::new(false);
 
 // Apple declares `AXIsProcessTrusted` as returning `Boolean` (`unsigned char`),
 // NOT C's `bool`. Rust's `bool` has a strict bit pattern (0 or 1) so binding
@@ -127,6 +131,14 @@ pub fn open_accessibility_settings() {
     open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility");
 }
 
+/// Whether the process should exit non-zero so launchd restarts the job.
+///
+/// Checked after the daemon has been reaped, so a clean shutdown still
+/// happens before the supervisor sees the exit status.
+pub fn exit_non_zero_for_relaunch() -> bool {
+    EXIT_NON_ZERO_FOR_RELAUNCH.load(Ordering::Relaxed)
+}
+
 /// Schedule a fresh instance of the current `.app` bundle.
 ///
 /// The helper waits for this process to exit. When this GUI owns the daemon,
@@ -134,11 +146,21 @@ pub fn open_accessibility_settings() {
 /// next instance cannot race its IPC socket. Separately managed daemons are
 /// left untouched. The caller should quit only after this returns successfully.
 pub fn relaunch_bundle() -> io::Result<()> {
+    // Under a LaunchAgent, launchd supervises this process: spawning `open -n`
+    // would race the supervisor and fight over the IPC socket. The job is
+    // configured to restart only on an unclean exit, so the caller must exit
+    // non-zero for the relaunch to actually happen.
+    if is_launchd_supervised() {
+        EXIT_NON_ZERO_FOR_RELAUNCH.store(true, Ordering::Relaxed);
+        return Ok(());
+    }
+
     let bundle = bundle_path(&std::env::current_exe()?)?;
     let mut signal = RELAUNCH_SIGNAL
         .lock()
         .map_err(|_| io::Error::other("relaunch state lock poisoned"))?;
     if signal.is_some() {
+        // A relaunch is already scheduled; this process still has to exit.
         return Ok(());
     }
 
@@ -149,6 +171,16 @@ pub fn relaunch_bundle() -> io::Result<()> {
     relaunch_command(&bundle, read_end).spawn().map(drop)?;
     *signal = Some(write_end);
     Ok(())
+}
+
+/// Whether this process was started by a LaunchAgent rather than by Finder,
+/// the Dock or `open`. launchd sets `XPC_SERVICE_NAME` for supervised jobs.
+fn is_launchd_supervised() -> bool {
+    supervised_by_launchd(std::env::var_os("XPC_SERVICE_NAME").as_deref())
+}
+
+fn supervised_by_launchd(service_name: Option<&OsStr>) -> bool {
+    service_name.is_some_and(|name| !name.is_empty())
 }
 
 fn bundle_path(executable: &Path) -> io::Result<PathBuf> {
@@ -309,13 +341,22 @@ fn fire_initial_prompts_inner() {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
+
+    #[test]
+    fn launchd_supervision_is_detected_from_the_service_name() {
+        assert!(supervised_by_launchd(Some(OsStr::new(
+            "de.feschber.LanMouse"
+        ))));
+        // Finder / Dock launches carry no service name.
+        assert!(!supervised_by_launchd(None));
+        assert!(!supervised_by_launchd(Some(OsStr::new(""))));
+    }
 
     #[test]
     fn resolves_only_expected_bundle_layout() {

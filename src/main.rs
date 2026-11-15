@@ -94,6 +94,12 @@ fn run() -> Result<(), LanMouseError> {
                     service.kill()?;
                 }
                 res?;
+                // Under a LaunchAgent the post-grant relaunch needs a
+                // non-zero status for launchd to start a fresh instance.
+                #[cfg(all(target_os = "macos", feature = "gtk"))]
+                if lan_mouse_gtk::exit_non_zero_for_relaunch() {
+                    std::process::exit(1);
+                }
             }
             #[cfg(not(feature = "gtk"))]
             {
