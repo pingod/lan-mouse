@@ -145,6 +145,10 @@ fn displays() -> String {
 }
 
 /// Run `cmd args`, returning trimmed stdout on success.
+///
+/// Only the unix and macOS paths call this; Windows reads its values from the
+/// environment instead.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn command_output(cmd: &str, args: &[&str]) -> Option<String> {
     let out = std::process::Command::new(cmd).args(args).output().ok()?;
     if !out.status.success() {

@@ -30,6 +30,10 @@ pub(crate) struct Hotkey {
 }
 
 /// What a hotkey trigger produced.
+///
+/// Constructed by the evdev matcher, which only exists on unix; Windows and
+/// macOS reach it through the no-op `Hotkeys`, so the variants are unused there.
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum HotkeyFire {
     /// Type these keys on the peer.
