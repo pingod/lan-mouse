@@ -10,11 +10,12 @@ use lan_mouse_cli::CliError;
 #[cfg(feature = "gtk")]
 use lan_mouse_gtk::GtkError;
 use lan_mouse_ipc::{IpcError, IpcListenerCreationError};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 use std::{
     future::Future,
     io,
     process::{self, Child},
-    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::task::LocalSet;
@@ -147,6 +148,10 @@ where
 }
 
 /// Wait until `child` exits or `timeout` elapses, polling instead of blocking.
+///
+/// Unix only: on Windows the frontend terminates the daemon with `kill`, which
+/// never waits for the graceful shutdown signal.
+#[cfg(unix)]
 fn wait_for_exit(child: &mut Child, timeout: Duration) -> Result<(), io::Error> {
     let deadline = Instant::now() + timeout;
     loop {
