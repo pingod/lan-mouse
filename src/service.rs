@@ -791,6 +791,14 @@ impl Service {
     }
 
     fn notify_frontend(&mut self, event: FrontendEvent) {
+        // Bound the queue: a frontend that stops reading (window hidden, IPC
+        // stalled) must not let a streaming event source grow it forever.
+        // Dropping the oldest is safe — every event is a snapshot of state, and
+        // the frontend re-syncs on reconnect.
+        const MAX_PENDING: usize = 4096;
+        if self.pending_frontend_events.len() >= MAX_PENDING {
+            self.pending_frontend_events.pop_front();
+        }
         self.pending_frontend_events.push_back(event);
         self.frontend_event_pending.notify_one();
     }

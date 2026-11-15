@@ -203,7 +203,9 @@ impl LanMouseConnection {
                     return Err(LanMouseConnectionError::TargetEmulationDisabled);
                 }
                 match conn.send(buf).await {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        self.client_manager.record_forwarded(handle);
+                    }
                     Err(e) => {
                         log::warn!("client {handle} failed to send: {e}");
                         disconnect(
@@ -378,6 +380,7 @@ async fn receive_loop(
                 log::trace!("{addr} <==<==<== {event}");
                 match event {
                     ProtoEvent::Pong(b) => {
+                        client_manager.record_received(handle);
                         client_manager.set_active_addr(handle, Some(addr));
                         client_manager.set_alive(handle, b);
                         ping_response.borrow_mut().insert(addr);

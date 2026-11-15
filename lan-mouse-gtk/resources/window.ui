@@ -9,10 +9,10 @@
     </item>
   </menu>
   <template class="LanMouseWindow" parent="AdwApplicationWindow">
-    <property name="default-width">820</property>
-    <property name="default-height">820</property>
-    <property name="width-request">560</property>
-    <property name="height-request">600</property>
+    <property name="default-width">760</property>
+    <property name="default-height">660</property>
+    <property name="width-request">520</property>
+    <property name="height-request">520</property>
     <property name="title" translatable="yes">Lan Mouse</property>
     <property name="show-menubar">True</property>
     <property name="content">
@@ -103,6 +103,25 @@
                                     <style><class name="pill"/></style>
                                   </object>
                                 </child>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="AdwPreferencesGroup">
+                            <property name="title" translatable="yes">Activity</property>
+                            <child>
+                              <object class="AdwActionRow" id="peers_row">
+                                <property name="title" translatable="yes">Peers</property>
+                                <property name="subtitle">-</property>
+                                <property name="icon-name">network-transmit-receive-symbolic</property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="AdwActionRow" id="traffic_row">
+                                <property name="title" translatable="yes">Forwarded</property>
+                                <property name="subtitle">-</property>
+                                <property name="icon-name">go-next-symbolic</property>
                               </object>
                             </child>
                           </object>

@@ -67,6 +67,10 @@ pub struct Window {
     pub main_stack: TemplateChild<adw::ViewStack>,
     #[template_child]
     pub active_device_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub peers_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub traffic_row: TemplateChild<ActionRow>,
     pub clients: RefCell<Option<gio::ListStore>>,
     pub authorized: RefCell<Option<gio::ListStore>>,
     pub frontend_request_writer: RefCell<Option<FrontendRequestWriter>>,

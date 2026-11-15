@@ -343,6 +343,20 @@ impl ClientManager {
             .and_then(|(_, s)| s.active_addr)
     }
 
+    /// Count an event forwarded to `handle`.
+    pub(crate) fn record_forwarded(&self, handle: ClientHandle) {
+        if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            s.forwarded = s.forwarded.saturating_add(1);
+        }
+    }
+
+    /// Count an event received from `handle`.
+    pub(crate) fn record_received(&self, handle: ClientHandle) {
+        if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            s.received = s.received.saturating_add(1);
+        }
+    }
+
     /// Mark a client as no longer connected, keeping its last-seen time.
     pub(crate) fn set_disconnected(&self, handle: ClientHandle) {
         if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {

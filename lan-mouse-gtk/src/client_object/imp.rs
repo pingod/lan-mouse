@@ -23,6 +23,8 @@ pub struct ClientObject {
     #[property(name = "connected", get, set, type = bool, member = connected)]
     #[property(name = "rtt-ms", get, set, type = u32, member = rtt_ms, maximum = u32::MAX)]
     #[property(name = "last-seen", get, set, type = u64, member = last_seen)]
+    #[property(name = "forwarded", get, set, type = u64, member = forwarded)]
+    #[property(name = "received", get, set, type = u64, member = received)]
     pub data: RefCell<ClientData>,
 }
 

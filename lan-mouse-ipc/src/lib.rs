@@ -191,6 +191,10 @@ pub struct ClientState {
     pub last_seen: Option<u64>,
     /// the client has an established (D)TLS connection right now
     pub connected: bool,
+    /// input events forwarded to this client since the connection started
+    pub forwarded: u64,
+    /// input events received from this client since the connection started
+    pub received: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

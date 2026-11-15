@@ -724,6 +724,30 @@ impl Window {
             }
         }
 
+        // Activity group: how many peers are connected and how much has moved.
+        let mut connected = 0usize;
+        let mut forwarded = 0u64;
+        let mut received = 0u64;
+        if let Some(store) = imp.clients.borrow().clone() {
+            for i in 0..store.n_items() {
+                let Some(obj) = store.item(i).and_downcast::<ClientObject>() else {
+                    continue;
+                };
+                if obj.property::<bool>("connected") {
+                    connected += 1;
+                }
+                forwarded += obj.property::<u64>("forwarded");
+                received += obj.property::<u64>("received");
+            }
+        }
+        imp.peers_row.set_subtitle(&if connected == 0 {
+            "no peer connected".to_owned()
+        } else {
+            format!("{connected} connected")
+        });
+        imp.traffic_row
+            .set_subtitle(&format!("{forwarded} sent · {received} received"));
+
         match controlling {
             Some(name) => {
                 imp.active_device_row
