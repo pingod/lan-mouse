@@ -179,6 +179,58 @@ async fn update_barriers(
     Ok((barriers, id_map))
 }
 
+/// The coordinate of the barrier line that was actually crossed.
+///
+/// Looked up by the activation's barrier id: several barriers can share one
+/// edge (one per display), so the edge alone does not identify the line.
+fn crossed_barrier_edge(
+    barriers: &[ICBarrier],
+    activated: &Activated,
+    pos: Position,
+) -> Option<f64> {
+    let barrier_id = match activated.barrier_id() {
+        Some(ActivatedBarrier::Barrier(id)) => Some(id),
+        _ => None,
+    };
+    crossed_barrier_edge_of(barriers, barrier_id, activated.cursor_position(), pos)
+}
+
+/// [`crossed_barrier_edge`] without the portal types, so the lookup is testable.
+fn crossed_barrier_edge_of(
+    barriers: &[ICBarrier],
+    barrier_id: Option<BarrierID>,
+    cursor: Option<(f32, f32)>,
+    pos: Position,
+) -> Option<f64> {
+    // Compositors are not required to report which barrier fired (KDE returns
+    // `UnknownBarrier`), so fall back to the cursor position: pick the barrier
+    // whose line is nearest to it. This matters because the reported cursor can
+    // be outside every zone, and parking relative to it would leave the pointer
+    // off-screen.
+    let by_id = barrier_id.and_then(|id| barriers.iter().find(|b| b.barrier_id == id));
+    let barrier = match by_id {
+        Some(barrier) => barrier,
+        None => {
+            let (cx, cy) = cursor?;
+            let distance = |b: &ICBarrier| {
+                let (x1, y1, _, _) = b.position;
+                match pos {
+                    Position::Top | Position::Bottom => (y1 as f64 - cy as f64).abs(),
+                    Position::Left | Position::Right => (x1 as f64 - cx as f64).abs(),
+                }
+            };
+            barriers
+                .iter()
+                .min_by(|a, b| distance(a).total_cmp(&distance(b)))?
+        }
+    };
+    let (x1, y1, _, _) = barrier.position;
+    Some(match pos {
+        Position::Top | Position::Bottom => y1 as f64,
+        Position::Left | Position::Right => x1 as f64,
+    })
+}
+
 /// Whether two barrier sets describe the same geometry.
 ///
 /// Only the position matters: barrier ids are handed out from a counter that
@@ -513,7 +565,7 @@ async fn do_capture_session(
                         },
                     }
 
-                    release_capture(input_capture, session, activated, pos).await?;
+                    release_capture(input_capture, session, activated, pos, &barriers).await?;
 
                 }
                 _ = zone_check.tick() => {
@@ -579,6 +631,7 @@ async fn release_capture(
     session: &Session<InputCapture>,
     activated: Activated,
     current_pos: Position,
+    barriers: &[ICBarrier],
 ) -> Result<(), CaptureError> {
     if let Some(activation_id) = activated.activation_id() {
         log::debug!("releasing input capture {activation_id}");
@@ -587,15 +640,33 @@ async fn release_capture(
         .cursor_position()
         .expect("compositor did not report cursor position!");
     log::debug!("client entered @ ({x}, {y})");
-    let (dx, dy) = match current_pos {
-        // offset cursor position to not enter again immediately
-        Position::Left => (1., 0.),
-        Position::Right => (-1., 0.),
-        Position::Top => (0., 1.),
-        Position::Bottom => (0., -1.),
+    // Park the cursor a fixed distance inside the edge, measured from the
+    // barrier line rather than from wherever the cursor happened to be.
+    //
+    // Offsetting the cursor by one pixel was not enough: the reported position
+    // can already be past the barrier, so `+1` still left it inside the region
+    // that triggers the edge. The very next motion sample then re-entered the
+    // peer ~1 ms after leaving it, which is what made the pointer stall on the
+    // boundary instead of returning cleanly.
+    const PARK_MARGIN: f64 = 24.;
+    let cursor_position = match current_pos {
+        Position::Top => {
+            let edge = crossed_barrier_edge(barriers, &activated, current_pos).unwrap_or(y as f64);
+            (x as f64, edge + PARK_MARGIN)
+        }
+        Position::Bottom => {
+            let edge = crossed_barrier_edge(barriers, &activated, current_pos).unwrap_or(y as f64);
+            (x as f64, edge - PARK_MARGIN)
+        }
+        Position::Left => {
+            let edge = crossed_barrier_edge(barriers, &activated, current_pos).unwrap_or(x as f64);
+            (edge + PARK_MARGIN, y as f64)
+        }
+        Position::Right => {
+            let edge = crossed_barrier_edge(barriers, &activated, current_pos).unwrap_or(x as f64);
+            (edge - PARK_MARGIN, y as f64)
+        }
     };
-    // release 1px to the right of the entered zone
-    let cursor_position = (x as f64 + dx, y as f64 + dy);
     let release_options = ReleaseOptions::default()
         .set_activation_id(activated.activation_id())
         .set_cursor_position(Some(cursor_position));
@@ -753,6 +824,38 @@ mod barrier_tests {
 
     fn barrier(position: (i32, i32, i32, i32)) -> ICBarrier {
         ICBarrier::new(id(1), position)
+    }
+
+    fn barrier_at(barrier_id: u32, position: (i32, i32, i32, i32)) -> ICBarrier {
+        ICBarrier::new(id(barrier_id), position)
+    }
+
+    #[test]
+    fn park_position_uses_the_barrier_line_not_the_reported_cursor() {
+        // The compositor reported an out-of-range cursor (Hyprland does this
+        // when it constrains the pointer); the park position must come from
+        // the barrier, otherwise the cursor is parked off-screen and the edge
+        // keeps firing.
+        let barriers = vec![
+            barrier_at(1, (2560, 0, 3999, 0)),
+            barrier_at(2, (0, 1120, 2559, 1120)),
+        ];
+        assert_eq!(
+            crossed_barrier_edge_of(&barriers, None, Some((1000., 3410.)), Position::Top),
+            Some(1120.)
+        );
+    }
+
+    #[test]
+    fn park_position_uses_the_reported_barrier_id() {
+        let barriers = vec![
+            barrier_at(1, (2560, 0, 3999, 0)),
+            barrier_at(2, (0, 1120, 2559, 1120)),
+        ];
+        assert_eq!(
+            crossed_barrier_edge_of(&barriers, Some(id(2)), Some((1000., 3410.)), Position::Top),
+            Some(1120.)
+        );
     }
 
     #[test]

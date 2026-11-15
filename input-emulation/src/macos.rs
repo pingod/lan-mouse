@@ -7,7 +7,7 @@ use core_foundation_sys::preferences::{
 };
 use core_graphics::base::CGFloat;
 use core_graphics::display::{
-    CGDirectDisplayID, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
+    CGDirectDisplayID, CGDisplay, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
 };
 use core_graphics::event::{
     CGEvent, CGEventField, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton,
@@ -228,6 +228,18 @@ fn is_arrow_key(key: u16) -> bool {
 /// back into the capture pipeline.
 pub const INJECTED_EVENT_TAG: i64 = 0x6c616e6d; // "lanm"
 
+/// Post `event` tagged as synthesized.
+///
+/// Every injected event must carry the tag, not just keystrokes: the capture
+/// tap reads mouse motion too, and an untagged synthetic move is treated as
+/// local input. The captured delta then accumulates past the screen edge,
+/// which fires this device's own barrier and makes the peer believe the user
+/// came back — the pointer visibly stalls instead of crossing cleanly.
+fn post_synthesized(event: &CGEvent) {
+    event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECTED_EVENT_TAG);
+    event.post(CGEventTapLocation::HID);
+}
+
 fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods) {
     let event = match CGEvent::new_keyboard_event(event_source, key, state != 0) {
         Ok(e) => e,
@@ -249,8 +261,7 @@ fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods)
     // hardware input. Without the tag the injected keystroke is captured again
     // and forwarded to the peer, which is a feedback loop: the peer's hotkey
     // looked like local typing here.
-    event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECTED_EVENT_TAG);
-    event.post(CGEventTapLocation::HID);
+    post_synthesized(&event);
     log::trace!("key event: {key} {state}");
 }
 
@@ -275,7 +286,7 @@ fn modifier_key_event(event_source: CGEventSource, key: u16, depressed: XMods) {
     };
     event.set_type(CGEventType::FlagsChanged);
     event.set_flags(modifier_flags_changed_flags(depressed));
-    event.post(CGEventTapLocation::HID);
+    post_synthesized(&event);
     log::trace!("modifier key event: {key} {depressed:?}");
 }
 
@@ -382,18 +393,25 @@ fn clamp_to_screen_space(
     //   Clamp the mouse to the current display
     // Else If the point is on a display
     //   Clamp the mouse to the new display
-    let current_display = match get_display_at_point(current_x, current_y) {
-        Some(display) => display,
-        None => {
-            log::warn!("could not get current display!");
-            return (current_x, current_y);
-        }
-    };
-
     let new_x = current_x + dx;
     let new_y = current_y + dy;
 
-    let final_display = get_display_at_point(new_x, new_y).unwrap_or(current_display);
+    // Prefer the display the cursor would land on, then the one it is leaving.
+    // When both are off-screen the position is already invalid — clamping to
+    // the display under the *old* point used to bail out early and return the
+    // out-of-range coordinate unchanged, so the cursor could never come back
+    // from an overshoot. Fall back to the main display instead.
+    let final_display = match get_display_at_point(new_x, new_y)
+        .or_else(|| get_display_at_point(current_x, current_y))
+    {
+        Some(display) => display,
+        None => {
+            log::debug!(
+                "cursor off every display at ({new_x}, {new_y}); clamping to the main display"
+            );
+            CGDisplay::main().id
+        }
+    };
     let (min_x, min_y, max_x, max_y) = get_display_bounds(final_display);
 
     (
@@ -450,7 +468,7 @@ impl Emulation for MacOSEmulation {
                         };
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, dx as i64);
                         event.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, dy as i64);
-                        event.post(CGEventTapLocation::HID);
+                        post_synthesized(&event);
                     }
                     PointerEvent::Button {
                         time: _,
@@ -530,7 +548,7 @@ impl Emulation for MacOSEmulation {
                                 btn_num,
                             );
                         }
-                        event.post(CGEventTapLocation::HID);
+                        post_synthesized(&event);
                     }
                     PointerEvent::Axis {
                         time: _,
@@ -564,7 +582,7 @@ impl Emulation for MacOSEmulation {
                                 return Ok(());
                             }
                         };
-                        event.post(CGEventTapLocation::HID);
+                        post_synthesized(&event);
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
                         let value = if natural_scroll_enabled(&self.natural_scroll_key) {
@@ -595,7 +613,7 @@ impl Emulation for MacOSEmulation {
                                 return Ok(());
                             }
                         };
-                        event.post(CGEventTapLocation::HID);
+                        post_synthesized(&event);
                     }
                 }
 
