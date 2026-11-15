@@ -53,6 +53,14 @@
 				</child>
 			</object>
 		</child>
+		<!-- connection status -->
+		<child>
+			<object class="AdwActionRow" id="status_row">
+				<property name="title" translatable="yes">connection</property>
+				<property name="subtitle">-</property>
+				<property name="use-markup">false</property>
+			</object>
+		</child>
 		<!-- position -->
 		<child>
 			<object class="AdwComboRow" id="position">

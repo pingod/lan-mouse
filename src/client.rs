@@ -3,6 +3,7 @@ use std::{
     collections::HashSet,
     net::{IpAddr, SocketAddr},
     rc::Rc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use slab::Slab;
@@ -298,6 +299,25 @@ impl ClientManager {
         }
     }
 
+    /// Record the outcome of a ping/pong exchange.
+    ///
+    /// `rtt` is `None` when the peer answered without a usable timing sample;
+    /// the timestamp is always refreshed so the UI can show staleness.
+    pub(crate) fn set_health(&self, handle: ClientHandle, rtt: Option<Duration>, connected: bool) {
+        if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            if let Some(rtt) = rtt {
+                s.rtt_ms = Some(rtt.as_millis() as u64);
+            }
+            s.connected = connected;
+            s.last_seen = Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or_default(),
+            );
+        }
+    }
+
     pub(crate) fn set_peer_commit(&self, handle: ClientHandle, commit: Option<[u8; 8]>) {
         if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
             s.peer_commit = commit;
@@ -321,6 +341,23 @@ impl ClientManager {
             .borrow()
             .get(handle as usize)
             .and_then(|(_, s)| s.active_addr)
+    }
+
+    /// Mark a client as no longer connected, keeping its last-seen time.
+    pub(crate) fn set_disconnected(&self, handle: ClientHandle) {
+        if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            s.connected = false;
+            s.rtt_ms = None;
+        }
+    }
+
+    /// Find the client currently associated with `addr`.
+    pub(crate) fn handle_for_addr(&self, addr: SocketAddr) -> Option<ClientHandle> {
+        self.clients
+            .borrow()
+            .iter()
+            .find(|(_, (_, s))| s.active_addr == Some(addr))
+            .map(|(i, _)| i as ClientHandle)
     }
 
     pub(crate) fn alive(&self, handle: ClientHandle) -> bool {

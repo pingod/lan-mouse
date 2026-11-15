@@ -68,6 +68,8 @@ pub(crate) enum EmulationEvent {
 
 enum EmulationRequest {
     Reenable,
+    /// stop injecting input until `Reenable`
+    Disable,
     Release(SocketAddr),
     ChangePort(u16),
     Terminate,
@@ -105,6 +107,11 @@ impl Emulation {
         self.request_tx
             .send(EmulationRequest::Reenable)
             .expect("channel closed");
+    }
+
+    /// Stop emulating input until [`Self::reenable`].
+    pub(crate) fn disable(&self) {
+        let _ = self.request_tx.send(EmulationRequest::Disable);
     }
 
     pub(crate) fn request_port_change(&self, port: u16) {
@@ -198,6 +205,7 @@ impl ListenTask {
                 request = self.request_rx.recv() => match request.expect("channel closed") {
                     // reenable emulation
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
+                    EmulationRequest::Disable => self.emulation_proxy.disable(),
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
                     EmulationRequest::ChangePort(port) => {
@@ -243,6 +251,8 @@ enum ProxyRequest {
     Remove(SocketAddr),
     Terminate,
     Reenable,
+    /// drop every handle so nothing is injected until `Reenable`
+    Disable,
 }
 
 impl EmulationProxy {
@@ -308,6 +318,10 @@ impl EmulationProxy {
             .expect("channel closed");
     }
 
+    fn disable(&self) {
+        let _ = self.request_tx.send(ProxyRequest::Disable);
+    }
+
     async fn terminate(&mut self) {
         self.exit_requested.replace(true);
         self.request_tx
@@ -354,6 +368,7 @@ impl EmulationTask {
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Enter(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::Disable => { /* already inactive */ }
                 }
             }
         }
@@ -434,6 +449,15 @@ impl EmulationTask {
                     }
                     ProxyRequest::Terminate => break Ok(()),
                     ProxyRequest::Reenable => continue,
+                    ProxyRequest::Disable => {
+                        // Drop every handle so a resumed session starts clean;
+                        // the peer keeps sending until it leaves, and those
+                        // events are ignored while no handle exists.
+                        for (_, handle) in std::mem::take(&mut self.handles) {
+                            emulation.destroy(handle).await;
+                        }
+                        self.left.clear();
+                    }
                 },
             }
         }
@@ -457,6 +481,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             ProxyRequest::Enter(_) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
+            ProxyRequest::Disable => continue,
         }
     }
 }

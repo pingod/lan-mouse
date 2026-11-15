@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use webrtc_dtls::crypto::Certificate;
+pub use webrtc_dtls::crypto::Certificate;
 
 #[derive(Debug, Error)]
 pub enum Error {

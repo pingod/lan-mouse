@@ -15,5 +15,6 @@ pub mod emulation_test;
 mod hotkey;
 mod hotkey_task;
 mod listen;
+pub mod logging;
 mod remap;
 pub mod service;

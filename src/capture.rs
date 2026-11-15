@@ -74,6 +74,8 @@ enum CaptureRequest {
     Destroy(CaptureHandle),
     /// start the connection to this client before the pointer reaches it
     Preconnect(CaptureHandle),
+    /// stop acting on input until [`CaptureRequest::Reenable`]
+    Disable,
     /// reenable input capture
     Reenable,
     /// set release bind
@@ -128,6 +130,14 @@ impl Capture {
         self.request_tx
             .send(CaptureRequest::Reenable)
             .expect("channel closed");
+    }
+
+    /// Stop capturing until [`Self::reenable`].
+    ///
+    /// Errors are ignored: the channel is only closed when the capture task has
+    /// already stopped, in which case there is nothing left to disable.
+    pub(crate) fn disable(&self) {
+        let _ = self.request_tx.send(CaptureRequest::Disable);
     }
 
     pub(crate) async fn terminate(&mut self) {
@@ -262,6 +272,7 @@ impl CaptureTask {
                 tokio::select! {
                     r = self.request_rx.recv() => match r.expect("channel closed") {
                         CaptureRequest::Reenable => break,
+                        CaptureRequest::Disable => { /* nothing to do yet */ }
                         CaptureRequest::Preconnect(_) => { /* no connection yet */ }
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
@@ -364,6 +375,20 @@ impl CaptureTask {
                                 }
                             }
                         }
+                        // The connection dropped locally (peer stopped, network
+                        // gone). Release at once: the dwell check below only
+                        // guards against a peer's own enter/leave fight, and
+                        // there is no peer left to fight with. Without this the
+                        // compositor keeps the pointer hidden on the remote
+                        // edge with nobody to send `Leave` for it.
+                        ProtoEvent::Leave(serial)
+                            if serial == crate::connect::DISCONNECT_SERIAL =>
+                        {
+                            log::warn!(
+                                "client {handle} disconnected while capturing — releasing"
+                            );
+                            self.release_capture(capture).await?;
+                        }
                         // client disconnected
                         ProtoEvent::Leave(_) => {
                             // A peer that is itself in the middle of an
@@ -398,6 +423,11 @@ impl CaptureTask {
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => { /* already active */ },
+                    CaptureRequest::Disable => {
+                        log::info!("capture disabled");
+                        self.release_capture(capture).await?;
+                        capture.release().await?;
+                    }
                     CaptureRequest::Release => self.release_capture(capture).await?,
                     CaptureRequest::Preconnect(h) => {
                         self.conn.preconnect(h).await;

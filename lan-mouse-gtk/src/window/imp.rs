@@ -53,6 +53,16 @@ pub struct Window {
     pub version_row: TemplateChild<ActionRow>,
     #[template_child]
     pub autostart_switch: TemplateChild<gtk::Switch>,
+    #[template_child]
+    pub pause_switch: TemplateChild<gtk::Switch>,
+    #[template_child]
+    pub restart_interval_entry: TemplateChild<gtk::Entry>,
+    #[template_child]
+    pub log_level_label: TemplateChild<gtk::Label>,
+    #[template_child]
+    pub log_view: TemplateChild<gtk::TextView>,
+    #[template_child]
+    pub log_level_combo: TemplateChild<adw::ComboRow>,
     pub clients: RefCell<Option<gio::ListStore>>,
     pub authorized: RefCell<Option<gio::ListStore>>,
     pub frontend_request_writer: RefCell<Option<FrontendRequestWriter>>,
@@ -62,6 +72,9 @@ pub struct Window {
     pub authorization_window: RefCell<Option<AuthorizationWindow>>,
     /// set while the autostart switch is being updated from the daemon
     pub autostart_updating: Cell<bool>,
+    /// set while the pause switch is being updated from the daemon
+    pub pause_updating: Cell<bool>,
+    pub log_buffer: RefCell<gtk::TextBuffer>,
 }
 
 #[glib::object_subclass]
@@ -100,6 +113,40 @@ impl Window {
         }
         let active = self.autostart_switch.is_active();
         self.obj().request_autostart(active);
+    }
+
+    #[template_callback]
+    fn handle_force_release_pressed(&self, _button: &Button) {
+        self.obj().request_force_release();
+    }
+
+    #[template_callback]
+    fn handle_switch_device_pressed(&self, _button: &Button) {
+        self.obj().request_switch_device();
+    }
+
+    #[template_callback]
+    fn handle_log_refresh_pressed(&self, _button: &Button) {
+        self.obj().request_logs();
+    }
+
+    #[template_callback]
+    fn handle_pause_toggled(&self, _param: glib::ParamSpec) {
+        if self.pause_updating.get() {
+            return;
+        }
+        let paused = self.pause_switch.is_active();
+        self.obj().request_pause(paused);
+    }
+
+    #[template_callback]
+    fn handle_restart_pressed(&self, _button: &Button) {
+        self.obj().request_restart();
+    }
+
+    #[template_callback]
+    fn handle_reload_pressed(&self, _button: &Button) {
+        self.obj().request_reload();
     }
 
     #[template_callback]
@@ -238,6 +285,24 @@ impl ObjectImpl for Window {
         obj.setup_icon();
         obj.setup_clients();
         obj.setup_authorized();
+
+        // The log view owns its buffer; wire it up once and let
+        // `set_logs` write into it.
+        self.log_view.set_buffer(Some(&*self.log_buffer.borrow()));
+        let combo = self.log_level_combo.clone();
+        let weak = obj.downgrade();
+        combo.connect_selected_notify(move |row| {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            let Some(level) = row
+                .selected_item()
+                .and_then(|item| item.downcast::<gtk::StringObject>().ok())
+            else {
+                return;
+            };
+            window.request_log_level(&level.string());
+        });
     }
 }
 

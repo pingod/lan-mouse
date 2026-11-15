@@ -153,6 +153,46 @@ impl ClientRow {
         self.imp().set_pos(pos);
     }
 
+    /// Describe the connection in one line: reachability, round-trip time and
+    /// how recently the peer was heard from.
+    pub fn set_status(&self, state: &lan_mouse_ipc::ClientState) {
+        let row = &self.imp().status_row;
+        let mut parts: Vec<String> = Vec::new();
+
+        parts.push(if state.connected {
+            "connected".to_string()
+        } else if state.active {
+            "not connected".to_string()
+        } else {
+            "disabled".to_string()
+        });
+
+        if let Some(addr) = state.active_addr {
+            parts.push(format!("via {addr}"));
+        }
+        if let Some(rtt) = state.rtt_ms {
+            parts.push(format!("rtt {rtt} ms"));
+        }
+        if !state.alive {
+            parts.push("peer cannot emulate input".to_string());
+        }
+        if state.resolving {
+            parts.push("resolving".to_string());
+        }
+        if state.has_pressed_keys {
+            parts.push("keys held".to_string());
+        }
+        if let Some(last_seen) = state.last_seen {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(last_seen);
+            parts.push(format!("last seen {}s ago", now.saturating_sub(last_seen)));
+        }
+
+        row.set_subtitle(&parts.join(" · "));
+    }
+
     pub fn set_dns_state(&self, resolved: bool) {
         self.imp().set_dns_state(resolved);
     }

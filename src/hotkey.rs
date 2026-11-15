@@ -14,7 +14,7 @@
 //! additionally types `s` on the peer.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::File,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
@@ -29,7 +29,7 @@ pub(crate) const EVENT_SIZE: usize = 24;
 const EV_KEY: u16 = 0x01;
 const EV_SYN: u16 = 0x00;
 
-pub(crate) use crate::hotkey_task::Hotkey;
+pub(crate) use crate::hotkey_task::{Hotkey, HotkeyFire};
 
 /// One key event read from a device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,10 +206,15 @@ pub(crate) struct HotkeyState {
     /// device (14 times in practice). The guard collapses those duplicates
     /// while still allowing a deliberate second press.
     last_fire: Option<Instant>,
+    /// progress of multi-tap rules, keyed by the sorted `from` chord
+    tap_progress: HashMap<Vec<u32>, (u8, Instant)>,
 }
 
 /// Minimum spacing between two firings of any hotkey.
 const FIRE_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// How long a double-tap rule waits for the second press.
+const MULTI_TAP_WINDOW: Duration = Duration::from_millis(400);
 
 impl HotkeyState {
     pub(crate) fn new(hotkeys: Vec<Hotkey>) -> Self {
@@ -218,6 +223,7 @@ impl HotkeyState {
             held: HashSet::new(),
             fired: HashSet::new(),
             last_fire: None,
+            tap_progress: HashMap::new(),
         }
     }
 
@@ -230,11 +236,11 @@ impl HotkeyState {
         self.held.clear();
         self.fired.clear();
         self.last_fire = None;
+        self.tap_progress.clear();
     }
 
-    /// Feed one key sample. Returns the sequence to send to the peer if a
-    /// hotkey just fired.
-    pub(crate) fn on_key(&mut self, sample: KeySample) -> Option<Vec<u32>> {
+    /// Feed one key sample. Returns what to do if a hotkey just fired.
+    pub(crate) fn on_key(&mut self, sample: KeySample) -> Option<HotkeyFire> {
         if self.hotkeys.is_empty() {
             return None;
         }
@@ -259,15 +265,36 @@ impl HotkeyState {
                     }
                     let mut sorted = hk.from.clone();
                     sorted.sort_unstable();
-                    if !self.fired.insert(sorted) {
+
+                    // A multi-tap rule counts presses of the same chord inside
+                    // `MULTI_TAP_WINDOW`; a single-tap rule fires immediately.
+                    let taps = hk.taps.max(1);
+                    if taps > 1 {
+                        let count = match self.tap_progress.get(&sorted) {
+                            Some((n, at)) if at.elapsed() < MULTI_TAP_WINDOW => *n + 1,
+                            _ => 1,
+                        };
+                        self.tap_progress
+                            .insert(sorted.clone(), (count, Instant::now()));
+                        if count < taps {
+                            log::trace!("hotkey: tap {count}/{taps} on {sorted:?}");
+                            continue;
+                        }
+                        self.tap_progress.remove(&sorted);
+                    } else if !self.fired.insert(sorted) {
+                        // Already fired for this hold; wait for a release.
                         continue;
                     }
+
                     if self.last_fire.is_some_and(|t| t.elapsed() < FIRE_DEBOUNCE) {
                         log::trace!("hotkey: suppressing duplicate within debounce window");
                         continue;
                     }
                     self.last_fire = Some(Instant::now());
-                    hit = Some(hk.to.clone());
+                    hit = Some(match hk.action {
+                        Some(action) => HotkeyFire::Action(action),
+                        None => HotkeyFire::Keys(hk.to.clone()),
+                    });
                 }
                 hit
             }
@@ -322,6 +349,8 @@ mod tests {
         HotkeyState::new(vec![Hotkey {
             from: vec![KeyLeftShift as u32, KeyLeftAlt as u32, KeyS as u32],
             to: vec![KeyS as u32],
+            action: None,
+            taps: 1,
         }])
     }
 
@@ -330,7 +359,10 @@ mod tests {
         let mut st = sas();
         assert_eq!(st.on_key(press(KeyLeftShift)), None);
         assert_eq!(st.on_key(press(KeyLeftAlt)), None);
-        assert_eq!(st.on_key(press(KeyS)), Some(vec![KeyS as u32]));
+        assert_eq!(
+            st.on_key(press(KeyS)),
+            Some(HotkeyFire::Keys(vec![KeyS as u32]))
+        );
     }
 
     #[test]
@@ -375,7 +407,10 @@ mod tests {
         assert_eq!(st.on_key(release(KeyS)), None);
         // step past the duplicate-device debounce window
         st.last_fire = Some(Instant::now() - FIRE_DEBOUNCE * 2);
-        assert_eq!(st.on_key(press(KeyS)), Some(vec![KeyS as u32]));
+        assert_eq!(
+            st.on_key(press(KeyS)),
+            Some(HotkeyFire::Keys(vec![KeyS as u32]))
+        );
     }
 
     #[test]
@@ -391,7 +426,10 @@ mod tests {
         for k in [KeyLeftShift, KeyLeftAlt, KeyA] {
             st.on_key(press(k));
         }
-        assert_eq!(st.on_key(press(KeyS)), Some(vec![KeyS as u32]));
+        assert_eq!(
+            st.on_key(press(KeyS)),
+            Some(HotkeyFire::Keys(vec![KeyS as u32]))
+        );
     }
 
     #[test]

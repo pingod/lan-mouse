@@ -30,6 +30,8 @@ pub struct ClientRow {
     pub delete_button: TemplateChild<gtk::Button>,
     #[template_child]
     pub dns_loading_indicator: TemplateChild<gtk::Spinner>,
+    #[template_child]
+    pub status_row: TemplateChild<ActionRow>,
     pub bindings: RefCell<Vec<Binding>>,
     hostname_change_handler: RefCell<Option<SignalHandlerId>>,
     port_change_handler: RefCell<Option<SignalHandlerId>>,

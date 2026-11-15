@@ -185,6 +185,12 @@ pub struct ClientState {
     /// that predates the Hello event. The frontend uses this to
     /// soft-warn on version mismatch.
     pub peer_commit: Option<[u8; 8]>,
+    /// round trip time of the last ping/pong exchange, in milliseconds
+    pub rtt_ms: Option<u64>,
+    /// when this client was last heard from, as seconds since the Unix epoch
+    pub last_seen: Option<u64>,
+    /// the client has an established (D)TLS connection right now
+    pub connected: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +209,15 @@ pub enum FrontendEvent {
     Enumerate(Vec<(ClientHandle, ClientConfig, ClientState)>),
     /// an error occured
     Error(String),
+    /// service is paused: capture and emulation are torn down but the process
+    /// keeps running and its IPC socket stays reachable
+    Paused(bool),
+    /// periodic restart interval in seconds, `None` when disabled
+    RestartInterval(Option<u64>),
+    /// the active log level
+    LogLevel(String),
+    /// buffered log records, oldest first
+    Logs(Vec<String>),
     /// capture status
     CaptureStatus(Status),
     /// emulation status
@@ -287,6 +302,24 @@ pub enum FrontendRequest {
     EnumerateVersion,
     /// enable or disable starting with the session
     SetAutostart(bool),
+    /// re-read the configuration file now
+    ReloadConfig,
+    /// suspend or resume input capture and emulation without exiting
+    SetPaused(bool),
+    /// exit so the supervisor (systemd / launchd) starts a fresh process
+    Restart,
+    /// schedule a periodic restart; `None` disables it
+    SetRestartInterval(Option<u64>),
+    /// request the pause state and restart schedule
+    EnumerateServiceState,
+    /// release the pointer from whatever client currently holds it
+    ForceRelease,
+    /// hand control to the next client (or back to this machine)
+    SwitchDevice,
+    /// change the log level at runtime; `None` keeps the current level
+    SetLogLevel(Option<String>),
+    /// request the last N log records
+    EnumerateLogs(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

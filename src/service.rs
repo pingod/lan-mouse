@@ -20,6 +20,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     sync::{Arc, RwLock},
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{process::Command, signal, sync::Notify};
@@ -70,6 +71,19 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+    /// capture and emulation are torn down while paused
+    paused: bool,
+    /// periodic restart interval, `None` disables it
+    restart_interval: Option<Duration>,
+    /// when the periodic restart timer last fired
+    last_restart: Instant,
+    /// set when an IPC request asked for a restart
+    should_exit: bool,
+    /// pause state requested over IPC, applied by the main loop
+    pending_pause: Option<bool>,
+    /// the client the pointer is currently handed to, tracked from the
+    /// capture event stream rather than inferred from connection state
+    active_capture: Option<ClientHandle>,
 }
 
 #[derive(Debug)]
@@ -104,6 +118,10 @@ impl Service {
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
+        // `Capture` owns the connection handle that carries `recv_rx`; the
+        // service keeps a clone for sending and preconnecting. A clone has no
+        // receive side, so handing the clone to the capture task would panic on
+        // its first `recv()`.
         let capture = Capture::new(
             capture_backend,
             conn,
@@ -117,6 +135,7 @@ impl Service {
         let resolver = DnsResolver::new()?;
 
         let port = config.port();
+        let config_restart_interval = config.restart_interval();
         let service = Self {
             config,
             capture,
@@ -135,6 +154,12 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
+            paused: false,
+            restart_interval: config_restart_interval,
+            last_restart: Instant::now(),
+            should_exit: false,
+            pending_pause: None,
+            active_capture: None,
         };
         Ok(service)
     }
@@ -154,14 +179,42 @@ impl Service {
 
         loop {
             tokio::select! {
-                request = self.frontend_listener.next() => self.handle_frontend_request(request),
+                request = self.frontend_listener.next() => {
+                    self.handle_frontend_request(request);
+                    if let Some(paused) = self.pending_pause.take() {
+                        self.set_paused(paused).await;
+                    }
+                }
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
-                keys = self.hotkeys.next() => self.hotkeys.send(keys, self.capture.is_active()).await,
+                fire = self.hotkeys.next() => match fire {
+                    crate::hotkey_task::HotkeyFire::Keys(keys) => {
+                        self.hotkeys.send(crate::hotkey_task::HotkeyFire::Keys(keys), self.capture.is_active()).await
+                    }
+                    crate::hotkey_task::HotkeyFire::Action(action) => match action {
+                        crate::hotkey_task::HotkeyAction::SwitchDevice => self.switch_device(),
+                        crate::hotkey_task::HotkeyAction::ForceRelease => {
+                            log::info!("force release (hotkey)");
+                            self.capture.release();
+                        }
+                    },
+                },
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 _ = self.config.changed() => self.handle_config_change(),
-                r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
+                _ = restart_tick(&self.restart_interval, self.last_restart) => {
+                    log::info!("scheduled restart");
+                    self.last_restart = Instant::now();
+                    self.should_exit = true;
+                }
+                r = signal::ctrl_c() => {
+                    r.expect("failed to wait for CTRL+C");
+                    break;
+                }
+            }
+            if self.should_exit {
+                log::info!("exiting for restart");
+                break;
             }
         }
 
@@ -174,6 +227,80 @@ impl Service {
         self.resolver.terminate().await;
 
         Ok(())
+    }
+
+    /// Suspend or resume capture and emulation without exiting.
+    ///
+    /// Pausing releases the pointer and stops the backends from acting while
+    /// leaving the process (and its IPC socket) alive. The backends cannot be
+    /// destroyed and rebuilt in place: the capture task owns the only receive
+    /// half of the connection, so a fresh `Capture` built from a clone would
+    /// panic on its first `recv()`. Instead the existing instances are released
+    /// and told to stand down.
+    async fn set_paused(&mut self, paused: bool) {
+        if self.paused == paused {
+            return;
+        }
+        self.paused = paused;
+        if paused {
+            log::info!("pausing: releasing the pointer and disabling backends");
+            self.capture.release();
+            self.capture.disable();
+            self.emulation.disable();
+        } else {
+            log::info!("resuming capture and emulation");
+            self.capture.reenable();
+            self.emulation.reenable();
+        }
+        self.notify_frontend(FrontendEvent::Paused(paused));
+        self.notify_frontend(FrontendEvent::CaptureStatus(if paused {
+            Status::Disabled
+        } else {
+            Status::Enabled
+        }));
+        self.notify_frontend(FrontendEvent::EmulationStatus(if paused {
+            Status::Disabled
+        } else {
+            Status::Enabled
+        }));
+    }
+
+    /// Hand control away from the peer that currently holds it.
+    ///
+    /// The capture backends can only take the pointer *back*: `release` returns
+    /// it to this machine. Moving it onto another peer is what the barrier does
+    /// when the user crosses that edge. So a switch means "take it back here",
+    /// and the next client is pre-warmed so the handshake is done by the time
+    /// the pointer reaches its edge.
+    ///
+    /// With no peer holding the pointer there is nothing to switch, and saying
+    /// so is better than a no-op that looks like it worked.
+    fn switch_device(&mut self) {
+        let Some(current) = self.capturing_client() else {
+            self.notify_frontend(FrontendEvent::Error(
+                "nothing to switch: the pointer is already on this machine".to_owned(),
+            ));
+            return;
+        };
+
+        log::info!("switch: taking the pointer back from client {current}");
+        self.capture.release();
+
+        // Warm the next active client so crossing to it is instant.
+        let active = self.client_manager.active_clients();
+        if let Some(next) = active.iter().copied().find(|h| *h != current) {
+            self.capture.preconnect(next);
+        }
+        self.sync_frontend();
+    }
+
+    /// The client the pointer is currently handed to, if any.
+    ///
+    /// Taken from the capture event stream: a connected peer is not the same
+    /// as a peer holding the pointer, and inferring it from `active_addr` made
+    /// "switch" jump to the wrong machine whenever a connection was idle.
+    fn capturing_client(&self) -> Option<ClientHandle> {
+        self.active_capture
     }
 
     fn handle_frontend_request(&mut self, request: Option<Result<FrontendRequest, IpcError>>) {
@@ -198,6 +325,48 @@ impl Service {
             FrontendRequest::Delete(handle) => {
                 self.remove_client(handle);
                 self.save_config();
+            }
+            FrontendRequest::ReloadConfig => self.handle_config_change(),
+            FrontendRequest::SetPaused(paused) => {
+                // The handler is synchronous; queue the work for the main loop.
+                self.pending_pause = Some(paused);
+            }
+            FrontendRequest::Restart => {
+                log::info!("restart requested over IPC");
+                // The supervisor restarts us; exiting cleanly lets it do so.
+                self.should_exit = true;
+            }
+            FrontendRequest::SetRestartInterval(secs) => {
+                self.restart_interval = secs.filter(|s| *s > 0).map(Duration::from_secs);
+                self.last_restart = Instant::now();
+                let secs = self.restart_interval.map(|d| d.as_secs());
+                self.notify_frontend(FrontendEvent::RestartInterval(secs));
+            }
+            FrontendRequest::ForceRelease => {
+                log::info!("force release requested");
+                self.capture.release();
+            }
+            FrontendRequest::SwitchDevice => self.switch_device(),
+            FrontendRequest::SetLogLevel(level) => match level {
+                Some(name) => match crate::logging::set_level(&name) {
+                    Ok(level) => {
+                        self.notify_frontend(FrontendEvent::LogLevel(
+                            crate::logging::level_name(level).to_owned(),
+                        ));
+                    }
+                    Err(e) => self.notify_frontend(FrontendEvent::Error(e)),
+                },
+                None => self.notify_frontend(FrontendEvent::LogLevel(
+                    crate::logging::level_name(crate::logging::current_level()).to_owned(),
+                )),
+            },
+            FrontendRequest::EnumerateLogs(n) => {
+                self.notify_frontend(FrontendEvent::Logs(crate::logging::recent(n)));
+            }
+            FrontendRequest::EnumerateServiceState => {
+                self.notify_frontend(FrontendEvent::Paused(self.paused));
+                let secs = self.restart_interval.map(|d| d.as_secs());
+                self.notify_frontend(FrontendEvent::RestartInterval(secs));
             }
             FrontendRequest::EnableCapture => self.capture.reenable(),
             FrontendRequest::EnableEmulation => self.emulation.reenable(),
@@ -259,6 +428,8 @@ impl Service {
         rules.push(crate::hotkey_task::Hotkey {
             from: from_keys,
             to: to_keys,
+            action: None,
+            taps: 1,
         });
         self.apply_hotkeys(rules);
     }
@@ -454,10 +625,14 @@ impl Service {
             }
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
+                self.active_capture = Some(handle);
                 self.spawn_hook_command(handle, HookKind::Enter);
             }
             ICaptureEvent::ClientLeft(handle) => {
                 log::info!("leaving client {handle} ...");
+                if self.active_capture == Some(handle) {
+                    self.active_capture = None;
+                }
                 self.spawn_hook_command(handle, HookKind::Leave);
             }
         }
@@ -812,6 +987,21 @@ fn canonical_key_name(name: &str) -> String {
     match chars.next() {
         Some(first) => format!("Key{}{}", first.to_ascii_uppercase(), chars.as_str()),
         None => String::new(),
+    }
+}
+
+/// Resolve when the periodic restart interval elapses.
+///
+/// Never resolves when no interval is configured, so the `select!` arm stays
+/// idle instead of spinning.
+async fn restart_tick(interval: &Option<Duration>, last: Instant) {
+    match interval {
+        Some(interval) => {
+            let elapsed = last.elapsed();
+            let remaining = interval.saturating_sub(elapsed);
+            tokio::time::sleep(remaining).await
+        }
+        None => std::future::pending().await,
     }
 }
 

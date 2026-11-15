@@ -11,7 +11,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::{collections::HashSet, io};
+use std::{collections::HashSet, io, time::Duration};
 use thiserror::Error;
 use toml;
 use toml_edit::{self, DocumentMut};
@@ -76,13 +76,35 @@ struct ConfigToml {
     authorized_fingerprints: Option<HashMap<String, String>>,
     remap: Option<Vec<TomlRule>>,
     hotkey: Option<Vec<TomlHotkey>>,
+    /// restart the service every N seconds; `None` disables it
+    restart_interval: Option<u64>,
 }
 
 /// A global hotkey: pressing `from` while typing locally sends `to` to the peer.
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
 struct TomlHotkey {
     from: Vec<scancode::Linux>,
+    #[serde(default)]
     to: Vec<scancode::Linux>,
+    /// local action to run instead of sending keys
+    #[serde(default)]
+    action: Option<TomlHotkeyAction>,
+    /// presses required: 1 = chord (default), 2 = double-tap
+    #[serde(default = "default_taps")]
+    taps: u8,
+}
+
+fn default_taps() -> u8 {
+    1
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum TomlHotkeyAction {
+    /// hand the pointer to the next device, or back to this one
+    SwitchDevice,
+    /// release the pointer without moving it
+    ForceRelease,
 }
 
 /// A chord rule: pressing all keys in `from` emits `to` on the peer.
@@ -514,6 +536,19 @@ impl Config {
     }
 
     /// release bind for returning control to the host
+    /// Periodic restart interval, if configured.
+    ///
+    /// Useful when the backends leak or the compositor's portal session goes
+    /// stale over long uptimes; the supervisor (systemd / launchd) restarts the
+    /// process and everything is rebuilt from the config file.
+    pub fn restart_interval(&self) -> Option<Duration> {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.restart_interval)
+            .filter(|secs| *secs > 0)
+            .map(Duration::from_secs)
+    }
+
     pub fn release_bind(&self) -> Vec<scancode::Linux> {
         self.config_toml
             .as_ref()
@@ -548,6 +583,15 @@ impl Config {
             .map(|h| crate::hotkey_task::Hotkey {
                 from: h.from.into_iter().map(|k| k as u32).collect(),
                 to: h.to.into_iter().map(|k| k as u32).collect(),
+                action: h.action.map(|a| match a {
+                    TomlHotkeyAction::SwitchDevice => {
+                        crate::hotkey_task::HotkeyAction::SwitchDevice
+                    }
+                    TomlHotkeyAction::ForceRelease => {
+                        crate::hotkey_task::HotkeyAction::ForceRelease
+                    }
+                }),
+                taps: h.taps.max(1),
             })
             .collect()
     }
@@ -565,6 +609,15 @@ impl Config {
                     .into_iter()
                     .filter_map(|k| scancode::Linux::try_from(k).ok())
                     .collect(),
+                action: h.action.map(|a| match a {
+                    crate::hotkey_task::HotkeyAction::SwitchDevice => {
+                        TomlHotkeyAction::SwitchDevice
+                    }
+                    crate::hotkey_task::HotkeyAction::ForceRelease => {
+                        TomlHotkeyAction::ForceRelease
+                    }
+                }),
+                taps: h.taps,
                 to: h
                     .to
                     .into_iter()

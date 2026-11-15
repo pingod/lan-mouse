@@ -1,4 +1,3 @@
-use env_logger::Env;
 use input_capture::InputCaptureError;
 use input_emulation::InputEmulationError;
 use lan_mouse::{
@@ -41,9 +40,21 @@ enum LanMouseError {
 }
 
 fn main() {
-    // init logging
-    let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", "info");
-    env_logger::init_from_env(env);
+    // Logging goes through an in-process ring buffer so the GUI and CLI can
+    // read recent records; `LAN_MOUSE_LOG_LEVEL` still sets the initial level
+    // and can be changed at runtime over IPC.
+    let raw = std::env::var("LAN_MOUSE_LOG_LEVEL").unwrap_or_else(|_| "info".to_owned());
+    let level = match raw.trim().to_ascii_lowercase().as_str() {
+        "off" => log::LevelFilter::Off,
+        "error" => log::LevelFilter::Error,
+        "warn" | "warning" => log::LevelFilter::Warn,
+        "debug" => log::LevelFilter::Debug,
+        "trace" => log::LevelFilter::Trace,
+        // Anything else (including module filters like `lan_mouse=debug`) falls
+        // back to info; the level can be changed at runtime over IPC.
+        _ => log::LevelFilter::Info,
+    };
+    lan_mouse::logging::init(level);
 
     if let Err(e) = run() {
         log::error!("{e}");

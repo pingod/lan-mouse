@@ -10,7 +10,7 @@ use std::{
     net::SocketAddr,
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{
@@ -42,6 +42,12 @@ pub(crate) enum LanMouseConnectionError {
 }
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Reserved `Leave` serial marking a locally-detected disconnect.
+///
+/// The serial is otherwise unused on the wire, so it cannot collide with a
+/// real Leave from a peer.
+pub(crate) const DISCONNECT_SERIAL: u32 = u32::MAX;
 
 async fn connect(
     addr: SocketAddr,
@@ -200,7 +206,14 @@ impl LanMouseConnection {
                     Ok(_) => {}
                     Err(e) => {
                         log::warn!("client {handle} failed to send: {e}");
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                        disconnect(
+                            &self.client_manager,
+                            handle,
+                            addr,
+                            &self.conns,
+                            &self.recv_tx,
+                        )
+                        .await;
                     }
                 }
                 log::trace!("{event} >->->->->- {addr}");
@@ -272,7 +285,12 @@ async fn connect_to_handle(
         }
 
         // poll connection for active
-        spawn_local(ping_pong(addr, conn.clone(), ping_response.clone()));
+        spawn_local(ping_pong(
+            addr,
+            conn.clone(),
+            ping_response.clone(),
+            client_manager.clone(),
+        ));
 
         // receiver
         spawn_local(receive_loop(
@@ -294,26 +312,52 @@ async fn ping_pong(
     addr: SocketAddr,
     conn: Arc<dyn Conn + Send + Sync>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    client_manager: ClientManager,
 ) {
     loop {
         let (buf, len) = ProtoEvent::Ping.into();
 
-        // send 4 pings, at least one must be answered
+        // Send four pings 500 ms apart so a single lost datagram does not tear
+        // the connection down; at least one must be answered.
+        //
+        // The round-trip estimate is measured from the *last* ping, not from
+        // the start of the round: the round itself deliberately spans 2 s, and
+        // reporting that as latency made a healthy link look like 2000 ms.
+        let mut sent_at: Option<Instant> = None;
         for _ in 0..4 {
+            let sent = Instant::now();
             if let Err(e) = conn.send(&buf[..len]).await {
                 log::warn!("{addr}: send error `{e}`, closing connection");
                 let _ = conn.close().await;
                 break;
             }
+            sent_at = Some(sent);
             log::trace!("PING >->->->->- {addr}");
 
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Sleep in short steps and stop as soon as a pong lands, so the
+            // measurement is not padded by the full 500 ms wait.
+            let deadline = sent + Duration::from_millis(500);
+            while Instant::now() < deadline {
+                if ping_response.borrow().contains(&addr) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if ping_response.borrow().contains(&addr) {
+                break;
+            }
         }
 
         if !ping_response.borrow_mut().remove(&addr) {
             log::warn!("{addr} did not respond, closing connection");
             let _ = conn.close().await;
             return;
+        }
+
+        // Time from the last ping to the moment its pong was observed.
+        if let Some(handle) = client_manager.handle_for_addr(addr) {
+            let rtt = sent_at.map(|t| t.elapsed());
+            client_manager.set_health(handle, rtt, true);
         }
     }
 }
@@ -352,7 +396,7 @@ async fn receive_loop(
         }
     }
     log::warn!("recv error");
-    disconnect(&client_manager, handle, addr, &conns).await;
+    disconnect(&client_manager, handle, addr, &conns, &tx).await;
 }
 
 async fn disconnect(
@@ -360,11 +404,27 @@ async fn disconnect(
     handle: ClientHandle,
     addr: SocketAddr,
     conns: &Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>,
+    tx: &Sender<(ClientHandle, ProtoEvent)>,
 ) {
     log::warn!("client ({handle}) @ {addr} connection closed");
     conns.lock().await.remove(&addr);
     client_manager.set_active_addr(handle, None);
     client_manager.set_peer_commit(handle, None);
+    // Clear the health flags too, otherwise the UI keeps showing the peer as
+    // connected with a stale round-trip time.
+    client_manager.set_disconnected(handle);
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
+
+    // Tell the service so it can drop the capture. Without this the sender
+    // keeps believing it owns the pointer: the compositor has it hidden on the
+    // remote edge and the peer is gone, so there is no one to send `Leave` and
+    // the pointer can never come back (the "pointer left and never returned"
+    // symptom after the receiving machine is stopped).
+    //
+    // A `Leave` with the reserved serial `DISCONNECT_SERIAL` is an in-process
+    // marker meaning "the connection is gone", not a peer-initiated Leave. The
+    // capture task acts on it immediately: the dwell check exists to ignore a
+    // peer's enter/leave fight, and there is no peer left to fight with.
+    let _ = tx.send((handle, ProtoEvent::Leave(DISCONNECT_SERIAL)));
 }

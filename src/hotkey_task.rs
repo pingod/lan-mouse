@@ -23,6 +23,28 @@ pub(crate) use noop::Hotkeys;
 pub(crate) struct Hotkey {
     pub from: Vec<u32>,
     pub to: Vec<u32>,
+    /// Run a local action instead of typing `to` on the peer.
+    pub action: Option<HotkeyAction>,
+    /// Number of presses required. `1` is a chord; `2` means double-tap.
+    pub taps: u8,
+}
+
+/// What a hotkey trigger produced.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HotkeyFire {
+    /// Type these keys on the peer.
+    Keys(Vec<u32>),
+    /// Run a local action.
+    Action(HotkeyAction),
+}
+
+/// What a hotkey does locally instead of sending keystrokes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HotkeyAction {
+    /// Hand the pointer back to this machine, or forward it to the next peer.
+    SwitchDevice,
+    /// Release the pointer without moving it.
+    ForceRelease,
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -32,7 +54,7 @@ mod imp {
     use tokio::io::unix::AsyncFd;
     use tokio::sync::mpsc;
 
-    use super::Hotkey;
+    use super::{Hotkey, HotkeyFire};
     use crate::{
         config::Config,
         connect::{LanMouseConnection, LanMouseConnectionError},
@@ -111,15 +133,18 @@ mod imp {
         }
 
         /// Wait for the next hotkey trigger.
-        pub(crate) async fn next(&mut self) -> Vec<u32> {
+        ///
+        /// Returns the action when the rule is local, otherwise the key
+        /// sequence to type on the peer.
+        pub(crate) async fn next(&mut self) -> HotkeyFire {
             loop {
                 let Some(sample) = self.key_rx.recv().await else {
                     // every device closed; nothing left to watch
                     std::future::pending::<()>().await;
                     unreachable!()
                 };
-                if let Some(seq) = self.state.on_key(sample) {
-                    return seq;
+                if let Some(fire) = self.state.on_key(sample) {
+                    return fire;
                 }
             }
         }
@@ -127,7 +152,12 @@ mod imp {
         /// `capture_active` reports whether the pointer is currently captured
         /// by a remote client. While it is, the capture path already forwards
         /// every keystroke, so firing here would send the chord twice.
-        pub(crate) async fn send(&self, keys: Vec<u32>, capture_active: bool) {
+        pub(crate) async fn send(&self, fire: HotkeyFire, capture_active: bool) {
+            let HotkeyFire::Keys(keys) = fire else {
+                // Local actions are handled by the service, which owns the
+                // capture and client state.
+                return;
+            };
             if capture_active {
                 log::trace!("hotkey suppressed: capture is forwarding input");
                 return;

@@ -290,6 +290,7 @@ impl Window {
         let client = ClientObject::new(handle, client, state.clone());
         self.clients().append(&client);
         self.update_placeholder_visibility();
+
         self.update_dns_state(handle, !state.ips.is_empty());
     }
 
@@ -343,6 +344,8 @@ impl Window {
     pub(super) fn request_initial_state(&self) {
         self.request(FrontendRequest::EnumerateHotkeys);
         self.request(FrontendRequest::EnumerateVersion);
+        self.request(FrontendRequest::EnumerateServiceState);
+        self.request_logs();
     }
 
     pub(super) fn set_version(&self, version: &str, commit: &str) {
@@ -360,6 +363,61 @@ impl Window {
 
     pub(super) fn request_autostart(&self, enabled: bool) {
         self.request(FrontendRequest::SetAutostart(enabled));
+    }
+
+    pub(super) fn set_paused(&self, paused: bool) {
+        let imp = self.imp();
+        imp.pause_updating.set(true);
+        imp.pause_switch.set_active(paused);
+        imp.pause_updating.set(false);
+    }
+
+    pub(super) fn request_pause(&self, paused: bool) {
+        self.request(FrontendRequest::SetPaused(paused));
+    }
+
+    pub(super) fn request_restart(&self) {
+        self.request(FrontendRequest::Restart);
+    }
+
+    pub(super) fn request_reload(&self) {
+        self.request(FrontendRequest::ReloadConfig);
+    }
+
+    pub(super) fn set_log_level(&self, level: &str) {
+        self.imp().log_level_label.set_text(level);
+    }
+
+    pub(super) fn set_logs(&self, lines: Vec<String>) {
+        let imp = self.imp();
+        imp.log_buffer.borrow().set_text(&lines.join("\n"));
+        // Keep the newest record visible.
+        let view = imp.log_view.get();
+        let mut end = view.buffer().end_iter();
+        view.scroll_to_iter(&mut end, 0.0, false, 0.0, 0.0);
+    }
+
+    pub(super) fn request_logs(&self) {
+        self.request(FrontendRequest::EnumerateLogs(500));
+        self.request(FrontendRequest::SetLogLevel(None));
+    }
+
+    pub(super) fn request_log_level(&self, level: &str) {
+        self.request(FrontendRequest::SetLogLevel(Some(level.to_owned())));
+    }
+
+    pub(super) fn request_force_release(&self) {
+        self.request(FrontendRequest::ForceRelease);
+    }
+
+    pub(super) fn request_switch_device(&self) {
+        self.request(FrontendRequest::SwitchDevice);
+    }
+
+    pub(super) fn set_restart_interval(&self, secs: Option<u64>) {
+        self.imp()
+            .restart_interval_entry
+            .set_text(&secs.map(|s| s.to_string()).unwrap_or_default());
     }
 
     /// Prompt for `from` and `to`, then add the rule.
@@ -467,6 +525,8 @@ impl Window {
 
         /* dns state */
         client_object.set_resolving(state.resolving);
+
+        row.set_status(&state);
 
         self.update_dns_state(handle, !state.ips.is_empty());
         let ips = state

@@ -75,6 +75,29 @@ enum CliSubcommand {
     RemoveAuthorizedKey { sha256_fingerprint: String },
     /// save configuration to file
     SaveConfig,
+    /// re-read the configuration file now
+    ReloadConfig,
+    /// suspend input capture and emulation without quitting
+    Pause,
+    /// resume after [`Self::Pause`]
+    Resume,
+    /// exit so the service manager starts a fresh process
+    Restart,
+    /// restart every N seconds; 0 disables
+    SetRestartInterval { seconds: u64 },
+    /// show pause state, restart schedule and per-client connection health
+    Status,
+    /// release the pointer from the remote machine
+    ForceRelease,
+    /// hand control to the next machine, or back to this one
+    Switch,
+    /// show recent service log records
+    Logs {
+        #[arg(default_value_t = 100)]
+        lines: usize,
+    },
+    /// change the log level at runtime
+    SetLogLevel { level: String },
 }
 
 pub async fn run(args: CliArgs) -> Result<(), CliError> {
@@ -134,8 +157,13 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                         let pos = config.pos;
                         let active = state.active;
                         let ips = state.ips;
+                        let health = match (state.connected, state.rtt_ms) {
+                            (true, Some(rtt)) => format!("connected, rtt {rtt} ms"),
+                            (true, None) => "connected".to_owned(),
+                            (false, _) => "not connected".to_owned(),
+                        };
                         println!(
-                            "id {handle}: {host}:{port} ({pos}) active: {active}, ips: {ips:?}"
+                            "id {handle}: {host}:{port} ({pos}) active: {active}, {health}, ips: {ips:?}"
                         );
                     }
                     break;
@@ -172,6 +200,99 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 .await?
         }
         CliSubcommand::SaveConfig => tx.request(FrontendRequest::SaveConfiguration).await?,
+        CliSubcommand::ReloadConfig => tx.request(FrontendRequest::ReloadConfig).await?,
+        CliSubcommand::Pause => tx.request(FrontendRequest::SetPaused(true)).await?,
+        CliSubcommand::Resume => tx.request(FrontendRequest::SetPaused(false)).await?,
+        CliSubcommand::Restart => tx.request(FrontendRequest::Restart).await?,
+        CliSubcommand::SetRestartInterval { seconds } => {
+            let interval = if seconds == 0 { None } else { Some(seconds) };
+            tx.request(FrontendRequest::SetRestartInterval(interval))
+                .await?
+        }
+        CliSubcommand::ForceRelease => tx.request(FrontendRequest::ForceRelease).await?,
+        CliSubcommand::Switch => tx.request(FrontendRequest::SwitchDevice).await?,
+        CliSubcommand::Logs { lines } => {
+            tx.request(FrontendRequest::EnumerateLogs(lines)).await?;
+            while let Some(e) = rx.next().await {
+                if let FrontendEvent::Logs(records) = e? {
+                    for record in records {
+                        println!("{record}");
+                    }
+                    break;
+                }
+            }
+        }
+        CliSubcommand::SetLogLevel { level } => {
+            tx.request(FrontendRequest::SetLogLevel(Some(level)))
+                .await?;
+            while let Some(e) = rx.next().await {
+                match e? {
+                    FrontendEvent::LogLevel(level) => {
+                        println!("log level: {level}");
+                        break;
+                    }
+                    FrontendEvent::Error(e) => {
+                        eprintln!("{e}");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        CliSubcommand::Status => {
+            tx.request(FrontendRequest::Enumerate()).await?;
+            tx.request(FrontendRequest::EnumerateServiceState).await?;
+            let mut paused: Option<bool> = None;
+            let mut interval: Option<Option<u64>> = None;
+            let mut clients: Option<Vec<_>> = None;
+            while let Some(e) = rx.next().await {
+                match e? {
+                    FrontendEvent::Paused(p) => paused = Some(p),
+                    FrontendEvent::RestartInterval(s) => interval = Some(s),
+                    FrontendEvent::Enumerate(c) => clients = Some(c),
+                    _ => {}
+                }
+                if paused.is_some() && interval.is_some() && clients.is_some() {
+                    break;
+                }
+            }
+            println!(
+                "service: {}",
+                match paused {
+                    Some(true) => "paused",
+                    Some(false) => "running",
+                    None => "unknown",
+                }
+            );
+            match interval.flatten() {
+                Some(secs) => println!("scheduled restart: every {secs}s"),
+                None => println!("scheduled restart: off"),
+            }
+            for (handle, config, state) in clients.unwrap_or_default() {
+                let host = config.hostname.unwrap_or_else(|| "unknown".to_owned());
+                println!("id {handle}: {host}:{} ({})", config.port, config.pos);
+                println!(
+                    "  enabled: {}, connected: {}, alive: {}, resolving: {}",
+                    state.active, state.connected, state.alive, state.resolving
+                );
+                if let Some(addr) = state.active_addr {
+                    println!("  address: {addr}");
+                }
+                if let Some(rtt) = state.rtt_ms {
+                    println!("  round trip: {rtt} ms");
+                }
+                if let Some(seen) = state.last_seen {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(seen);
+                    println!("  last seen: {}s ago", now.saturating_sub(seen));
+                }
+                if state.has_pressed_keys {
+                    println!("  keys held on peer");
+                }
+            }
+        }
     }
     Ok(())
 }

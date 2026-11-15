@@ -349,6 +349,10 @@ fn build_ui(app: &Application) {
                         window.set_autostart(autostart);
                     }
                     FrontendEvent::Autostart(enabled) => window.set_autostart(enabled),
+                    FrontendEvent::Paused(paused) => window.set_paused(paused),
+                    FrontendEvent::RestartInterval(secs) => window.set_restart_interval(secs),
+                    FrontendEvent::LogLevel(level) => window.set_log_level(&level),
+                    FrontendEvent::Logs(lines) => window.set_logs(lines),
                 }
             }
         }

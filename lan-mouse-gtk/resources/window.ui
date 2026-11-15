@@ -210,6 +210,90 @@
                           </object>
                         </child>
                         <child>
+                          <object class="AdwActionRow" id="force_release_row">
+                            <property name="title" translatable="yes">release input</property>
+                            <property name="subtitle" translatable="yes">hand the pointer back to this machine immediately</property>
+                            <property name="icon-name">input-mouse-symbolic</property>
+                            <child>
+                              <object class="GtkButton" id="force_release_button">
+                                <property name="valign">center</property>
+                                <property name="label" translatable="yes">Release</property>
+                                <signal name="clicked" handler="handle_force_release_pressed" swapped="true"/>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="AdwActionRow" id="switch_device_row">
+                            <property name="title" translatable="yes">switch device</property>
+                            <property name="subtitle" translatable="yes">hand control to the next machine, or back to this one</property>
+                            <property name="icon-name">object-flip-horizontal-symbolic</property>
+                            <child>
+                              <object class="GtkButton" id="switch_device_button">
+                                <property name="valign">center</property>
+                                <property name="label" translatable="yes">Switch</property>
+                                <signal name="clicked" handler="handle_switch_device_pressed" swapped="true"/>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="AdwActionRow" id="pause_row">
+                            <property name="title" translatable="yes">pause</property>
+                            <property name="subtitle" translatable="yes">stop capturing and emulating input without quitting</property>
+                            <property name="icon-name">media-playback-pause-symbolic</property>
+                            <child>
+                              <object class="GtkSwitch" id="pause_switch">
+                                <property name="valign">center</property>
+                                <signal name="notify::active" handler="handle_pause_toggled" swapped="true"/>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="AdwActionRow" id="restart_row">
+                            <property name="title" translatable="yes">restart</property>
+                            <property name="subtitle" translatable="yes">exit so the service manager starts a fresh process</property>
+                            <property name="icon-name">view-refresh-symbolic</property>
+                            <child>
+                              <object class="GtkButton" id="restart_button">
+                                <property name="valign">center</property>
+                                <property name="label" translatable="yes">Restart</property>
+                                <signal name="clicked" handler="handle_restart_pressed" swapped="true"/>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="AdwActionRow" id="reload_row">
+                            <property name="title" translatable="yes">reload config</property>
+                            <property name="subtitle" translatable="yes">re-read config.toml now (also happens automatically on change)</property>
+                            <property name="icon-name">document-revert-symbolic</property>
+                            <child>
+                              <object class="GtkButton" id="reload_button">
+                                <property name="valign">center</property>
+                                <property name="label" translatable="yes">Reload</property>
+                                <signal name="clicked" handler="handle_reload_pressed" swapped="true"/>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="AdwActionRow" id="restart_interval_row">
+                            <property name="title" translatable="yes">scheduled restart</property>
+                            <property name="subtitle" translatable="yes">restart every N seconds (empty disables)</property>
+                            <property name="icon-name">alarm-symbolic</property>
+                            <child>
+                              <object class="GtkEntry" id="restart_interval_entry">
+                                <property name="valign">center</property>
+                                <property name="input_purpose">GTK_INPUT_PURPOSE_NUMBER</property>
+                                <property name="width-chars">8</property>
+                                <property name="placeholder-text" translatable="yes">seconds</property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
                           <object class="AdwActionRow" id="version_row">
                             <property name="title" translatable="yes">version</property>
                             <property name="subtitle">-</property>
@@ -249,6 +333,67 @@
                           <object class="AdwActionRow" id="hotkey_placeholder_row">
                             <property name="title" translatable="yes">No hotkeys</property>
                             <property name="subtitle" translatable="yes">add a rule with the + button</property>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="AdwPreferencesGroup">
+                        <property name="title" translatable="yes">Logs</property>
+                        <property name="description" translatable="yes">Recent records from the running service. Raise the level to debug when something misbehaves.</property>
+                        <property name="header-suffix">
+                          <object class="GtkButton" id="log_refresh_button">
+                            <signal name="clicked" handler="handle_log_refresh_pressed" swapped="true"/>
+                            <property name="child">
+                              <object class="AdwButtonContent">
+                                <property name="icon-name">view-refresh-symbolic</property>
+                                <property name="label" translatable="yes">Refresh</property>
+                              </object>
+                            </property>
+                            <style>
+                              <class name="flat"/>
+                            </style>
+                          </object>
+                        </property>
+                        <child>
+                          <object class="AdwComboRow" id="log_level_combo">
+                            <property name="title" translatable="yes">level</property>
+                            <property name="subtitle">-</property>
+                            <property name="model">
+                              <object class="GtkStringList">
+                                <items>
+                                  <item>off</item>
+                                  <item>error</item>
+                                  <item>warn</item>
+                                  <item>info</item>
+                                  <item>debug</item>
+                                  <item>trace</item>
+                                </items>
+                              </object>
+                            </property>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="AdwActionRow" id="log_level_row">
+                            <property name="title" translatable="yes">active level</property>
+                            <child>
+                              <object class="GtkLabel" id="log_level_label">
+                                <property name="label">-</property>
+                                <property name="valign">center</property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkScrolledWindow">
+                            <property name="min-content-height">240</property>
+                            <property name="child">
+                              <object class="GtkTextView" id="log_view">
+                                <property name="editable">false</property>
+                                <property name="monospace">true</property>
+                                <property name="wrap-mode">GTK_WRAP_WORD_CHAR</property>
+                              </object>
+                            </property>
                           </object>
                         </child>
                       </object>
