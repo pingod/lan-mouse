@@ -224,6 +224,8 @@ pub enum FrontendEvent {
     Logs(Vec<String>),
     /// records appended to a live stream
     LogAppended(Vec<String>),
+    /// a full snapshot of every inbound connection
+    IncomingConnections(Vec<IncomingInfo>),
     /// capture status
     CaptureStatus(Status),
     /// emulation status
@@ -328,6 +330,23 @@ pub enum FrontendRequest {
     EnumerateLogs(usize),
     /// stream new records as they are written; `None` stops the stream
     SubscribeLogs(Option<usize>),
+}
+
+/// One device currently driving (or allowed to drive) this machine.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct IncomingInfo {
+    /// peer address
+    pub addr: SocketAddr,
+    /// peer certificate fingerprint (SHA-256, colon separated)
+    pub fingerprint: String,
+    /// side of this screen the peer entered from
+    pub pos: Position,
+    /// seconds since this peer last sent an event
+    pub idle_secs: u64,
+    /// events received from this peer since it connected
+    pub received: u64,
+    /// whether this peer is the one currently holding the pointer
+    pub active: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

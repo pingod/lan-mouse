@@ -71,6 +71,12 @@ pub struct Window {
     pub peers_row: TemplateChild<ActionRow>,
     #[template_child]
     pub traffic_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub latency_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub incoming_list: TemplateChild<ListBox>,
+    #[template_child]
+    pub incoming_placeholder: TemplateChild<ActionRow>,
     pub clients: RefCell<Option<gio::ListStore>>,
     pub authorized: RefCell<Option<gio::ListStore>>,
     pub frontend_request_writer: RefCell<Option<FrontendRequestWriter>>,

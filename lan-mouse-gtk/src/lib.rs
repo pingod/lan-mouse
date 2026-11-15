@@ -95,6 +95,11 @@ fn gtk_main() -> glib::ExitCode {
 
     let app = Application::builder()
         .application_id("de.feschber.LanMouse")
+        // Allow several instances: the GTK single-instance handshake goes over
+        // D-Bus, which a bare Wayland session in a test sandbox may not have.
+        // The daemon already enforces one IPC listener, so a second GUI just
+        // connects to it.
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
     app.connect_startup(|app| {
@@ -336,6 +341,7 @@ fn build_ui(app: &Application) {
                     } => {
                         window.show_toast(format!("device entered: {addr} ({pos})").as_str());
                     }
+                    FrontendEvent::IncomingConnections(infos) => window.set_incoming(infos),
                     FrontendEvent::IncomingDisconnected(addr) => {
                         window.show_toast(format!("{addr} disconnected").as_str());
                     }

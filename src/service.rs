@@ -93,6 +93,10 @@ struct Incoming {
     fingerprint: String,
     addr: SocketAddr,
     pos: Position,
+    /// when this peer last sent an event
+    last_seen: Instant,
+    /// events received since it connected
+    received: u64,
 }
 
 impl Service {
@@ -600,6 +604,15 @@ impl Service {
                 pos,
                 fingerprint,
             } => {
+                // A peer entered this machine: it is now driving us.
+                if let Some(incoming) = self
+                    .incoming_conn_info
+                    .values_mut()
+                    .find(|i| i.addr == addr)
+                {
+                    incoming.last_seen = Instant::now();
+                    incoming.received = incoming.received.saturating_add(1);
+                }
                 // check if already registered
                 if !self.incoming_conns.contains(&addr) {
                     self.add_incoming(addr, pos, fingerprint.clone());
@@ -611,6 +624,7 @@ impl Service {
                 } else {
                     self.update_incoming(addr, pos, fingerprint);
                 }
+                self.publish_incoming();
             }
             EmulationEvent::Disconnected { addr } => {
                 if let Some(addr) = self.remove_incoming(addr) {
@@ -734,6 +748,26 @@ impl Service {
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;
 
+    /// Publish a snapshot of every inbound connection.
+    fn publish_incoming(&mut self) {
+        let active_addr = self
+            .active_capture
+            .and_then(|h| self.incoming_conn_info.get(&h).map(|i| i.addr));
+        let infos: Vec<lan_mouse_ipc::IncomingInfo> = self
+            .incoming_conn_info
+            .values()
+            .map(|i| lan_mouse_ipc::IncomingInfo {
+                addr: i.addr,
+                fingerprint: i.fingerprint.clone(),
+                pos: i.pos,
+                idle_secs: i.last_seen.elapsed().as_secs(),
+                received: i.received,
+                active: active_addr == Some(i.addr),
+            })
+            .collect();
+        self.notify_frontend(FrontendEvent::IncomingConnections(infos));
+    }
+
     fn add_incoming(&mut self, addr: SocketAddr, pos: Position, fingerprint: String) {
         let handle = Self::ENTER_HANDLE_BEGIN + self.next_trigger_handle;
         self.next_trigger_handle += 1;
@@ -745,6 +779,8 @@ impl Service {
                 fingerprint,
                 addr,
                 pos,
+                last_seen: Instant::now(),
+                received: 0,
             },
         );
     }

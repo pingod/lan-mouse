@@ -745,6 +745,43 @@ impl Window {
         self.update_capture_emulation_status();
     }
 
+    /// Render the inbound connection list and the latency summary.
+    pub(super) fn set_incoming(&self, infos: Vec<lan_mouse_ipc::IncomingInfo>) {
+        let imp = self.imp();
+        let list = imp.incoming_list.get();
+        while let Some(child) = list.first_child() {
+            list.remove(&child);
+        }
+        imp.incoming_placeholder.set_visible(infos.is_empty());
+
+        for info in &infos {
+            let row = adw::ActionRow::builder()
+                .title(info.addr.to_string())
+                .subtitle(format!(
+                    "from {} · {} event(s) · idle {}s{}",
+                    info.pos,
+                    info.received,
+                    info.idle_secs,
+                    if info.active { " · driving" } else { "" }
+                ))
+                .build();
+            let fp: String = info.fingerprint.chars().take(23).collect();
+            row.add_suffix(
+                &gtk::Label::builder()
+                    .label(format!("{fp}…"))
+                    .css_classes(["dim-label", "caption"])
+                    .build(),
+            );
+            list.append(&row);
+        }
+
+        let active = infos.iter().find(|i| i.active);
+        imp.latency_row.set_subtitle(&match active {
+            Some(i) => format!("{} is driving · {}s idle", i.addr, i.idle_secs),
+            None => "no inbound traffic".to_owned(),
+        });
+    }
+
     /// Show which machine the pointer is currently on, plus the best peer RTT.
     fn update_active_device_row(&self) {
         let imp = self.imp();

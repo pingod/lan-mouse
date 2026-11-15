@@ -110,6 +110,7 @@
                         <child>
                           <object class="AdwPreferencesGroup">
                             <property name="title" translatable="yes">Activity</property>
+                            <property name="description" translatable="yes">Live view of the link: who is connected, how far away they are, and how much has moved.</property>
                             <child>
                               <object class="AdwActionRow" id="peers_row">
                                 <property name="title" translatable="yes">Peers</property>
@@ -122,6 +123,33 @@
                                 <property name="title" translatable="yes">Forwarded</property>
                                 <property name="subtitle">-</property>
                                 <property name="icon-name">go-next-symbolic</property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="AdwActionRow" id="latency_row">
+                                <property name="title" translatable="yes">Latency</property>
+                                <property name="subtitle">-</property>
+                                <property name="icon-name">alarm-symbolic</property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="AdwPreferencesGroup">
+                            <property name="title" translatable="yes">Inbound</property>
+                            <property name="description" translatable="yes">Devices currently driving this machine.</property>
+                            <child>
+                              <object class="GtkListBox" id="incoming_list">
+                                <property name="selection-mode">none</property>
+                                <child type="placeholder">
+                                  <object class="AdwActionRow" id="incoming_placeholder">
+                                    <property name="title">No inbound connections</property>
+                                    <property name="subtitle">this machine is not being driven right now</property>
+                                  </object>
+                                </child>
+                                <style>
+                                  <class name="boxed-list"/>
+                                </style>
                               </object>
                             </child>
                           </object>

@@ -10,23 +10,35 @@
   </gresource>
   <gresource prefix="/de/feschber/LanMouse/icons">
     <file compressed="true" preprocess="xml-stripblanks">de.feschber.LanMouse.svg</file>
-    <!--
-      Bundled Adwaita symbolic icons so the GTK frontend has a complete icon set
-      on platforms (notably macOS) where the Adwaita icon theme is not installed.
-      Registered via IconTheme::add_resource_path("/de/feschber/LanMouse/icons").
-    -->
+    <file compressed="true" preprocess="xml-stripblanks" alias="scalable/actions/document-revert-symbolic.svg">icons/scalable/actions/document-revert-symbolic.svg</file>
+    <file compressed="true" preprocess="xml-stripblanks" alias="scalable/actions/edit-clear-symbolic.svg">icons/scalable/actions/edit-clear-symbolic.svg</file>
     <file compressed="true" preprocess="xml-stripblanks" alias="scalable/actions/edit-copy-symbolic.svg">icons/scalable/actions/edit-copy-symbolic.svg</file>
     <file compressed="true" preprocess="xml-stripblanks" alias="scalable/actions/edit-delete-symbolic.svg">icons/scalable/actions/edit-delete-symbolic.svg</file>
     <file compressed="true" preprocess="xml-stripblanks" alias="scalable/actions/emblem-ok-symbolic.svg">icons/scalable/actions/emblem-ok-symbolic.svg</file>
+    <file compressed="true" preprocess="xml-stripblanks" alias="scalable/actions/go-next-symbolic.svg">icons/scalable/actions/go-next-symbolic.svg</file>
+    <file compressed="true" preprocess="xml-stripblanks" alias="scalable/actions/help-about-symbolic.svg">icons/scalable/actions/help-about-symbolic.svg</file>
     <file compressed="true" preprocess="xml-stripblanks" alias="scalable/actions/list-add-symbolic.svg">icons/scalable/actions/list-add-symbolic.svg</file>
+    <file compressed="true" preprocess="xml-stripblanks" alias="scalable/actions/media-playback-pause-symbolic.svg">icons/scalable/actions/media-playback-pause-symbolic.svg</file>
+    <file compressed="true" preprocess="xml-stripblanks" alias="scalable/actions/object-flip-horizontal-symbolic.svg">icons/scalable/actions/object-flip-horizontal-symbolic.svg</file>
     <file compressed="true" preprocess="xml-stripblanks" alias="scalable/actions/object-rotate-right-symbolic.svg">icons/scalable/actions/object-rotate-right-symbolic.svg</file>
     <file compressed="true" preprocess="xml-stripblanks" alias="scalable/actions/object-select-symbolic.svg">icons/scalable/actions/object-select-symbolic.svg</file>
     <file compressed="true" preprocess="xml-stripblanks" alias="scalable/actions/open-menu-symbolic.svg">icons/scalable/actions/open-menu-symbolic.svg</file>
     <file compressed="true" preprocess="xml-stripblanks" alias="scalable/actions/process-stop-symbolic.svg">icons/scalable/actions/process-stop-symbolic.svg</file>
+    <file compressed="true" preprocess="xml-stripblanks" alias="scalable/actions/system-run-symbolic.svg">icons/scalable/actions/system-run-symbolic.svg</file>
+    <file compressed="true" preprocess="xml-stripblanks" alias="scalable/actions/view-refresh-symbolic.svg">icons/scalable/actions/view-refresh-symbolic.svg</file>
     <file compressed="true" preprocess="xml-stripblanks" alias="scalable/devices/auth-fingerprint-symbolic.svg">icons/scalable/devices/auth-fingerprint-symbolic.svg</file>
+    <file compressed="true" preprocess="xml-stripblanks" alias="scalable/devices/computer-symbolic.svg">icons/scalable/devices/computer-symbolic.svg</file>
+    <file compressed="true" preprocess="xml-stripblanks" alias="scalable/devices/input-keyboard-symbolic.svg">icons/scalable/devices/input-keyboard-symbolic.svg</file>
+    <file compressed="true" preprocess="xml-stripblanks" alias="scalable/devices/input-mouse-symbolic.svg">icons/scalable/devices/input-mouse-symbolic.svg</file>
     <file compressed="true" preprocess="xml-stripblanks" alias="scalable/devices/network-wired-symbolic.svg">icons/scalable/devices/network-wired-symbolic.svg</file>
+    <file compressed="true" preprocess="xml-stripblanks" alias="scalable/legacy/emblem-system-symbolic.svg">icons/scalable/legacy/emblem-system-symbolic.svg</file>
+    <file compressed="true" preprocess="xml-stripblanks" alias="scalable/legacy/utilities-terminal-symbolic.svg">icons/scalable/legacy/utilities-terminal-symbolic.svg</file>
     <file compressed="true" preprocess="xml-stripblanks" alias="scalable/places/user-trash-symbolic.svg">icons/scalable/places/user-trash-symbolic.svg</file>
+    <file compressed="true" preprocess="xml-stripblanks" alias="scalable/status/alarm-symbolic.svg">icons/scalable/status/alarm-symbolic.svg</file>
     <file compressed="true" preprocess="xml-stripblanks" alias="scalable/status/dialog-warning-symbolic.svg">icons/scalable/status/dialog-warning-symbolic.svg</file>
+    <file compressed="true" preprocess="xml-stripblanks" alias="scalable/status/network-transmit-receive-symbolic.svg">icons/scalable/status/network-transmit-receive-symbolic.svg</file>
     <file compressed="true" preprocess="xml-stripblanks" alias="scalable/status/network-wired-disconnected-symbolic.svg">icons/scalable/status/network-wired-disconnected-symbolic.svg</file>
+    <file compressed="true" preprocess="xml-stripblanks" alias="scalable/status/utilities-system-monitor-symbolic.svg">icons/scalable/status/utilities-system-monitor-symbolic.svg</file>
+    <file compressed="true" preprocess="xml-stripblanks" alias="scalable/ui/window-close-symbolic.svg">icons/scalable/ui/window-close-symbolic.svg</file>
   </gresource>
 </gresources>
