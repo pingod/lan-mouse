@@ -44,33 +44,6 @@ jobs:
           target/release/bundle/deb/lan-mouse_*.deb
           target/release/bundle/appimage/lan-mouse_*.AppImage
 
-  linux-arm64-release-build:
-    runs-on: ubuntu-24.04-arm
-    steps:
-    - uses: actions/checkout@v6
-    - name: install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install libx11-dev libxtst-dev
-        sudo apt-get install libadwaita-1-dev libgtk-4-dev
-    - name: Release Build
-      run: |
-        cargo build --release
-        cp target/release/lan-mouse lan-mouse-linux-arm64
-    - name: Install cargo bundle
-      run: cargo install cargo-bundle --version "0.11.0"  # 0.12 pulls sigstore, which fails to build on current rustc
-    - name: Bundle
-      run: |
-        cargo bundle --release
-    - name: Upload build artifact
-      uses: actions/upload-artifact@v6
-      with:
-        name: lan-mouse-linux-arm64
-        path: |
-          lan-mouse-linux-arm64
-          target/release/bundle/deb/lan-mouse_*.deb
-          target/release/bundle/appimage/lan-mouse_*.AppImage
-
   windows-release-build:
     runs-on: windows-latest
     steps:
@@ -123,36 +96,6 @@ jobs:
         name: lan-mouse-windows-x86_64
         path: lan-mouse-windows-x86_64.zip
 
-  macos-release-build:
-    runs-on: macos-15-intel
-    steps:
-    - uses: actions/checkout@v6
-    - name: install dependencies
-      run: |
-        brew install --cask inkscape
-        brew install gtk4 libadwaita imagemagick librsvg
-    - name: Release Build
-      run: |
-        cargo build --release
-        cp target/release/lan-mouse lan-mouse-macos-intel
-    - name: Make icns
-      run: scripts/makeicns.sh
-    - name: Install cargo bundle
-      run: cargo install cargo-bundle --version "0.11.0"  # 0.12 pulls sigstore, which fails to build on current rustc
-    - name: Bundle
-      run: |
-        cargo bundle --release
-        scripts/copy-macos-dylib.sh "target/release/bundle/osx/Lan Mouse.app/Contents/MacOS/lan-mouse"
-    - name: Zip bundle
-      run: |
-        cd target/release/bundle/osx
-        zip -r "lan-mouse-macos-intel.zip" "Lan Mouse.app"
-    - name: Upload build artifact
-      uses: actions/upload-artifact@v6
-      with:
-        name: lan-mouse-macos-intel
-        path: target/release/bundle/osx/lan-mouse-macos-intel.zip
-
   macos-arm64-release-build:
     runs-on: macos-15
     steps:
@@ -185,7 +128,7 @@ jobs:
 
   release:
     name: "Release"
-    needs: [windows-release-build, linux-release-build, linux-arm64-release-build, macos-release-build, macos-arm64-release-build]
+    needs: [windows-release-build, linux-release-build, macos-arm64-release-build]
     runs-on: "ubuntu-latest"
     # The default token is read-only; creating a release and generating its
     # notes needs write access to the repository contents.
@@ -210,10 +153,6 @@ jobs:
           lan-mouse-linux-x86_64/lan-mouse-linux-x86_64
           lan-mouse-linux-x86_64/target/release/bundle/deb/lan-mouse_*.deb
           lan-mouse-linux-x86_64/target/release/bundle/appimage/lan-mouse_*.AppImage
-          lan-mouse-linux-arm64/lan-mouse-linux-arm64
-          lan-mouse-linux-arm64/target/release/bundle/deb/lan-mouse_*.deb
-          lan-mouse-linux-arm64/target/release/bundle/appimage/lan-mouse_*.AppImage
-          lan-mouse-macos-intel/lan-mouse-macos-intel.zip
           lan-mouse-macos-arm64/lan-mouse-macos-arm64.zip
           lan-mouse-windows-x86_64/lan-mouse-windows-x86_64.zip
     - name: Create Tagged Release
@@ -227,9 +166,5 @@ jobs:
           lan-mouse-linux-x86_64/lan-mouse-linux-x86_64
           lan-mouse-linux-x86_64/target/release/bundle/deb/lan-mouse_*.deb
           lan-mouse-linux-x86_64/target/release/bundle/appimage/lan-mouse_*.AppImage
-          lan-mouse-linux-arm64/lan-mouse-linux-arm64
-          lan-mouse-linux-arm64/target/release/bundle/deb/lan-mouse_*.deb
-          lan-mouse-linux-arm64/target/release/bundle/appimage/lan-mouse_*.AppImage
-          lan-mouse-macos-intel/lan-mouse-macos-intel.zip
           lan-mouse-macos-arm64/lan-mouse-macos-arm64.zip
           lan-mouse-windows-x86_64/lan-mouse-windows-x86_64.zip
