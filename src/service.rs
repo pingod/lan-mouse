@@ -623,6 +623,10 @@ impl Service {
 
         /* activate the client */
         if self.client_manager.activate_client(handle) {
+            /* Start the handshake now. The pointer may never reach this client,
+             * but when it does the connection is usually already up, which
+             * removes the round trip from the moment of crossing. */
+            self.capture.preconnect(handle);
             /* notify capture and frontends */
             self.capture.create(handle, pos, CaptureType::Default);
             self.broadcast_client(handle);

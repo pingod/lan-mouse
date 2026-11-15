@@ -72,6 +72,8 @@ enum CaptureRequest {
     Create(CaptureHandle, Position, CaptureType),
     /// destory a capture client
     Destroy(CaptureHandle),
+    /// start the connection to this client before the pointer reaches it
+    Preconnect(CaptureHandle),
     /// reenable input capture
     Reenable,
     /// set release bind
@@ -105,6 +107,7 @@ impl Capture {
             entered_at: None,
             last_enter_release: None,
             state: Default::default(),
+            pending_input: Vec::new(),
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -114,6 +117,11 @@ impl Capture {
             event_rx,
             active,
         }
+    }
+
+    /// Start the connection to `handle` ahead of the pointer reaching it.
+    pub(crate) fn preconnect(&self, handle: CaptureHandle) {
+        let _ = self.request_tx.send(CaptureRequest::Preconnect(handle));
     }
 
     pub(crate) fn reenable(&self) {
@@ -206,6 +214,12 @@ struct CaptureTask {
     last_enter_release: Option<Instant>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
+    /// Input that arrived before the peer acknowledged our `Enter`.
+    ///
+    /// The handshake takes a network round trip, and the pointer is already
+    /// moving by then. Dropping those events is what makes the first moments
+    /// on the peer feel sticky, so they are replayed once the Ack lands.
+    pending_input: Vec<ProtoEvent>,
 }
 
 impl CaptureTask {
@@ -248,6 +262,7 @@ impl CaptureTask {
                 tokio::select! {
                     r = self.request_rx.recv() => match r.expect("channel closed") {
                         CaptureRequest::Reenable => break,
+                        CaptureRequest::Preconnect(_) => { /* no connection yet */ }
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
                         CaptureRequest::Release => { /* nothing to do */ }
@@ -336,6 +351,18 @@ impl CaptureTask {
                             log::info!("client {handle} acknowledged the connection!");
                             self.state = State::Sending;
                             self.entered_at.get_or_insert_with(Instant::now);
+                            // Deliver the input that arrived while the
+                            // handshake was in flight.
+                            if !self.pending_input.is_empty() {
+                                let pending = std::mem::take(&mut self.pending_input);
+                                log::debug!("flushing {} buffered input event(s)", pending.len());
+                                for event in pending {
+                                    if let Err(e) = self.conn.send(event, handle).await {
+                                        log::warn!("failed to flush buffered input: {e}");
+                                        break;
+                                    }
+                                }
+                            }
                         }
                         // client disconnected
                         ProtoEvent::Leave(_) => {
@@ -347,7 +374,11 @@ impl CaptureTask {
                             // `pressed_keys`, so the release-bind stops
                             // working too. Require a short dwell before
                             // honouring a remote Leave.
-                            const MIN_DWELL: Duration = Duration::from_millis(400);
+                            // The dwell only needs to outlast the burst of
+                            // Leavess a peer emits while its own state settles;
+                            // it is not a UX delay and every millisecond here
+                            // is felt as a stall when returning from the peer.
+                            const MIN_DWELL: Duration = Duration::from_millis(120);
                             let dwell = self
                                 .entered_at
                                 .map(|t| t.elapsed())
@@ -368,6 +399,9 @@ impl CaptureTask {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::Release => self.release_capture(capture).await?,
+                    CaptureRequest::Preconnect(h) => {
+                        self.conn.preconnect(h).await;
+                    }
                     CaptureRequest::Create(h, p, t) => {
                         self.add_capture(h, p, t);
                         capture.create(h, p).await?;
@@ -434,7 +468,10 @@ impl CaptureTask {
         // pointer. Debounce it so one release per crossing is enough.
         if self.get_type(handle) == CaptureType::EnterOnly {
             if !self.is_default_capture_at(self.get_pos(handle)) {
-                const RELEASE_DEBOUNCE: Duration = Duration::from_millis(750);
+                // Only needs to outlive the in-flight `Begin` storm from a
+                // single crossing. 750 ms made a deliberate second crossing
+                // feel unresponsive; the storm itself settles far sooner.
+                const RELEASE_DEBOUNCE: Duration = Duration::from_millis(250);
                 let due = self
                     .last_enter_release
                     .is_none_or(|t| t.elapsed() >= RELEASE_DEBOUNCE);
@@ -466,8 +503,23 @@ impl CaptureTask {
             CaptureEvent::Interrupted => return Ok(()),
             CaptureEvent::Begin => vec![ProtoEvent::Enter(opposite_pos)],
             CaptureEvent::Input(e) => match self.state {
-                // connection not acknowledged, repeat `Enter` event
-                State::WaitingForAck => vec![ProtoEvent::Enter(opposite_pos)],
+                // The handshake is still in flight. Keep the event so it can
+                // be replayed right after the Ack instead of being lost — the
+                // pointer is already moving, and dropping these makes the
+                // first instants on the peer feel like a stall.
+                State::WaitingForAck => {
+                    let remapped = self.remap.apply(e);
+                    // Bound the buffer: a peer that never acks must not grow it
+                    // without limit. Older events are the ones worth dropping.
+                    const MAX_PENDING: usize = 256;
+                    for event in remapped {
+                        if self.pending_input.len() >= MAX_PENDING {
+                            self.pending_input.remove(0);
+                        }
+                        self.pending_input.push(ProtoEvent::Input(event));
+                    }
+                    vec![ProtoEvent::Enter(opposite_pos)]
+                }
                 State::Sending => self
                     .remap
                     .apply(e)
@@ -517,6 +569,7 @@ impl CaptureTask {
             // forget the local chord state so a later capture cannot match it.
             self.remap.reset();
             self.entered_at = None;
+            self.pending_input.clear();
             for key in capture.take_pressed_keys() {
                 let key_up = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
                     time: 0,

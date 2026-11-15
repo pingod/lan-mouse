@@ -143,6 +143,34 @@ impl LanMouseConnection {
         self.client_manager.first_active_client()
     }
 
+    /// Start connecting to `handle` without sending anything.
+    ///
+    /// A capture that begins before the connection exists has to drop the
+    /// first events, because the handshake needs a round trip and the pointer
+    /// is already moving. Warming the connection as soon as a client is
+    /// activated means the handshake usually completes before the user
+    /// reaches the edge.
+    pub(crate) async fn preconnect(&self, handle: ClientHandle) {
+        if self.client_manager.active_addr(handle).is_some() {
+            return;
+        }
+        let mut connecting = self.connecting.lock().await;
+        if connecting.contains(&handle) {
+            return;
+        }
+        connecting.insert(handle);
+        log::debug!("preconnecting to client {handle}");
+        spawn_local(connect_to_handle(
+            self.client_manager.clone(),
+            self.cert.clone(),
+            handle,
+            self.conns.clone(),
+            self.connecting.clone(),
+            self.recv_tx.clone(),
+            self.ping_response.clone(),
+        ));
+    }
+
     pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
         self.recv_rx
             .as_mut()
