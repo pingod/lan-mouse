@@ -89,6 +89,7 @@ impl Emulation {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_task = ListenTask {
+            reassemblers: HashMap::new(),
             listener,
             emulation_proxy,
             request_rx,
@@ -146,6 +147,8 @@ struct ListenTask {
     emulation_proxy: EmulationProxy,
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,
+    /// partial peer reports, keyed by peer address
+    reassemblers: HashMap<SocketAddr, crate::sysinfo::Reassembler>,
 }
 
 impl ListenTask {
@@ -188,24 +191,17 @@ impl ListenTask {
                             // the peer is in fact happily talking to us.
                             ProtoEvent::Hello { commit } => {
                                 self.listener.reply(addr, ProtoEvent::Hello { commit: local_commit() }).await;
-                                // Describe this machine so the peer can show it.
-                                self.listener.reply(addr, ProtoEvent::PeerInfo(*crate::sysinfo::LOCAL)).await;
+                                // Describe this machine in pieces: the
+                                // listening side cannot push a whole record to
+                                // the connecting side.
+                                for chunk in crate::sysinfo::chunks(&crate::sysinfo::LOCAL) {
+                                    self.listener.reply(addr, chunk).await;
+                                }
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
                             }
                             ProtoEvent::PeerInfoRequest => {
-                                // Answer on the same connection. The reply is
-                                // retried a few times: a single packet sent
-                                // during the handshake can be lost before the
-                                // peer's DTLS state is ready to receive it,
-                                // which is why the first answer alone never
-                                // arrived.
-                                for delay_ms in [0u64, 150, 400] {
-                                    if delay_ms > 0 {
-                                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                                    }
-                                    self.listener
-                                        .reply(addr, ProtoEvent::PeerInfo(*crate::sysinfo::LOCAL))
-                                        .await;
+                                for chunk in crate::sysinfo::chunks(&crate::sysinfo::LOCAL) {
+                                    self.listener.reply(addr, chunk).await;
                                 }
                             }
                             ProtoEvent::PeerInfo(info) => {
@@ -215,6 +211,21 @@ impl ListenTask {
                                         info: Box::new(info),
                                     })
                                     .expect("channel closed");
+                            }
+                            ProtoEvent::PeerInfoChunk {
+                                index,
+                                total,
+                                data,
+                            } => {
+                                let entry = self.reassemblers.entry(addr).or_default();
+                                if let Some(info) = entry.push(index, total, &data) {
+                                    self.event_tx
+                                        .send(EmulationEvent::PeerInfo {
+                                            addr,
+                                            info: Box::new(info),
+                                        })
+                                        .expect("channel closed");
+                                }
                             }
                             _ => {}
                         }

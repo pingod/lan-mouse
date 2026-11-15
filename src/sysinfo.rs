@@ -176,6 +176,80 @@ pub fn flatten(info: &PeerInfo) -> lan_mouse_ipc::IncomingInfo {
     }
 }
 
+/// Split a report into wire-sized chunks.
+///
+/// The listening side cannot push a whole record to the connecting side, so
+/// every report travels as small pieces regardless of direction.
+pub fn chunks(info: &PeerInfo) -> Vec<lan_mouse_proto::ProtoEvent> {
+    use lan_mouse_proto::{PEER_INFO_CHUNK, ProtoEvent};
+
+    // Flatten the fixed slots into one byte string; trailing NULs are kept so
+    // the receiver can rebuild the exact same layout.
+    let bytes: Vec<u8> = info.fields.iter().flatten().copied().collect();
+    let total = bytes.len().div_ceil(PEER_INFO_CHUNK);
+    bytes
+        .chunks(PEER_INFO_CHUNK)
+        .enumerate()
+        .map(|(i, piece)| {
+            let mut data = [0u8; PEER_INFO_CHUNK];
+            data[..piece.len()].copy_from_slice(piece);
+            ProtoEvent::PeerInfoChunk {
+                index: i as u8,
+                total: total as u8,
+                data,
+            }
+        })
+        .collect()
+}
+
+/// Collects chunks until a full report is available.
+#[derive(Default)]
+pub struct Reassembler {
+    buf: Vec<u8>,
+    total: Option<u8>,
+    next: u8,
+}
+
+impl Reassembler {
+    /// Feed one chunk; returns the report once every piece has arrived.
+    pub fn push(
+        &mut self,
+        index: u8,
+        total: u8,
+        data: &[u8; lan_mouse_proto::PEER_INFO_CHUNK],
+    ) -> Option<PeerInfo> {
+        use lan_mouse_proto::{PEER_INFO_CHUNK, PEER_INFO_FIELD, PEER_INFO_FIELDS};
+
+        // A new report starts at index 0; anything else is a stray piece from a
+        // previous one and would corrupt the buffer.
+        if index == 0 {
+            self.buf.clear();
+            self.next = 0;
+            self.total = Some(total);
+        }
+        if self.total != Some(total) || index != self.next {
+            return None;
+        }
+        self.buf.extend_from_slice(data);
+        self.next += 1;
+
+        if self.next < total {
+            return None;
+        }
+        let expected = PEER_INFO_FIELDS * PEER_INFO_FIELD;
+        if self.buf.len() < expected {
+            return None;
+        }
+        let mut fields = [[0u8; PEER_INFO_FIELD]; PEER_INFO_FIELDS];
+        for (slot, out) in fields.iter_mut().zip(self.buf.chunks(PEER_INFO_FIELD)) {
+            let n = out.len().min(PEER_INFO_FIELD);
+            slot[..n].copy_from_slice(&out[..n]);
+        }
+        let _ = PEER_INFO_CHUNK;
+        Some(PeerInfo { fields })
+    }
+}
+
 /// A one-line summary for the log.
 pub fn describe(info: &PeerInfo) -> String {
     format!(
@@ -200,6 +274,48 @@ mod tests {
         assert_eq!(info.get(info_slot::ARCH), std::env::consts::ARCH);
         assert_eq!(info.get(info_slot::APP_VERSION), env!("CARGO_PKG_VERSION"));
         assert!(!info.get(info_slot::OS).is_empty());
+    }
+
+    #[test]
+    fn chunks_reassemble_to_the_original() {
+        let info = PeerInfo::new([
+            "linux",
+            "CachyOS",
+            "7.3.4-1-cachyos",
+            "x86_64",
+            "cachyos-x8664",
+            "0.11.0",
+            "abc12345",
+            "2 displays",
+        ]);
+        let pieces = chunks(&info);
+        assert!(pieces.len() > 1, "a 257-byte report must span chunks");
+
+        let mut r = Reassembler::default();
+        let mut out = None;
+        for piece in pieces {
+            let lan_mouse_proto::ProtoEvent::PeerInfoChunk { index, total, data } = piece else {
+                panic!("expected a chunk");
+            };
+            out = r.push(index, total, &data);
+        }
+        let out = out.expect("all chunks arrived");
+        assert_eq!(out, info);
+        assert_eq!(out.get(info_slot::KERNEL), "7.3.4-1-cachyos");
+    }
+
+    #[test]
+    fn a_missing_chunk_yields_nothing() {
+        let info = PeerInfo::new(["a", "b", "c", "d", "e", "f", "g", "h"]);
+        let mut r = Reassembler::default();
+        let pieces = chunks(&info);
+        // Feed everything except the last piece: no report may be produced.
+        for piece in pieces.iter().take(pieces.len() - 1) {
+            let lan_mouse_proto::ProtoEvent::PeerInfoChunk { index, total, data } = piece else {
+                panic!("expected a chunk");
+            };
+            assert_eq!(r.push(*index, *total, data), None);
+        }
     }
 
     #[test]

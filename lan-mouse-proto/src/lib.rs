@@ -23,6 +23,14 @@ pub const PEER_INFO_FIELD: usize = 32;
 /// Number of fixed-width string slots in a [`ProtoEvent::PeerInfo`].
 pub const PEER_INFO_FIELDS: usize = 8;
 
+/// Bytes of a [`ProtoEvent::PeerInfo`] carried per chunk.
+///
+/// Measured on a Linux↔macOS pair: the listening side's replies larger than a
+/// few bytes never reach the connecting side, while its 2-byte `Pong` and
+/// 9-byte `Hello` do. 16 keeps a chunk at 19 bytes, inside that window, and the
+/// 257-byte report needs 17 of them.
+pub const PEER_INFO_CHUNK: usize = 16;
+
 /// defines the maximum size an encoded event can take up
 ///
 /// The largest event is `PeerInfo`: a type byte followed by
@@ -100,6 +108,17 @@ pub enum ProtoEvent {
     /// inline to keep `ProtoEvent` `Copy`: it is constructed once per
     /// connection and moved through channels, never stored in bulk.
     PeerInfo(PeerInfo),
+    /// One slice of a [`ProtoEvent::PeerInfo`].
+    ///
+    /// The listening side cannot push a large record to the connecting side, so
+    /// a report is split into `PEER_INFO_CHUNK`-sized pieces that each fit.
+    /// `index` counts from zero; a receiver reassembles until `total` pieces
+    /// have arrived.
+    PeerInfoChunk {
+        index: u8,
+        total: u8,
+        data: [u8; PEER_INFO_CHUNK],
+    },
     /// Ask the peer to send its [`ProtoEvent::PeerInfo`].
     ///
     /// Needed because the pushing side may be a receive-only peer whose reply
@@ -197,6 +216,9 @@ impl Display for ProtoEvent {
             }
             ProtoEvent::PeerInfo(info) => write!(f, "{info:?}"),
             ProtoEvent::PeerInfoRequest => write!(f, "PeerInfoRequest"),
+            ProtoEvent::PeerInfoChunk { index, total, .. } => {
+                write!(f, "PeerInfoChunk({}/{total})", *index as u32 + 1)
+            }
         }
     }
 }
@@ -218,6 +240,7 @@ pub enum EventType {
     Hello,
     PeerInfo,
     PeerInfoRequest,
+    PeerInfoChunk,
 }
 
 impl ProtoEvent {
@@ -243,6 +266,7 @@ impl ProtoEvent {
             ProtoEvent::Hello { .. } => EventType::Hello,
             ProtoEvent::PeerInfo(_) => EventType::PeerInfo,
             ProtoEvent::PeerInfoRequest => EventType::PeerInfoRequest,
+            ProtoEvent::PeerInfoChunk { .. } => EventType::PeerInfoChunk,
         }
     }
 }
@@ -298,6 +322,15 @@ impl TryFrom<&[u8]> for ProtoEvent {
             EventType::Leave => Ok(Self::Leave(decode_u32(&mut buf)?)),
             EventType::Ack => Ok(Self::Ack(decode_u32(&mut buf)?)),
             EventType::PeerInfoRequest => Ok(Self::PeerInfoRequest),
+            EventType::PeerInfoChunk => {
+                let index = decode_u8(&mut buf)?;
+                let total = decode_u8(&mut buf)?;
+                let mut data = [0u8; PEER_INFO_CHUNK];
+                for b in data.iter_mut() {
+                    *b = decode_u8(&mut buf)?;
+                }
+                Ok(Self::PeerInfoChunk { index, total, data })
+            }
             EventType::PeerInfo => {
                 let mut fields = [[0u8; PEER_INFO_FIELD]; PEER_INFO_FIELDS];
                 for slot in fields.iter_mut() {
@@ -384,6 +417,13 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                     }
                 }
                 ProtoEvent::PeerInfoRequest => {}
+                ProtoEvent::PeerInfoChunk { index, total, data } => {
+                    encode_u8(buf, len, index);
+                    encode_u8(buf, len, total);
+                    for b in data.iter() {
+                        encode_u8(buf, len, *b);
+                    }
+                }
                 ProtoEvent::PeerInfo(info) => {
                     for slot in info.fields.iter() {
                         for b in slot.iter() {

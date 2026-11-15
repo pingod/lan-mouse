@@ -289,9 +289,12 @@ async fn connect_to_handle(
         // Describe this machine, and ask the peer to do the same. The request
         // matters: a receive-only peer's own push may never reach us, but it can
         // always answer a packet we sent.
-        let (buf, len) = ProtoEvent::PeerInfo(*crate::sysinfo::LOCAL).into();
-        if let Err(e) = conn.send(&buf[..len]).await {
-            log::debug!("peer info send to {addr} failed: {e}");
+        for chunk in crate::sysinfo::chunks(&crate::sysinfo::LOCAL) {
+            let (buf, len) = chunk.into();
+            if let Err(e) = conn.send(&buf[..len]).await {
+                log::debug!("peer info chunk to {addr} failed: {e}");
+                break;
+            }
         }
         let (buf, len) = ProtoEvent::PeerInfoRequest.into();
         if let Err(e) = conn.send(&buf[..len]).await {
@@ -385,6 +388,7 @@ async fn receive_loop(
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 ) {
+    let mut reassembler = crate::sysinfo::Reassembler::default();
     let mut buf = [0u8; MAX_EVENT_SIZE];
     loop {
         // Keep the length: decoding the whole buffer would read stale bytes
@@ -413,6 +417,12 @@ async fn receive_loop(
                     ProtoEvent::PeerInfo(info) => {
                         log::debug!("peer {}: {}", addr, crate::sysinfo::describe(&info));
                         client_manager.set_peer_info(handle, info);
+                    }
+                    ProtoEvent::PeerInfoChunk { index, total, data } => {
+                        if let Some(info) = reassembler.push(index, total, &data) {
+                            log::debug!("peer {}: {}", addr, crate::sysinfo::describe(&info));
+                            client_manager.set_peer_info(handle, info);
+                        }
                     }
                     event => tx.send((handle, event)).expect("channel closed"),
                 }
