@@ -135,38 +135,6 @@
                           </object>
                         </child>
                         <child>
-                          <object class="AdwPreferencesGroup">
-                            <property name="title" translatable="yes">Inbound</property>
-                            <property name="description" translatable="yes">Devices currently driving this machine.</property>
-                            <property name="header-suffix">
-                              <object class="GtkButton" id="refresh_peers_button">
-                                <signal name="clicked" handler="handle_refresh_peers_pressed" swapped="true"/>
-                                <property name="child">
-                                  <object class="AdwButtonContent">
-                                    <property name="icon-name">view-refresh-symbolic</property>
-                                    <property name="label" translatable="yes">Refresh</property>
-                                  </object>
-                                </property>
-                                <style><class name="flat"/></style>
-                              </object>
-                            </property>
-                            <child>
-                              <object class="GtkListBox" id="incoming_list">
-                                <property name="selection-mode">none</property>
-                                <child type="placeholder">
-                                  <object class="AdwActionRow" id="incoming_placeholder">
-                                    <property name="title">No inbound connections</property>
-                                    <property name="subtitle">this machine is not being driven right now</property>
-                                  </object>
-                                </child>
-                                <style>
-                                  <class name="boxed-list"/>
-                                </style>
-                              </object>
-                            </child>
-                          </object>
-                        </child>
-                        <child>
                           <object class="AdwPreferencesGroup" id="capture_emulation_group">
                             <property name="title" translatable="yes">Backends</property>
                             <property name="description" translatable="yes">Both must be enabled for a two-way setup.</property>
@@ -268,6 +236,38 @@
                                 </child>
                                 <style>
                                   <class name="boxed-list" />
+                                </style>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="AdwPreferencesGroup">
+                            <property name="title" translatable="yes">Inbound</property>
+                            <property name="description" translatable="yes">Devices currently driving this machine.</property>
+                            <property name="header-suffix">
+                              <object class="GtkButton" id="refresh_peers_button">
+                                <signal name="clicked" handler="handle_refresh_peers_pressed" swapped="true"/>
+                                <property name="child">
+                                  <object class="AdwButtonContent">
+                                    <property name="icon-name">view-refresh-symbolic</property>
+                                    <property name="label" translatable="yes">Refresh</property>
+                                  </object>
+                                </property>
+                                <style><class name="flat"/></style>
+                              </object>
+                            </property>
+                            <child>
+                              <object class="GtkListBox" id="incoming_list">
+                                <property name="selection-mode">none</property>
+                                <child type="placeholder">
+                                  <object class="AdwActionRow" id="incoming_placeholder">
+                                    <property name="title">No inbound connections</property>
+                                    <property name="subtitle">this machine is not being driven right now</property>
+                                  </object>
+                                </child>
+                                <style>
+                                  <class name="boxed-list"/>
                                 </style>
                               </object>
                             </child>

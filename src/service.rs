@@ -707,6 +707,13 @@ impl Service {
                 self.active_capture = Some(handle);
                 self.spawn_hook_command(handle, HookKind::Enter);
             }
+            ICaptureEvent::PeerInfo(handle) => {
+                // Details arrived: re-broadcast the client state so the window
+                // picks up the new fields.
+                if let Some((config, state)) = self.client_manager.get_state(handle) {
+                    self.notify_frontend(FrontendEvent::State(handle, config, state));
+                }
+            }
             ICaptureEvent::ReturnRequested(handle) => {
                 // The pointer came back to this machine's own edge while a peer
                 // was driving it. Tell that peer to release, otherwise it keeps

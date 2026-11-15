@@ -428,11 +428,15 @@ async fn receive_loop(
                     ProtoEvent::PeerInfo(info) => {
                         log::debug!("peer {}: {}", addr, crate::sysinfo::describe(&info));
                         client_manager.set_peer_info(handle, info);
+                        // Push the new state to the frontend: without this the
+                        // details are stored but the window never learns of them.
+                        let _ = tx.send((handle, ProtoEvent::PeerInfo(info)));
                     }
                     ProtoEvent::PeerInfoChunk { index, total, data } => {
                         if let Some(info) = reassembler.push(index, total, &data) {
                             log::debug!("peer {}: {}", addr, crate::sysinfo::describe(&info));
                             client_manager.set_peer_info(handle, info);
+                            let _ = tx.send((handle, ProtoEvent::PeerInfo(info)));
                         }
                     }
                     event => tx.send((handle, event)).expect("channel closed"),

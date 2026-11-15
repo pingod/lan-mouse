@@ -41,6 +41,8 @@ pub(crate) enum ICaptureEvent {
     /// the pointer reached this machine's own edge; ask the driving peer to
     /// release it
     ReturnRequested(CaptureHandle),
+    /// the peer sent updated machine details
+    PeerInfo(CaptureHandle),
     /// A (new) client was entered.
     /// In contrast to [`ICaptureEvent::CaptureBegin`] this
     /// event is only triggered when the capture was
@@ -431,6 +433,13 @@ impl CaptureTask {
                             log::info!("releasing capture: left remote client device region");
                             self.release_capture(capture).await?;
                         },
+                        // Machine details are not input; surface them so the
+                        // service can refresh the frontend.
+                        ProtoEvent::PeerInfo(_) | ProtoEvent::PeerInfoChunk { .. } => {
+                            self.event_tx
+                                .send(ICaptureEvent::PeerInfo(handle))
+                                .expect("channel closed");
+                        }
                         _ => {}
                     }
                 },
