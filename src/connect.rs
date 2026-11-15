@@ -359,6 +359,7 @@ async fn ping_pong(
         // the start of the round: the round itself deliberately spans 2 s, and
         // reporting that as latency made a healthy link look like 2000 ms.
         let mut sent_at: Option<Instant> = None;
+        let mut rtt: Option<Duration> = None;
         for _ in 0..4 {
             let sent = Instant::now();
             if let Err(e) = conn.send(&buf[..len]).await {
@@ -379,6 +380,10 @@ async fn ping_pong(
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             if ping_response.borrow().contains(&addr) {
+                // Capture the round trip here, while it is still the reply
+                // latency: measuring after the inter-round wait below would
+                // always report that wait instead.
+                rtt = sent_at.map(|t| t.elapsed());
                 break;
             }
         }
@@ -396,9 +401,7 @@ async fn ping_pong(
             return;
         }
 
-        // Time from the last ping to the moment its pong was observed.
         if let Some(handle) = client_manager.handle_for_addr(addr) {
-            let rtt = sent_at.map(|t| t.elapsed());
             client_manager.set_health(handle, rtt, true);
         }
     }
