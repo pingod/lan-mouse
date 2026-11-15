@@ -25,6 +25,7 @@ use std::{
     rc::Rc,
     sync::{Arc, LazyLock},
     task::{Context, Poll},
+    time::Duration,
 };
 use tokio::{
     sync::{
@@ -176,6 +177,48 @@ async fn update_barriers(
     let response = response.response()?;
     log::debug!("{response:?}");
     Ok((barriers, id_map))
+}
+
+/// Whether two barrier sets describe the same geometry.
+///
+/// Only the position matters: barrier ids are handed out from a counter that
+/// changes on every rebuild, so comparing ids would report a change every time.
+fn barriers_unchanged(candidate: &[ICBarrier], current: &[ICBarrier]) -> bool {
+    candidate.len() == current.len()
+        && candidate
+            .iter()
+            .zip(current.iter())
+            .all(|(a, b)| a.position == b.position)
+}
+
+/// Rebuild the pointer barriers when the compositor's zone layout changed.
+///
+/// Returns `Ok(None)` when nothing changed, so the caller can skip the
+/// re-registration — the portal round trip is not free and doing it every tick
+/// would churn the session.
+async fn refresh_barriers_if_changed(
+    input_capture: &InputCapture,
+    session: &Session<InputCapture>,
+    active_clients: &[Position],
+    next_barrier_id: &mut NonZeroU32,
+    current: &[ICBarrier],
+) -> Result<Option<(Vec<ICBarrier>, HashMap<BarrierID, Position>)>, ashpd::Error> {
+    let zones = input_capture
+        .zones(session, Default::default())
+        .await?
+        .response()?;
+
+    // Compare the geometry we would register now against what is registered.
+    let mut probe = *next_barrier_id;
+    let (candidate, _) = select_barriers(&zones, active_clients, &mut probe);
+
+    if barriers_unchanged(&candidate, current) {
+        return Ok(None);
+    }
+
+    let (barriers, id_map) =
+        update_barriers(input_capture, session, active_clients, next_barrier_id).await?;
+    Ok(Some((barriers, id_map)))
 }
 
 async fn create_session(
@@ -418,6 +461,16 @@ async fn do_capture_session(
         // receiver for activation tokens
         let mut activated = input_capture.receive_activated().await?;
         let mut ei_devices_changed = false;
+        // Barriers are rebuilt when the display layout changes; the originals
+        // stay in scope so a refresh can replace them.
+        let mut barriers = barriers;
+        let mut pos_for_barrier_id = pos_for_barrier_id;
+        // Display layout can change while we run (monitor unplugged, mode
+        // switch). The zones the compositor reports then no longer match the
+        // barriers we registered, so the pointer can never cross back — the
+        // "stuck after changing monitors" symptom of issue #512.
+        let mut zone_check = tokio::time::interval(Duration::from_secs(5));
+        zone_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 activated = activated.next() => {
@@ -462,6 +515,28 @@ async fn do_capture_session(
 
                     release_capture(input_capture, session, activated, pos).await?;
 
+                }
+                _ = zone_check.tick() => {
+                    match refresh_barriers_if_changed(
+                        input_capture,
+                        session,
+                        active_clients,
+                        next_barrier_id,
+                        &barriers,
+                    )
+                    .await
+                    {
+                        Ok(Some((new_barriers, new_map))) => {
+                            log::info!(
+                                "display layout changed — rebuilding {} barrier(s)",
+                                new_barriers.len()
+                            );
+                            barriers = new_barriers;
+                            pos_for_barrier_id = new_map;
+                        }
+                        Ok(None) => log::trace!("barrier layout unchanged"),
+                        Err(e) => log::warn!("could not refresh barriers: {e}"),
+                    }
                 }
                 _ = notify_release.notified() => { /* capture release -> we are not capturing anyway, so ignore */
                     log::debug!("release session requested");
@@ -665,5 +740,48 @@ impl Stream for LibeiInputCapture {
             },
             Poll::Pending => self.event_rx.poll_recv(cx).map(|e| e.map(Result::Ok)),
         }
+    }
+}
+
+#[cfg(test)]
+mod barrier_tests {
+    use super::*;
+
+    fn id(n: u32) -> BarrierID {
+        NonZeroU32::new(n).expect("nonzero")
+    }
+
+    fn barrier(position: (i32, i32, i32, i32)) -> ICBarrier {
+        ICBarrier::new(id(1), position)
+    }
+
+    #[test]
+    fn identical_geometry_is_unchanged() {
+        let a = vec![barrier((0, 0, 10, 0))];
+        let b = vec![barrier((0, 0, 10, 0))];
+        assert!(barriers_unchanged(&a, &b));
+    }
+
+    #[test]
+    fn moved_edge_is_a_change() {
+        // A display rearrangement moves the top edge; the barrier must be
+        // rebuilt or the pointer can never cross back (issue #512).
+        let a = vec![barrier((0, 0, 10, 0))];
+        let b = vec![barrier((0, -100, 10, -100))];
+        assert!(!barriers_unchanged(&a, &b));
+    }
+
+    #[test]
+    fn different_barrier_count_is_a_change() {
+        let a = vec![barrier((0, 0, 10, 0))];
+        let b = vec![barrier((0, 0, 10, 0)), barrier((0, 20, 10, 20))];
+        assert!(!barriers_unchanged(&a, &b));
+    }
+
+    #[test]
+    fn ids_are_ignored() {
+        let a = vec![ICBarrier::new(id(1), (0, 0, 10, 0))];
+        let b = vec![ICBarrier::new(id(7), (0, 0, 10, 0))];
+        assert!(barriers_unchanged(&a, &b));
     }
 }
