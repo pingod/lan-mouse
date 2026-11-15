@@ -319,7 +319,7 @@ mod imp_macos {
     use std::sync::{Arc, OnceLock};
 
     use core_foundation::base::TCFType;
-    use core_foundation::runloop::CFRunLoop;
+    use core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes};
     use core_graphics::event::{
         CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
         CallbackResult, EventField,
@@ -503,9 +503,28 @@ mod imp_macos {
             callback,
         ) {
             Ok(tap) => {
+                // `CGEventTap::new` only creates the port: the tap stays
+                // disabled and does nothing until its run loop source is added
+                // to a loop and it is explicitly enabled. Without these two
+                // steps `run_current` returns at once (the loop has no
+                // sources) and the whole listener is dead.
+                let source = match tap.mach_port().create_runloop_source(0) {
+                    Ok(source) => source,
+                    Err(_) => {
+                        log::warn!("hotkeys: could not create a run loop source for the event tap");
+                        return;
+                    }
+                };
+                unsafe {
+                    CFRunLoop::get_current().add_source(&source, kCFRunLoopCommonModes);
+                }
+                // The port is needed by the callback to undo a timeout disable.
                 let _ = tap_port.set(tap.mach_port().as_concrete_TypeRef() as usize);
+                tap.enable();
                 log::info!("hotkeys: listening on the macOS event tap");
+                // `tap` must outlive the loop: dropping it invalidates the port.
                 CFRunLoop::run_current();
+                drop(tap);
             }
             Err(()) => log::warn!(
                 "hotkeys: could not create the macOS event tap \
