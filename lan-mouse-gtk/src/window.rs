@@ -623,6 +623,7 @@ impl Window {
 
         /* activation state */
         row.set_active(state.active);
+        row.set_peer_details(&state);
 
         /* dns state */
         client_object.set_resolving(state.resolving);
@@ -755,24 +756,7 @@ impl Window {
         imp.incoming_placeholder.set_visible(infos.is_empty());
 
         for info in &infos {
-            let row = adw::ActionRow::builder()
-                .title(info.addr.to_string())
-                .subtitle(format!(
-                    "from {} · {} event(s) · idle {}s{}",
-                    info.pos,
-                    info.received,
-                    info.idle_secs,
-                    if info.active { " · driving" } else { "" }
-                ))
-                .build();
-            let fp: String = info.fingerprint.chars().take(23).collect();
-            row.add_suffix(
-                &gtk::Label::builder()
-                    .label(format!("{fp}…"))
-                    .css_classes(["dim-label", "caption"])
-                    .build(),
-            );
-            list.append(&row);
+            list.append(&Self::incoming_row(info));
         }
 
         let active = infos.iter().find(|i| i.active);
@@ -780,6 +764,49 @@ impl Window {
             Some(i) => format!("{} is driving · {}s idle", i.addr, i.idle_secs),
             None => "no inbound traffic".to_owned(),
         });
+    }
+
+    /// One expandable row per inbound peer, with everything it reported.
+    fn incoming_row(info: &lan_mouse_ipc::IncomingInfo) -> adw::ExpanderRow {
+        let title = if info.hostname.is_empty() {
+            info.addr.to_string()
+        } else {
+            format!("{} ({})", info.hostname, info.addr)
+        };
+        let state = if info.active { "driving" } else { "connected" };
+        let row = adw::ExpanderRow::builder()
+            .title(title)
+            .subtitle(format!(
+                "{state} · from {} · {} events",
+                info.pos, info.received
+            ))
+            .build();
+
+        let detail = |label: &str, value: &str| {
+            if value.is_empty() {
+                return;
+            }
+            row.add_row(
+                &adw::ActionRow::builder()
+                    .title(label)
+                    .subtitle(value)
+                    .build(),
+            );
+        };
+        detail("Operating system", &info.os);
+        detail("OS version", &info.os_version);
+        detail("Kernel", &info.kernel);
+        detail("Architecture", &info.arch);
+        detail("Hostname", &info.hostname);
+        detail("lan-mouse version", &info.app_version);
+        detail("Build commit", &info.commit);
+        detail("Displays", &info.displays);
+        detail("Address", &info.addr.to_string());
+        detail("Entry side", &info.pos.to_string());
+        detail("Events received", &info.received.to_string());
+        detail("Idle", &format!("{}s", info.idle_secs));
+        detail("Certificate", &info.fingerprint);
+        row
     }
 
     /// Show which machine the pointer is currently on, plus the best peer RTT.

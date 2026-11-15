@@ -193,6 +193,46 @@ impl ClientRow {
         row.set_subtitle(&parts.join(" · "));
     }
 
+    /// Fill the expander with everything the peer reported about itself.
+    ///
+    /// Rebuilt on every state update: the daemon only sends a peer report once
+    /// per connection, so this runs a handful of times, and rebuilding avoids
+    /// stale rows when a peer reconnects with different details.
+    pub fn set_peer_details(&self, state: &lan_mouse_ipc::ClientState) {
+        // Drop previously added detail rows, keeping the template rows.
+        let mut child = self.first_child();
+        while let Some(widget) = child {
+            let next = widget.next_sibling();
+            if widget
+                .downcast_ref::<adw::ActionRow>()
+                .is_some_and(|r| r.css_classes().iter().any(|c| c == "peer-detail"))
+            {
+                self.remove(&widget);
+            }
+            child = next;
+        }
+
+        let add = |label: &str, value: &str| {
+            if value.is_empty() {
+                return;
+            }
+            let row = adw::ActionRow::builder()
+                .title(label)
+                .subtitle(value)
+                .build();
+            row.add_css_class("peer-detail");
+            self.add_row(&row);
+        };
+        add("Operating system", &state.peer_os);
+        add("OS version", &state.peer_os_version);
+        add("Kernel", &state.peer_kernel);
+        add("Architecture", &state.peer_arch);
+        add("Hostname", &state.peer_hostname);
+        add("lan-mouse version", &state.peer_app_version);
+        add("Build commit", &state.peer_commit_short);
+        add("Displays", &state.peer_displays);
+    }
+
     pub fn set_dns_state(&self, resolved: bool) {
         self.imp().set_dns_state(resolved);
     }

@@ -53,6 +53,11 @@ pub(crate) enum EmulationEvent {
     EmulationEnabled,
     /// capture should be released
     ReleaseNotify,
+    /// peer described its machine
+    PeerInfo {
+        addr: SocketAddr,
+        info: Box<lan_mouse_proto::PeerInfo>,
+    },
     /// peer sent us a Hello with its build commit hash. Used to
     /// populate `client_manager.peer_commit` from the listen side
     /// too — without this, peer-version visibility silently fails
@@ -183,7 +188,33 @@ impl ListenTask {
                             // the peer is in fact happily talking to us.
                             ProtoEvent::Hello { commit } => {
                                 self.listener.reply(addr, ProtoEvent::Hello { commit: local_commit() }).await;
+                                // Describe this machine so the peer can show it.
+                                self.listener.reply(addr, ProtoEvent::PeerInfo(*crate::sysinfo::LOCAL)).await;
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
+                            }
+                            ProtoEvent::PeerInfoRequest => {
+                                // Answer on the same connection. The reply is
+                                // retried a few times: a single packet sent
+                                // during the handshake can be lost before the
+                                // peer's DTLS state is ready to receive it,
+                                // which is why the first answer alone never
+                                // arrived.
+                                for delay_ms in [0u64, 150, 400] {
+                                    if delay_ms > 0 {
+                                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                    }
+                                    self.listener
+                                        .reply(addr, ProtoEvent::PeerInfo(*crate::sysinfo::LOCAL))
+                                        .await;
+                                }
+                            }
+                            ProtoEvent::PeerInfo(info) => {
+                                self.event_tx
+                                    .send(EmulationEvent::PeerInfo {
+                                        addr,
+                                        info: Box::new(info),
+                                    })
+                                    .expect("channel closed");
                             }
                             _ => {}
                         }

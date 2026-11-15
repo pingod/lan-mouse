@@ -318,6 +318,24 @@ impl ClientManager {
         }
     }
 
+    /// Store what the peer reported about itself.
+    ///
+    /// Flattened into `ClientState` so the IPC layer does not depend on the
+    /// protocol crate.
+    pub(crate) fn set_peer_info(&self, handle: ClientHandle, info: lan_mouse_proto::PeerInfo) {
+        use lan_mouse_proto::info_slot;
+        if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
+            s.peer_os = info.get(info_slot::OS).to_owned();
+            s.peer_os_version = info.get(info_slot::OS_VERSION).to_owned();
+            s.peer_kernel = info.get(info_slot::KERNEL).to_owned();
+            s.peer_arch = info.get(info_slot::ARCH).to_owned();
+            s.peer_hostname = info.get(info_slot::HOSTNAME).to_owned();
+            s.peer_app_version = info.get(info_slot::APP_VERSION).to_owned();
+            s.peer_commit_short = info.get(info_slot::COMMIT).to_owned();
+            s.peer_displays = info.get(info_slot::DISPLAYS).to_owned();
+        }
+    }
+
     pub(crate) fn set_peer_commit(&self, handle: ClientHandle, commit: Option<[u8; 8]>) {
         if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
             s.peer_commit = commit;

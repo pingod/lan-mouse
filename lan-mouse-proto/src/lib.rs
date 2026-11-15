@@ -7,10 +7,28 @@ use std::{
 };
 use thiserror::Error;
 
+/// Longest string carried in a [`ProtoEvent::PeerInfo`] field.
+///
+/// Long enough for a kernel release (`6.12.0-1-cachyos`), a machine model
+/// (`MacBookPro18,3`) and a distro description, without letting a peer send an
+/// unbounded payload.
+/// Width of one string slot in a [`ProtoEvent::PeerInfo`].
+///
+/// 32 fits a kernel release or a hostname. The whole event is 257 bytes, which
+/// the connecting side delivers reliably; the listening side's push path drops
+/// anything larger than a few bytes, so its report only arrives when the
+/// connecting side asks for it (see `PeerInfoRequest`).
+pub const PEER_INFO_FIELD: usize = 32;
+
+/// Number of fixed-width string slots in a [`ProtoEvent::PeerInfo`].
+pub const PEER_INFO_FIELDS: usize = 8;
+
 /// defines the maximum size an encoded event can take up
-/// this is currently the pointer motion event
-/// type: u8, time: u32, dx: f64, dy: f64
-pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_of::<f64>();
+///
+/// The largest event is `PeerInfo`: a type byte followed by
+/// `PEER_INFO_FIELDS` NUL-padded slots. Pointer motion is smaller, so this
+/// bound covers every variant.
+pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + PEER_INFO_FIELDS * PEER_INFO_FIELD;
 
 /// error type for protocol violations
 #[derive(Debug, Error)]
@@ -47,6 +65,7 @@ impl Display for Position {
 
 /// main lan-mouse protocol event type
 #[derive(Clone, Copy, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum ProtoEvent {
     /// notify a client that the cursor entered its region at the given position
     /// [`ProtoEvent::Ack`] with the same serial is used for synchronization between devices
@@ -72,6 +91,89 @@ pub enum ProtoEvent {
     /// recognize the event type silently skip it per the
     /// forward-compat handling in the receive loop.
     Hello { commit: [u8; 8] },
+    /// Descriptive information about the sending machine.
+    ///
+    /// Sent once after the handshake. Older peers skip unknown event types, so
+    /// a peer that does not understand this still works.
+    ///
+    /// The payload is ~512 bytes, larger than every other variant. It stays
+    /// inline to keep `ProtoEvent` `Copy`: it is constructed once per
+    /// connection and moved through channels, never stored in bulk.
+    PeerInfo(PeerInfo),
+    /// Ask the peer to send its [`ProtoEvent::PeerInfo`].
+    ///
+    /// Needed because the pushing side may be a receive-only peer whose reply
+    /// path is not established: the connecting side can always send, so it
+    /// asks instead of waiting to be told.
+    PeerInfoRequest,
+}
+
+/// One fixed-width string slot, NUL-padded.
+pub type InfoField = [u8; PEER_INFO_FIELD];
+
+/// What a machine reports about itself.
+///
+/// Fixed-width slots keep the event inside the protocol's fixed-size buffer and
+/// keep `ProtoEvent` `Copy`. An all-zero slot means "not known".
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PeerInfo {
+    pub fields: [InfoField; PEER_INFO_FIELDS],
+}
+
+/// Slot indices, so call sites do not rely on magic numbers.
+pub mod info_slot {
+    pub const OS: usize = 0;
+    pub const OS_VERSION: usize = 1;
+    pub const KERNEL: usize = 2;
+    pub const ARCH: usize = 3;
+    pub const HOSTNAME: usize = 4;
+    pub const APP_VERSION: usize = 5;
+    pub const COMMIT: usize = 6;
+    pub const DISPLAYS: usize = 7;
+}
+
+impl PeerInfo {
+    /// Build from owned strings, truncating anything too long.
+    pub fn new(fields: [&str; PEER_INFO_FIELDS]) -> Self {
+        let mut out = [[0u8; PEER_INFO_FIELD]; PEER_INFO_FIELDS];
+        for (slot, value) in out.iter_mut().zip(fields.iter()) {
+            let bytes = value.as_bytes();
+            let n = bytes.len().min(PEER_INFO_FIELD - 1);
+            slot[..n].copy_from_slice(&bytes[..n]);
+        }
+        Self { fields: out }
+    }
+
+    /// Read slot `idx`, or `""` when unset.
+    pub fn get(&self, idx: usize) -> &str {
+        let slot = &self.fields[idx];
+        let end = slot.iter().position(|b| *b == 0).unwrap_or(slot.len());
+        std::str::from_utf8(&slot[..end]).unwrap_or("")
+    }
+}
+
+impl Default for PeerInfo {
+    fn default() -> Self {
+        Self {
+            fields: [[0u8; PEER_INFO_FIELD]; PEER_INFO_FIELDS],
+        }
+    }
+}
+
+impl Debug for PeerInfo {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PeerInfo({} {} {} {} host={} v{} {})",
+            self.get(info_slot::OS),
+            self.get(info_slot::OS_VERSION),
+            self.get(info_slot::KERNEL),
+            self.get(info_slot::ARCH),
+            self.get(info_slot::HOSTNAME),
+            self.get(info_slot::APP_VERSION),
+            self.get(info_slot::COMMIT)
+        )
+    }
 }
 
 impl Display for ProtoEvent {
@@ -93,6 +195,8 @@ impl Display for ProtoEvent {
                 let s = std::str::from_utf8(commit).unwrap_or("????????");
                 write!(f, "Hello({s})")
             }
+            ProtoEvent::PeerInfo(info) => write!(f, "{info:?}"),
+            ProtoEvent::PeerInfoRequest => write!(f, "PeerInfoRequest"),
         }
     }
 }
@@ -112,6 +216,8 @@ pub enum EventType {
     Leave,
     Ack,
     Hello,
+    PeerInfo,
+    PeerInfoRequest,
 }
 
 impl ProtoEvent {
@@ -135,15 +241,17 @@ impl ProtoEvent {
             ProtoEvent::Leave(_) => EventType::Leave,
             ProtoEvent::Ack(_) => EventType::Ack,
             ProtoEvent::Hello { .. } => EventType::Hello,
+            ProtoEvent::PeerInfo(_) => EventType::PeerInfo,
+            ProtoEvent::PeerInfoRequest => EventType::PeerInfoRequest,
         }
     }
 }
 
-impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
+impl TryFrom<&[u8]> for ProtoEvent {
     type Error = ProtocolError;
 
-    fn try_from(buf: [u8; MAX_EVENT_SIZE]) -> Result<Self, Self::Error> {
-        let mut buf = &buf[..];
+    fn try_from(buf: &[u8]) -> Result<Self, Self::Error> {
+        let mut buf = buf;
         let event_type = decode_u8(&mut buf)?;
         match EventType::try_from(event_type)? {
             EventType::PointerMotion => {
@@ -189,6 +297,16 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
             EventType::Enter => Ok(Self::Enter(decode_u8(&mut buf)?.try_into()?)),
             EventType::Leave => Ok(Self::Leave(decode_u32(&mut buf)?)),
             EventType::Ack => Ok(Self::Ack(decode_u32(&mut buf)?)),
+            EventType::PeerInfoRequest => Ok(Self::PeerInfoRequest),
+            EventType::PeerInfo => {
+                let mut fields = [[0u8; PEER_INFO_FIELD]; PEER_INFO_FIELDS];
+                for slot in fields.iter_mut() {
+                    for b in slot.iter_mut() {
+                        *b = decode_u8(&mut buf)?;
+                    }
+                }
+                Ok(Self::PeerInfo(PeerInfo { fields }))
+            }
             EventType::Hello => {
                 let mut commit = [0u8; 8];
                 for b in commit.iter_mut() {
@@ -263,6 +381,14 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                 ProtoEvent::Hello { commit } => {
                     for b in commit.iter() {
                         encode_u8(buf, len, *b);
+                    }
+                }
+                ProtoEvent::PeerInfoRequest => {}
+                ProtoEvent::PeerInfo(info) => {
+                    for slot in info.fields.iter() {
+                        for b in slot.iter() {
+                            encode_u8(buf, len, *b);
+                        }
                     }
                 }
             }

@@ -286,6 +286,18 @@ async fn connect_to_handle(
             log::debug!("hello send to {addr} failed: {e}");
         }
 
+        // Describe this machine, and ask the peer to do the same. The request
+        // matters: a receive-only peer's own push may never reach us, but it can
+        // always answer a packet we sent.
+        let (buf, len) = ProtoEvent::PeerInfo(*crate::sysinfo::LOCAL).into();
+        if let Err(e) = conn.send(&buf[..len]).await {
+            log::debug!("peer info send to {addr} failed: {e}");
+        }
+        let (buf, len) = ProtoEvent::PeerInfoRequest.into();
+        if let Err(e) = conn.send(&buf[..len]).await {
+            log::debug!("peer info request to {addr} failed: {e}");
+        }
+
         // poll connection for active
         spawn_local(ping_pong(
             addr,
@@ -374,8 +386,18 @@ async fn receive_loop(
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 ) {
     let mut buf = [0u8; MAX_EVENT_SIZE];
-    while conn.recv(&mut buf).await.is_ok() {
-        match buf.try_into() {
+    loop {
+        // Keep the length: decoding the whole buffer would read stale bytes
+        // left over from a previous, longer packet.
+        let n = match conn.recv(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => {
+                log::debug!("{addr}: recv failed: {e}");
+                break;
+            }
+        };
+        log::trace!("{addr} <== {n} bytes");
+        match buf[..n].try_into() {
             Ok(event) => {
                 log::trace!("{addr} <==<==<== {event}");
                 match event {
@@ -387,6 +409,10 @@ async fn receive_loop(
                     }
                     ProtoEvent::Hello { commit } => {
                         client_manager.set_peer_commit(handle, Some(commit));
+                    }
+                    ProtoEvent::PeerInfo(info) => {
+                        log::debug!("peer {}: {}", addr, crate::sysinfo::describe(&info));
+                        client_manager.set_peer_info(handle, info);
                     }
                     event => tx.send((handle, event)).expect("channel closed"),
                 }

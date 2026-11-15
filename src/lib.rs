@@ -18,3 +18,4 @@ mod listen;
 pub mod logging;
 mod remap;
 pub mod service;
+pub mod sysinfo;

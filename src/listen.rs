@@ -34,6 +34,7 @@ pub enum ListenerCreationError {
 
 type ArcConn = Arc<dyn Conn + Send + Sync>;
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ListenEvent {
     Msg {
         event: ProtoEvent,
@@ -204,13 +205,23 @@ impl LanMouseListener {
     }
 
     pub(crate) async fn reply(&self, addr: SocketAddr, event: ProtoEvent) {
-        log::trace!("reply {event} >=>=>=>=>=> {addr}");
+        log::debug!("reply {event} to {addr}");
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
         let conns = self.conns.lock().await;
+        let mut sent = false;
         for (a, conn) in conns.iter() {
             if *a == addr {
-                let _ = conn.send(&buf[..len]).await;
+                // Log the failure: a swallowed send made a broken reply path
+                // look identical to a peer that never asked.
+                match conn.send(&buf[..len]).await {
+                    Ok(_) => sent = true,
+                    Err(e) => log::warn!("reply to {addr} failed: {e}"),
+                }
             }
+        }
+        if !sent {
+            let known: Vec<SocketAddr> = conns.iter().map(|(a, _)| *a).collect();
+            log::debug!("reply to {addr} dropped: known connections {known:?}");
         }
     }
 
@@ -253,8 +264,14 @@ async fn read_loop(
 ) -> Result<(), Error> {
     let mut b = [0u8; MAX_EVENT_SIZE];
 
-    while conn.recv(&mut b).await.is_ok() {
-        match b.try_into() {
+    loop {
+        // Decode only the bytes actually received: the tail of `b` holds the
+        // previous packet, and parsing it as part of this one yields garbage.
+        let n = match conn.recv(&mut b).await {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        match b[..n].try_into() {
             Ok(event) => dtls_tx
                 .send(ListenEvent::Msg { event, addr })
                 .expect("channel closed"),

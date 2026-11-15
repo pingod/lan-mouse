@@ -97,6 +97,8 @@ struct Incoming {
     last_seen: Instant,
     /// events received since it connected
     received: u64,
+    /// what the peer reported about itself, if it sent a `PeerInfo`
+    info: Option<lan_mouse_ipc::IncomingInfo>,
 }
 
 impl Service {
@@ -596,6 +598,20 @@ impl Service {
 
     fn handle_emulation_event(&mut self, event: EmulationEvent) {
         match event {
+            EmulationEvent::PeerInfo { addr, info } => {
+                log::debug!("inbound {}: {}", addr, crate::sysinfo::describe(&info));
+                // Record it on the matching inbound connection so the UI can
+                // show who is driving this machine.
+                let flat = crate::sysinfo::flatten(&info);
+                if let Some(incoming) = self
+                    .incoming_conn_info
+                    .values_mut()
+                    .find(|i| i.addr == addr)
+                {
+                    incoming.info = Some(flat);
+                    self.publish_incoming();
+                }
+            }
             EmulationEvent::ConnectionAttempt { fingerprint } => {
                 self.notify_frontend(FrontendEvent::ConnectionAttempt { fingerprint });
             }
@@ -756,13 +772,17 @@ impl Service {
         let infos: Vec<lan_mouse_ipc::IncomingInfo> = self
             .incoming_conn_info
             .values()
-            .map(|i| lan_mouse_ipc::IncomingInfo {
-                addr: i.addr,
-                fingerprint: i.fingerprint.clone(),
-                pos: i.pos,
-                idle_secs: i.last_seen.elapsed().as_secs(),
-                received: i.received,
-                active: active_addr == Some(i.addr),
+            .map(|i| {
+                // Start from whatever the peer reported, then overlay the live
+                // connection facts.
+                let mut info = i.info.clone().unwrap_or_default();
+                info.addr = i.addr;
+                info.fingerprint = i.fingerprint.clone();
+                info.pos = i.pos;
+                info.idle_secs = i.last_seen.elapsed().as_secs();
+                info.received = i.received;
+                info.active = active_addr == Some(i.addr);
+                info
             })
             .collect();
         self.notify_frontend(FrontendEvent::IncomingConnections(infos));
@@ -781,6 +801,7 @@ impl Service {
                 pos,
                 last_seen: Instant::now(),
                 received: 0,
+                info: None,
             },
         );
     }

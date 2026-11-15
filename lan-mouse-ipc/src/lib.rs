@@ -191,6 +191,17 @@ pub struct ClientState {
     pub last_seen: Option<u64>,
     /// the client has an established (D)TLS connection right now
     pub connected: bool,
+    /// what the peer reported about itself: OS, version, kernel, arch,
+    /// hostname, app version, commit and display summary. Empty fields mean the
+    /// peer is on a build that predates the exchange.
+    pub peer_os: String,
+    pub peer_os_version: String,
+    pub peer_kernel: String,
+    pub peer_arch: String,
+    pub peer_hostname: String,
+    pub peer_app_version: String,
+    pub peer_commit_short: String,
+    pub peer_displays: String,
     /// input events forwarded to this client since the connection started
     pub forwarded: u64,
     /// input events received from this client since the connection started
@@ -347,6 +358,36 @@ pub struct IncomingInfo {
     pub received: u64,
     /// whether this peer is the one currently holding the pointer
     pub active: bool,
+    /// what the peer reported about itself; empty fields mean an older build
+    pub os: String,
+    pub os_version: String,
+    pub kernel: String,
+    pub arch: String,
+    pub hostname: String,
+    pub app_version: String,
+    pub commit: String,
+    pub displays: String,
+}
+
+impl Default for IncomingInfo {
+    fn default() -> Self {
+        Self {
+            addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+            fingerprint: String::new(),
+            pos: Position::default(),
+            idle_secs: 0,
+            received: 0,
+            active: false,
+            os: String::new(),
+            os_version: String::new(),
+            kernel: String::new(),
+            arch: String::new(),
+            hostname: String::new(),
+            app_version: String::new(),
+            commit: String::new(),
+            displays: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
