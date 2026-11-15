@@ -53,6 +53,24 @@ core-foundation-sys = "0.8.6"
 libc = "0.2.155"
 keycode = "1.0.0"
 bitflags = "2.6.0"
+# `CGEvent::as_ptr` (needed to hand the raw event to AppKit) comes from this
+# trait; `core-graphics` uses it internally but does not re-export it.
+foreign-types = "0.5.0"
+# Media keys (the volume knob, play/pause, brightness) are `NX_SYSDEFINED`
+# events whose payload only AppKit exposes, so the capture tap has to convert
+# the raw Quartz event into an `NSEvent` to read it.
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSEvent",
+    "objc2-core-graphics",
+] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CGEvent",
+    "CGEventTypes",
+    "objc2",
+] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61.2", features = [

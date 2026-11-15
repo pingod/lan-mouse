@@ -30,7 +30,7 @@ use wayland_client::{
     protocol::{wl_registry, wl_seat},
 };
 
-use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
+use input_event::{Event, KeyboardEvent, PointerEvent};
 
 use super::EmulationHandle;
 use super::error::WaylandBindError;
@@ -286,18 +286,12 @@ impl VirtualInput {
             }
             Event::Keyboard(e) => match e {
                 KeyboardEvent::Key { key, state, .. } => {
+                    // Only the key itself: the compositor's keymap derives
+                    // both the depressed and the locked (CapsLock / NumLock)
+                    // modifier state from it. Pushing our own guess here made
+                    // lock keys toggle twice — NumLock turned itself back off
+                    // and the numpad kept typing arrows.
                     self.keyboard.key(now, key, state as u32);
-                    if let Ok(mut mods) = self.modifiers.lock() {
-                        if mods.update_by_key_event(key, state) {
-                            log::trace!("Key triggers modifier change: {mods:?}");
-                            self.keyboard.modifiers(
-                                mods.mask_pressed().bits(),
-                                0,
-                                mods.mask_locks().bits(),
-                                0,
-                            );
-                        }
-                    }
                 }
                 KeyboardEvent::Modifiers {
                     depressed: mods_depressed,
@@ -396,56 +390,5 @@ impl XMods {
         {
             *self = XMods::from_bits_truncate(depressed) | XMods::from_bits_truncate(locked);
         }
-    }
-
-    fn update_by_key_event(&mut self, key: u32, state: u8) -> bool {
-        if let Ok(key) = scancode::Linux::try_from(key) {
-            log::trace!("Attempting to process modifier from: {key:#?}");
-            let pressed_mask = match key {
-                scancode::Linux::KeyLeftShift | scancode::Linux::KeyRightShift => XMods::ShiftMask,
-                scancode::Linux::KeyLeftCtrl | scancode::Linux::KeyRightCtrl => XMods::ControlMask,
-                // Right Alt is AltGr (ISO_Level3_Shift), which xkb places in
-                // Mod5 — not Mod1. Mapping it to Mod1 made AltGr+Q produce
-                // "q" instead of "@" on layouts that need level 3 (issue
-                // #486, #408).
-                scancode::Linux::KeyLeftAlt => XMods::Mod1Mask,
-                scancode::Linux::KeyRightalt => XMods::Mod5Mask,
-                scancode::Linux::KeyLeftMeta | scancode::Linux::KeyRightmeta => XMods::Mod4Mask,
-                _ => XMods::empty(),
-            };
-
-            let locked_mask = match key {
-                scancode::Linux::KeyCapsLock => XMods::LockMask,
-                scancode::Linux::KeyNumlock => XMods::Mod2Mask,
-                scancode::Linux::KeyScrollLock => XMods::Mod3Mask,
-                _ => XMods::empty(),
-            };
-
-            // unchanged
-            if pressed_mask.is_empty() && locked_mask.is_empty() {
-                log::trace!("{key:#?} is not a modifier key");
-                return false;
-            }
-            match state {
-                1 => {
-                    self.insert(pressed_mask);
-                    // lock keys toggle when they go down, e.g. CapsLock must
-                    // already be locked for the character typed after it
-                    self.toggle(locked_mask);
-                }
-                _ => self.remove(pressed_mask),
-            }
-            true
-        } else {
-            false
-        }
-    }
-
-    fn mask_locks(&self) -> XMods {
-        *self & (XMods::LockMask | XMods::Mod2Mask | XMods::Mod3Mask)
-    }
-
-    fn mask_pressed(&self) -> XMods {
-        *self & (XMods::ShiftMask | XMods::ControlMask | XMods::Mod1Mask | XMods::Mod4Mask)
     }
 }

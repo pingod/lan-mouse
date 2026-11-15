@@ -13,6 +13,51 @@ use core_foundation::{
 /// on-wire behaviour between them.
 const INJECTED_EVENT_TAG: i64 = 0x6c616e6d; // "lanm"
 
+/// Quartz event type of `NX_SYSDEFINED`, which carries media keys.
+///
+/// `core-graphics` has no variant for it: media keys are not key events, so
+/// the tap has to ask for the raw type and decode the payload itself.
+const SYSTEM_DEFINED_EVENT: u32 = 14;
+
+/// `NX_KEYTYPE_*` values a keyboard can send, mapped to the evdev codes the
+/// rest of lan-mouse speaks.
+fn media_key_evdev(data1: isize) -> Option<(u32, u8)> {
+    use input_event::scancode::Linux;
+
+    // data1 = NX_KEYTYPE << 16 | (0x0a on press, 0x0b on release) << 8
+    let key_type = (data1 >> 16) as u32 & 0xffff;
+    let key = match key_type {
+        0 => Linux::KeyVolumeUp,
+        1 => Linux::KeyVolumeDown,
+        2 => Linux::KeyBrightnessup,
+        3 => Linux::KeyBrightnessdown,
+        7 => Linux::KeyMute,
+        16 => Linux::KeyPlaypause,
+        17 => Linux::KeyNextsong,
+        18 => Linux::KeyPrevioussong,
+        _ => return None,
+    };
+    let state = if ((data1 >> 8) & 0xff) == 0x0a { 1 } else { 0 };
+    Some((key as u32, state))
+}
+
+/// Decode a media key from a raw Quartz event.
+///
+/// The payload lives in `NSEvent.data1`, which Quartz only exposes through
+/// AppKit, hence the conversion from the raw event.
+fn media_key_event(cg_ev: &CGEvent) -> Option<CaptureEvent> {
+    let ns_event = unsafe {
+        let event = &*(ForeignType::as_ptr(cg_ev) as *const objc2_core_graphics::CGEvent);
+        objc2_app_kit::NSEvent::eventWithCGEvent(event)?
+    };
+    let (key, state) = media_key_evdev(ns_event.data1())?;
+    Some(CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+        time: 0,
+        key,
+        state,
+    })))
+}
+
 /// Whether `event_type` reports pointer movement.
 fn is_pointer_motion(event_type: CGEventType) -> bool {
     matches!(
@@ -33,6 +78,7 @@ use core_graphics::{
     },
     event_source::{CGEventSource, CGEventSourceStateID},
 };
+use foreign_types::ForeignType;
 use futures_core::Stream;
 use input_event::{
     BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
@@ -545,6 +591,10 @@ fn create_event_tap<'a>(
         CGEventType::KeyDown,
         CGEventType::KeyUp,
         CGEventType::FlagsChanged,
+        // `NX_SYSDEFINED`: media keys (the volume knob, play/pause,
+        // brightness). `core-graphics` names no variant for it, but the tap
+        // mask is just a bit field, so the raw discriminant works.
+        unsafe { std::mem::transmute::<u32, CGEventType>(SYSTEM_DEFINED_EVENT) },
     ];
 
     let event_tap_callback = move |_proxy: CGEventTapProxy,
@@ -641,15 +691,25 @@ fn create_event_tap<'a>(
             // read back. Keep the cursor pinned but do not forward it: that
             // would send the peer its own movement.
             if !synthesized {
-                get_events(
-                    &event_type,
-                    cg_ev,
-                    &mut res_events,
-                    &mut state.modifier_state,
-                )
-                .unwrap_or_else(|e| {
-                    log::error!("Failed to get events: {e}");
-                });
+                if (event_type as u32) == SYSTEM_DEFINED_EVENT {
+                    // Media keys are not key events: the hardware sends
+                    // `NX_SYSDEFINED` with the key type packed into `data1`.
+                    // Without this the volume knob kept changing the Mac's
+                    // volume while the pointer was on the peer.
+                    if let Some(event) = media_key_event(cg_ev) {
+                        res_events.push(event);
+                    }
+                } else {
+                    get_events(
+                        &event_type,
+                        cg_ev,
+                        &mut res_events,
+                        &mut state.modifier_state,
+                    )
+                    .unwrap_or_else(|e| {
+                        log::error!("Failed to get events: {e}");
+                    });
+                }
             }
 
             // Keep (hidden) cursor at the edge of the screen
