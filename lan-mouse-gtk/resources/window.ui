@@ -110,7 +110,7 @@
                         <child>
                           <object class="AdwPreferencesGroup">
                             <property name="title" translatable="yes">Activity</property>
-                            <property name="description" translatable="yes">Live view of the link: who is connected, how far away they are, and how much has moved.</property>
+                            <property name="description" translatable="yes">Live counters for the running service.</property>
                             <child>
                               <object class="AdwActionRow" id="peers_row">
                                 <property name="title" translatable="yes">Peers</property>
@@ -132,17 +132,31 @@
                                 <property name="icon-name">alarm-symbolic</property>
                               </object>
                             </child>
+                            <child>
+                              <object class="AdwActionRow" id="uptime_row">
+                                <property name="title" translatable="yes">Uptime</property>
+                                <property name="subtitle">-</property>
+                                <property name="icon-name">preferences-system-time-symbolic</property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="AdwActionRow" id="port_row">
+                                <property name="title" translatable="yes">Listen port</property>
+                                <property name="subtitle">-</property>
+                                <property name="icon-name">network-server-symbolic</property>
+                              </object>
+                            </child>
                           </object>
                         </child>
                         <child>
                           <object class="AdwPreferencesGroup" id="capture_emulation_group">
                             <property name="title" translatable="yes">Backends</property>
-                            <property name="description" translatable="yes">Both must be enabled for a two-way setup.</property>
+                            <property name="description" translatable="yes">Which backend each side is using, and whether it is running.</property>
                             <child>
                               <object class="AdwActionRow" id="capture_status_row">
-                                <property name="title">input capture is disabled</property>
-                                <property name="subtitle">required for outgoing and incoming connections</property>
-                                <property name="icon-name">dialog-warning-symbolic</property>
+                                <property name="title">input capture</property>
+                                <property name="subtitle">-</property>
+                                <property name="icon-name">object-select-symbolic</property>
                                 <child>
                                   <object class="GtkButton" id="input_capture_button">
                                     <property name="child">
@@ -159,16 +173,13 @@
                                     </style>
                                   </object>
                                 </child>
-                                <style>
-                                  <class name="warning"/>
-                                </style>
                               </object>
                             </child>
                             <child>
                               <object class="AdwActionRow" id="emulation_status_row">
-                                <property name="title">input emulation is disabled</property>
-                                <property name="subtitle">required for incoming connections</property>
-                                <property name="icon-name">dialog-warning-symbolic</property>
+                                <property name="title">input emulation</property>
+                                <property name="subtitle">-</property>
+                                <property name="icon-name">object-select-symbolic</property>
                                 <child>
                                   <object class="GtkButton" id="input_emulation_button">
                                     <property name="child">
@@ -185,9 +196,6 @@
                                     </style>
                                   </object>
                                 </child>
-                                <style>
-                                  <class name="warning"/>
-                                </style>
                               </object>
                             </child>
                           </object>

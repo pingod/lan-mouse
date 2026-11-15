@@ -74,6 +74,10 @@ pub struct Window {
     #[template_child]
     pub latency_row: TemplateChild<ActionRow>,
     #[template_child]
+    pub uptime_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub port_row: TemplateChild<ActionRow>,
+    #[template_child]
     pub incoming_list: TemplateChild<ListBox>,
     #[template_child]
     pub incoming_placeholder: TemplateChild<ActionRow>,

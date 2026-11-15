@@ -237,6 +237,8 @@ pub enum FrontendEvent {
     LogAppended(Vec<String>),
     /// a full snapshot of every inbound connection
     IncomingConnections(Vec<IncomingInfo>),
+    /// live backend and runtime counters
+    Runtime(RuntimeInfo),
     /// capture status
     CaptureStatus(Status),
     /// emulation status
@@ -343,6 +345,38 @@ pub enum FrontendRequest {
     SubscribeLogs(Option<usize>),
     /// re-ask a peer for its machine details
     RefreshPeerInfo(ClientHandle),
+}
+
+/// Live state of the running service.
+///
+/// Everything here changes while it runs, unlike [`IncomingInfo`] which
+/// describes an install.
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub struct RuntimeInfo {
+    /// capture backend in use, empty when unavailable
+    pub capture_backend: String,
+    /// emulation backend in use
+    pub emulation_backend: String,
+    /// capture is enabled and the backend is alive
+    pub capture_alive: bool,
+    /// emulation is enabled and the backend is alive
+    pub emulation_alive: bool,
+    /// pointer is currently handed to a peer
+    pub capturing: bool,
+    /// peer that holds the pointer, empty when local
+    pub capturing_peer: String,
+    /// configured listen port
+    pub port: u16,
+    /// seconds since the service started
+    pub uptime_secs: u64,
+    /// whether capture or emulation is paused by the user
+    pub paused: bool,
+    /// number of active inbound connections
+    pub inbound: usize,
+    /// number of connected outbound clients
+    pub outbound: usize,
+    /// best round-trip time across peers, in milliseconds; 0 when unknown
+    pub best_rtt_ms: u32,
 }
 
 /// One device currently driving (or allowed to drive) this machine.

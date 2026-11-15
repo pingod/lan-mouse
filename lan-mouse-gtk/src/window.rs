@@ -760,6 +760,83 @@ impl Window {
         self.update_capture_emulation_status();
     }
 
+    /// Render the live service counters and the backend rows.
+    pub(super) fn set_runtime(&self, info: lan_mouse_ipc::RuntimeInfo) {
+        let imp = self.imp();
+
+        imp.peers_row.set_subtitle(&format!(
+            "{} outbound · {} inbound",
+            info.outbound, info.inbound
+        ));
+        imp.latency_row.set_subtitle(&if info.best_rtt_ms > 0 {
+            format!("{} ms", info.best_rtt_ms)
+        } else {
+            "no peer responding".to_owned()
+        });
+        imp.uptime_row
+            .set_subtitle(&format_duration(info.uptime_secs));
+        imp.port_row.set_subtitle(&info.port.to_string());
+
+        // Traffic totals live on the clients; sum them here so the row is
+        // filled even when the runtime snapshot has no counter of its own.
+        let (sent, recv) = imp
+            .clients
+            .borrow()
+            .clone()
+            .map(|store| {
+                let mut s = 0u64;
+                let mut r = 0u64;
+                for i in 0..store.n_items() {
+                    if let Some(obj) = store.item(i).and_downcast::<ClientObject>() {
+                        s += obj.property::<u64>("forwarded");
+                        r += obj.property::<u64>("received");
+                    }
+                }
+                (s, r)
+            })
+            .unwrap_or((0, 0));
+        imp.traffic_row
+            .set_subtitle(&format!("{sent} sent · {recv} received"));
+
+        // Backends: name what is actually running, not just on/off.
+        let capture_ok = info.capture_alive;
+        imp.capture_status_row.set_subtitle(&if info.paused {
+            "paused".to_owned()
+        } else if capture_ok {
+            format!("{} · running", info.capture_backend)
+        } else {
+            format!("{} · not available", info.capture_backend)
+        });
+        imp.capture_status_row
+            .set_css_classes(if capture_ok { &[] } else { &["warning"] });
+        imp.input_capture_button
+            .set_visible(!capture_ok && !info.paused);
+
+        let emulation_ok = info.emulation_alive;
+        imp.emulation_status_row.set_subtitle(&if info.paused {
+            "paused".to_owned()
+        } else if emulation_ok {
+            format!("{} · running", info.emulation_backend)
+        } else {
+            format!("{} · not available", info.emulation_backend)
+        });
+        imp.emulation_status_row
+            .set_css_classes(if emulation_ok { &[] } else { &["warning"] });
+        imp.input_emulation_button
+            .set_visible(!emulation_ok && !info.paused);
+
+        // "Controlling" is a fact from the capture stream, not a guess.
+        imp.active_device_row.set_subtitle(&if info.capturing {
+            if info.capturing_peer.is_empty() {
+                "a peer holds the pointer".to_owned()
+            } else {
+                format!("{} holds the pointer", info.capturing_peer)
+            }
+        } else {
+            "this machine".to_owned()
+        });
+    }
+
     /// Render the inbound connection list and the latency summary.
     pub(super) fn set_incoming(&self, infos: Vec<lan_mouse_ipc::IncomingInfo>) {
         let imp = self.imp();
@@ -1122,6 +1199,22 @@ fn add_detail(row: &adw::ExpanderRow, label: &str, value: &str) {
             .subtitle(value)
             .build(),
     );
+}
+
+/// Human-readable duration, e.g. `3d 4h 12m`.
+fn format_duration(secs: u64) -> String {
+    let d = secs / 86_400;
+    let h = (secs % 86_400) / 3600;
+    let m = (secs % 3600) / 60;
+    if d > 0 {
+        format!("{d}d {h}h {m}m")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {}s", secs % 60)
+    } else {
+        format!("{}s", secs)
+    }
 }
 
 #[cfg(test)]

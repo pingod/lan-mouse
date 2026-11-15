@@ -86,6 +86,11 @@ pub struct Service {
     active_capture: Option<ClientHandle>,
     /// reports that arrived before their connection was registered
     pending_peer_info: HashMap<SocketAddr, lan_mouse_ipc::IncomingInfo>,
+    /// when the service started, for the uptime readout
+    started: Instant,
+    /// names of the backends actually in use
+    capture_backend_name: String,
+    emulation_backend_name: String,
     /// when a frontend is streaming logs: how often to poll and where we are
     log_stream: Option<(tokio::time::Interval, usize)>,
 }
@@ -127,6 +132,14 @@ impl Service {
         let hotkeys = Hotkeys::new(&config, conn.clone());
 
         // input capture + emulation
+        let capture_backend_name = config
+            .capture_backend()
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "default".to_owned());
+        let emulation_backend_name = config
+            .emulation_backend()
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "default".to_owned());
         let capture_backend = config.capture_backend().map(|b| b.into());
         // `Capture` owns the connection handle that carries `recv_rx`; the
         // service keeps a clone for sending and preconnecting. A clone has no
@@ -171,6 +184,9 @@ impl Service {
             pending_pause: None,
             active_capture: None,
             pending_peer_info: Default::default(),
+            started: Instant::now(),
+            capture_backend_name: capture_backend_name.clone(),
+            emulation_backend_name: emulation_backend_name.clone(),
             log_stream: None,
         };
         Ok(service)
@@ -189,6 +205,10 @@ impl Service {
             self.activate_client(handle);
         }
 
+        // A `sleep` inside `select!` would be recreated every iteration and
+        // effectively never fire; an interval keeps its schedule.
+        let mut runtime_tick = tokio::time::interval(Duration::from_secs(1));
+        runtime_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 request = self.frontend_listener.next() => {
@@ -223,6 +243,7 @@ impl Service {
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 _ = self.config.changed() => self.handle_config_change(),
                 _ = log_tick(&mut self.log_stream) => self.flush_log_stream(),
+                _ = runtime_tick.tick() => self.publish_runtime(),
                 _ = restart_tick(&self.restart_interval, self.last_restart) => {
                     log::info!("scheduled restart");
                     self.last_restart = Instant::now();
@@ -782,6 +803,45 @@ impl Service {
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;
+
+    /// Publish live counters. These change while the service runs, so unlike the
+    /// peer reports they are refreshed on a timer — one small message per
+    /// second, and only while a frontend is listening.
+    fn publish_runtime(&mut self) {
+        let outbound = self
+            .client_manager
+            .active_clients()
+            .into_iter()
+            .filter(|h| self.client_manager.active_addr(*h).is_some())
+            .count();
+        let best_rtt = self
+            .client_manager
+            .clients()
+            .iter()
+            .filter_map(|(_, s)| s.rtt_ms)
+            .min()
+            .unwrap_or(0) as u32;
+        let capturing_peer = self
+            .active_capture
+            .and_then(|h| self.client_manager.get_state(h))
+            .and_then(|(c, _)| c.hostname)
+            .unwrap_or_default();
+
+        self.notify_frontend(FrontendEvent::Runtime(lan_mouse_ipc::RuntimeInfo {
+            capture_backend: self.capture_backend_name.clone(),
+            emulation_backend: self.emulation_backend_name.clone(),
+            capture_alive: self.capture_status == Status::Enabled && !self.paused,
+            emulation_alive: self.emulation_status == Status::Enabled && !self.paused,
+            capturing: self.active_capture.is_some(),
+            capturing_peer,
+            port: self.port,
+            uptime_secs: self.started.elapsed().as_secs(),
+            paused: self.paused,
+            inbound: self.incoming_conn_info.len(),
+            outbound,
+            best_rtt_ms: best_rtt,
+        }));
+    }
 
     /// Publish a snapshot of every inbound connection.
     fn publish_incoming(&mut self) {

@@ -342,6 +342,7 @@ fn build_ui(app: &Application) {
                         window.show_toast(format!("device entered: {addr} ({pos})").as_str());
                     }
                     FrontendEvent::IncomingConnections(infos) => window.set_incoming(infos),
+                    FrontendEvent::Runtime(info) => window.set_runtime(info),
                     FrontendEvent::IncomingDisconnected(addr) => {
                         window.show_toast(format!("{addr} disconnected").as_str());
                     }
