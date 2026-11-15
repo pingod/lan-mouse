@@ -765,36 +765,73 @@ fn parse_keys(spec: &str) -> Result<Vec<u32>, String> {
         if name.is_empty() {
             continue;
         }
-        let canonical = match name.to_ascii_lowercase().as_str() {
-            "shift" | "lshift" | "leftshift" => "KeyLeftShift".to_string(),
-            "rshift" | "rightshift" => "KeyRightShift".to_string(),
-            "ctrl" | "control" | "lctrl" | "leftctrl" => "KeyLeftCtrl".to_string(),
-            "rctrl" | "rightctrl" => "KeyRightCtrl".to_string(),
-            "alt" | "lalt" | "leftalt" => "KeyLeftAlt".to_string(),
-            "ralt" | "rightalt" | "altgr" => "KeyRightalt".to_string(),
-            "super" | "meta" | "win" | "lmeta" => "KeyLeftMeta".to_string(),
-            "rmeta" => "KeyRightmeta".to_string(),
-            other => {
-                // accept `KeyA` and bare `A`, case-insensitively
-                let stripped = other.strip_prefix("key").unwrap_or(other);
-                if stripped.chars().count() == 1 {
-                    let c = stripped.to_ascii_uppercase();
-                    format!("Key{c}")
-                } else {
-                    let mut chars = stripped.chars();
-                    match chars.next() {
-                        Some(first) => {
-                            format!("Key{}{}", first.to_ascii_uppercase(), chars.as_str())
-                        }
-                        None => continue,
-                    }
-                }
-            }
-        };
-        match toml::from_str::<Linux>(&format!("\"{canonical}\"")) {
+        let canonical = canonical_key_name(name);
+        // `serde_json` handles a bare string; `toml` would expect a document.
+        match serde_json::from_value::<Linux>(serde_json::Value::String(canonical)) {
             Ok(k) => out.push(k as u32),
             Err(_) => return Err(format!("unknown key `{name}`")),
         }
     }
     Ok(out)
+}
+
+/// Map a user-written key name to the `scancode::Linux` variant name.
+///
+/// Accepts the full variant (`KeyLeftShift`), a bare letter (`z`) and the
+/// short spellings people actually type (`Shift`, `Ctrl`, `Alt`, `Super`).
+fn canonical_key_name(name: &str) -> String {
+    match name.to_ascii_lowercase().as_str() {
+        "shift" | "lshift" | "leftshift" => return "KeyLeftShift".into(),
+        "rshift" | "rightshift" => return "KeyRightShift".into(),
+        "ctrl" | "control" | "lctrl" | "leftctrl" => return "KeyLeftCtrl".into(),
+        "rctrl" | "rightctrl" => return "KeyRightCtrl".into(),
+        "alt" | "lalt" | "leftalt" => return "KeyLeftAlt".into(),
+        "ralt" | "rightalt" | "altgr" => return "KeyRightalt".into(),
+        "super" | "meta" | "win" | "lmeta" | "leftmeta" => return "KeyLeftMeta".into(),
+        "rmeta" | "rightmeta" => return "KeyRightmeta".into(),
+        _ => {}
+    }
+
+    let stripped = name
+        .strip_prefix("Key")
+        .or_else(|| name.strip_prefix("key"))
+        .unwrap_or(name);
+
+    // single character: `z` -> `KeyZ`
+    if stripped.chars().count() == 1 {
+        return format!("Key{}", stripped.to_ascii_uppercase());
+    }
+
+    // already a full variant such as `LeftShift`: capitalise the first letter
+    // and keep the rest, which is exactly how the variants are spelled.
+    let mut chars = stripped.chars();
+    match chars.next() {
+        Some(first) => format!("Key{}{}", first.to_ascii_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod key_parsing_tests {
+    use super::*;
+
+    #[test]
+    fn parses_modifier_chord() {
+        let keys = parse_keys("Shift+Alt+Z").expect("parse");
+        assert_eq!(keys.len(), 3, "expected 3 keys, got {keys:?}");
+    }
+
+    #[test]
+    fn parses_bare_letter() {
+        let keys = parse_keys("Z").expect("parse");
+        assert_eq!(keys.len(), 1);
+    }
+
+    #[test]
+    fn round_trips_through_format() {
+        let keys = parse_keys("Shift+Alt+Z").expect("parse");
+        let text = format_keys(&keys);
+        let again = parse_keys(&text).expect("reparse");
+        assert_eq!(keys, again);
+    }
 }
