@@ -168,11 +168,7 @@ impl Log for CaptureLogger {
         // The line is rebuilt rather than cloned: `eprintln!` locks stderr and
         // this path runs for every record at debug level, so avoiding an
         // allocation per record is worth the extra format.
-        if *STDERR_WRITABLE.get_or_init(|| {
-            // fd 2 exists and is not closed. A tty or a pipe both qualify; only
-            // a closed descriptor fails `fcntl(F_GETFL)`.
-            unsafe { libc::fcntl(2, libc::F_GETFL) != -1 }
-        }) {
+        if *STDERR_WRITABLE.get_or_init(stderr_is_open) {
             eprintln!(
                 "[{} {} {}] {}",
                 record.level(),
@@ -190,6 +186,21 @@ impl Log for CaptureLogger {
 ///
 /// A full date is not worth pulling in a dependency for; log records are read
 /// live, and the journal has precise timestamps when history matters.
+/// Whether fd 2 exists and is not closed.
+///
+/// A tty or a pipe both qualify; only a closed descriptor fails
+/// `fcntl(F_GETFL)`. Windows has no `fcntl`, and a GUI build there always has
+/// a console handle, so the check is skipped rather than emulated.
+#[cfg(unix)]
+fn stderr_is_open() -> bool {
+    unsafe { libc::fcntl(2, libc::F_GETFL) != -1 }
+}
+
+#[cfg(not(unix))]
+fn stderr_is_open() -> bool {
+    true
+}
+
 /// Seconds since the Unix epoch, read at most once per second.
 ///
 /// Formatting a timestamp per record is measurable at debug level, and a log
