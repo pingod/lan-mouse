@@ -20,6 +20,9 @@ pub struct ClientObject {
     #[property(name = "resolving", get, set, type = bool, member = resolving)]
     #[property(name = "ips", get, set, type = Vec<String>, member = ips)]
     #[property(name = "peer-commit", get, set, type = Option<String>, member = peer_commit)]
+    #[property(name = "connected", get, set, type = bool, member = connected)]
+    #[property(name = "rtt-ms", get, set, type = u32, member = rtt_ms, maximum = u32::MAX)]
+    #[property(name = "last-seen", get, set, type = u64, member = last_seen)]
     pub data: RefCell<ClientData>,
 }
 

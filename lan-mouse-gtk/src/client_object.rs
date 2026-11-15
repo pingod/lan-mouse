@@ -27,6 +27,9 @@ impl ClientObject {
             )
             .property("resolving", state.resolving)
             .property("peer-commit", peer_commit_to_string(state.peer_commit))
+            .property("connected", state.connected)
+            .property("rtt-ms", state.rtt_ms.unwrap_or(0) as u32)
+            .property("last-seen", state.last_seen.unwrap_or(0))
             .build()
     }
 
@@ -53,4 +56,9 @@ pub struct ClientData {
     pub resolving: bool,
     pub ips: Vec<String>,
     pub peer_commit: Option<String>,
+    pub connected: bool,
+    /// Round-trip time in milliseconds; `0` means unknown.
+    pub rtt_ms: u32,
+    /// Unix timestamp of the last contact; `0` means unknown.
+    pub last_seen: u64,
 }

@@ -65,6 +65,8 @@ pub struct Window {
     pub log_level_combo: TemplateChild<adw::ComboRow>,
     #[template_child]
     pub main_stack: TemplateChild<adw::ViewStack>,
+    #[template_child]
+    pub active_device_row: TemplateChild<ActionRow>,
     pub clients: RefCell<Option<gio::ListStore>>,
     pub authorized: RefCell<Option<gio::ListStore>>,
     pub frontend_request_writer: RefCell<Option<FrontendRequestWriter>>,

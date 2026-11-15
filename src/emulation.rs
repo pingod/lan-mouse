@@ -422,7 +422,13 @@ impl EmulationTask {
             tokio::select! {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     ProxyRequest::Input(event, addr) => {
-                        if !should_accept_input(&self.left, addr, Instant::now()) {
+                        let now = Instant::now();
+                        // Drop expired latches as we go. The map is keyed by
+                        // peer address and a busy network would otherwise keep
+                        // one entry per address that ever said Leave.
+                        self.left
+                            .retain(|_, left_at| now.duration_since(*left_at) < LEAVE_GRACE);
+                        if !should_accept_input(&self.left, addr, now) {
                             log::debug!("dropping input from {addr}: peer has left");
                             continue;
                         }

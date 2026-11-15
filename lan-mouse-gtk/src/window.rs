@@ -292,6 +292,7 @@ impl Window {
         self.update_placeholder_visibility();
 
         self.update_dns_state(handle, !state.ips.is_empty());
+        self.update_active_device_row();
     }
 
     pub(super) fn update_client_list(
@@ -596,6 +597,7 @@ impl Window {
             crate::client_object::peer_commit_to_string(state.peer_commit),
         );
         row.refresh_version_status();
+        self.update_active_device_row();
     }
 
     fn client_object_for_handle(&self, handle: ClientHandle) -> Option<ClientObject> {
@@ -697,6 +699,46 @@ impl Window {
         self.update_capture_emulation_status();
     }
 
+    /// Show which machine the pointer is currently on, plus the best peer RTT.
+    fn update_active_device_row(&self) {
+        let imp = self.imp();
+        let store = imp.clients.borrow().clone();
+        let mut controlling: Option<String> = None;
+        let mut best_rtt: Option<u64> = None;
+
+        if let Some(store) = store {
+            for i in 0..store.n_items() {
+                let Some(obj) = store.item(i).and_downcast::<ClientObject>() else {
+                    continue;
+                };
+                let name = obj
+                    .property::<Option<String>>("hostname")
+                    .unwrap_or_else(|| "peer".to_owned());
+                if obj.property::<bool>("connected") {
+                    controlling.get_or_insert(name.clone());
+                }
+                let rtt = obj.property::<u32>("rtt-ms");
+                if rtt > 0 {
+                    best_rtt = Some(best_rtt.map_or(rtt as u64, |b: u64| b.min(rtt as u64)));
+                }
+            }
+        }
+
+        match controlling {
+            Some(name) => {
+                imp.active_device_row
+                    .set_subtitle(&format!("{name} is driving this machine"));
+            }
+            None => {
+                let subtitle = match best_rtt {
+                    Some(rtt) => format!("this machine · peer rtt {rtt} ms"),
+                    None => "this machine".to_owned(),
+                };
+                imp.active_device_row.set_subtitle(&subtitle);
+            }
+        }
+    }
+
     fn update_capture_emulation_status(&self) {
         let capture = self.imp().capture_active.get();
         let emulation = self.imp().emulation_active.get();
@@ -721,11 +763,33 @@ impl Window {
 
         #[cfg(not(target_os = "macos"))]
         {
-            self.imp().capture_status_row.set_visible(!capture);
-            self.imp().emulation_status_row.set_visible(!emulation);
+            // Always visible: a healthy backend is information too, and hiding
+            // the whole group left the Status page looking empty.
+            self.imp().capture_emulation_group.set_visible(true);
+            self.imp().capture_status_row.set_visible(true);
+            self.imp().emulation_status_row.set_visible(true);
+
+            let capture_title = if capture {
+                "input capture"
+            } else {
+                "input capture is disabled"
+            };
+            self.imp().capture_status_row.set_title(capture_title);
             self.imp()
-                .capture_emulation_group
-                .set_visible(!capture || !emulation);
+                .capture_status_row
+                .set_css_classes(if capture { &[] } else { &["warning"] });
+            self.imp().input_capture_button.set_visible(!capture);
+
+            let emulation_title = if emulation {
+                "input emulation"
+            } else {
+                "input emulation is disabled"
+            };
+            self.imp().emulation_status_row.set_title(emulation_title);
+            self.imp()
+                .emulation_status_row
+                .set_css_classes(if emulation { &[] } else { &["warning"] });
+            self.imp().input_emulation_button.set_visible(!emulation);
         }
     }
 

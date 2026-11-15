@@ -84,6 +84,13 @@
                               </object>
                             </child>
                             <child>
+                              <object class="AdwActionRow" id="active_device_row">
+                                <property name="title" translatable="yes">Controlling</property>
+                                <property name="subtitle" translatable="yes">this machine</property>
+                                <property name="icon-name">input-keyboard-symbolic</property>
+                              </object>
+                            </child>
+                            <child>
                               <object class="AdwActionRow" id="switch_device_row">
                                 <property name="title" translatable="yes">Switch device</property>
                                 <property name="subtitle" translatable="yes">take control back from the peer that currently holds it</property>
