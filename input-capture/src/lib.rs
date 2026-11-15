@@ -41,6 +41,13 @@ pub enum CaptureEvent {
     Begin,
     /// input event coming from capture handle
     Input(Event),
+    /// the compositor took the pointer away from us.
+    ///
+    /// Happens when a lock screen, a new surface or a display reconfiguration
+    /// grabs the seat: the barrier is gone and no further events will arrive,
+    /// so the caller must release the capture instead of waiting for input
+    /// that will never come (issues #545, #512).
+    Interrupted,
 }
 
 impl Display for CaptureEvent {
@@ -48,6 +55,7 @@ impl Display for CaptureEvent {
         match self {
             CaptureEvent::Begin => write!(f, "begin capture"),
             CaptureEvent::Input(e) => write!(f, "{e}"),
+            CaptureEvent::Interrupted => write!(f, "capture interrupted"),
         }
     }
 }

@@ -752,6 +752,18 @@ impl Dispatch<WlPointer, ()> for State {
                 if app.pointer_lock.is_some() {
                     log::warn!("compositor released mouse");
                 }
+                // If we were actively capturing, the compositor just took the
+                // pointer away (lock screen, new surface, display change). The
+                // barrier is gone and no further input will arrive, so tell the
+                // service to release instead of waiting for the release-bind
+                // chord that can never be delivered (issues #545, #512).
+                if let Some(pos) = app.focused.as_ref().map(|w| w.pos) {
+                    if app.pointer_lock.is_some() {
+                        log::info!("compositor took the pointer — capture interrupted");
+                        app.pending_events
+                            .push_back((pos, CaptureEvent::Interrupted));
+                    }
+                }
                 app.ungrab();
             }
             wl_pointer::Event::Button {

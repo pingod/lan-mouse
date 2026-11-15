@@ -397,6 +397,14 @@ impl CaptureTask {
             return self.release_capture(capture).await;
         }
 
+        // The compositor took the pointer away: no further input can arrive,
+        // so release rather than waiting for a release-bind that will never be
+        // delivered (issues #545, #512).
+        if event == CaptureEvent::Interrupted {
+            log::warn!("releasing capture: input stream interrupted by the compositor");
+            return self.release_capture(capture).await;
+        }
+
         if event == CaptureEvent::Begin {
             self.event_tx
                 .send(ICaptureEvent::CaptureBegin(handle))
@@ -428,6 +436,8 @@ impl CaptureTask {
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
 
         let events: Vec<ProtoEvent> = match event {
+            // already handled above (released the capture)
+            CaptureEvent::Interrupted => return Ok(()),
             CaptureEvent::Begin => vec![ProtoEvent::Enter(opposite_pos)],
             CaptureEvent::Input(e) => match self.state {
                 // connection not acknowledged, repeat `Enter` event
