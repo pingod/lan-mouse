@@ -24,6 +24,30 @@ Focus lies on performance, ease of use and a maintainable implementation that ca
 </picture>
 
 
+## 本分支的改动
+
+这个分支在 0.11.0 之上修复了一批实际使用中暴露的问题，并补充了运维所需的界面。
+完整说明见 **[PROJECT.md](PROJECT.md)**（中文，含配置、命令行、架构与故障排查）。
+
+主要修复：
+
+- **指针回程**：被控端能主动把指针交还，纯接收端不再「进得去出不来」。
+- **跨屏停顿**：连接在客户端激活时预建立，握手期间的输入被缓冲而非丢弃。
+- **macOS 权限**：固定证书签名，重建后辅助功能/输入监控授权不再失效。
+- **保活节奏**：修正了会导致每秒近百次 ping、进而拖垮接收端的循环。
+- **热键**：修复了 `Leave` 后热键被丢弃、以及合成按键被自己重新捕获的反馈环。
+- **显示器变更**：libei 后端会定期重建 barrier，换显示器后不再卡死。
+
+新增功能：
+
+- 服务控制：暂停/恢复、重启、定时重启、强制释放、切换设备、配置重载。
+- 连接状态：每个对端的系统、内核、架构、主机名、版本、commit、显示器、RTT、
+  收发事件数、空闲时间、证书指纹。
+- 日志：环形缓冲 + 实时推送到界面，级别可在运行时切换。
+- 前端：四个标签页（Status / Devices / Settings / Logs），热键可用按键录制。
+- 命令行：`status`、`logs`、`pause`、`resume`、`restart`、`force-release`、
+  `switch`、`set-log-level`、`refresh-peer-info` 等。
+
 ## Encryption
 
 Lan Mouse encrypts all network traffic using the DTLS implementation provided by [WebRTC.rs](https://github.com/webrtc-rs/webrtc).
