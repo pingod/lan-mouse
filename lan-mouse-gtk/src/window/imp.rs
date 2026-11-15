@@ -133,6 +133,11 @@ impl Window {
     }
 
     #[template_callback]
+    fn handle_refresh_peers_pressed(&self, _button: &Button) {
+        self.obj().refresh_peer_details();
+    }
+
+    #[template_callback]
     fn handle_force_release_pressed(&self, _button: &Button) {
         self.obj().request_force_release();
     }

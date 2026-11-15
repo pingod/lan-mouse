@@ -177,6 +177,13 @@ impl LanMouseConnection {
         ));
     }
 
+    /// Send a one-off request for the peer's machine details.
+    pub(crate) async fn request_peer_info(&self, handle: ClientHandle) {
+        if let Err(e) = self.send(ProtoEvent::PeerInfoRequest, handle).await {
+            log::debug!("peer info refresh for client {handle} failed: {e}");
+        }
+    }
+
     pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
         self.recv_rx
             .as_mut()
@@ -296,6 +303,10 @@ async fn connect_to_handle(
                 break;
             }
         }
+        // Ask once for the peer's report. No periodic refresh: the details
+        // describe an install, and a peer that reconnects sends them again. A
+        // user who wants them re-read can ask explicitly (see
+        // `FrontendRequest::RefreshPeerInfo`).
         let (buf, len) = ProtoEvent::PeerInfoRequest.into();
         if let Err(e) = conn.send(&buf[..len]).await {
             log::debug!("peer info request to {addr} failed: {e}");

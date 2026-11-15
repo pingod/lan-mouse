@@ -77,6 +77,8 @@ enum CaptureRequest {
     Destroy(CaptureHandle),
     /// start the connection to this client before the pointer reaches it
     Preconnect(CaptureHandle),
+    /// ask a client to re-send its machine details
+    RefreshPeerInfo(CaptureHandle),
     /// stop acting on input until [`CaptureRequest::Reenable`]
     Disable,
     /// reenable input capture
@@ -133,6 +135,13 @@ impl Capture {
         self.request_tx
             .send(CaptureRequest::Reenable)
             .expect("channel closed");
+    }
+
+    /// Ask `handle` to send its machine details again.
+    pub(crate) fn request_peer_info(&self, handle: CaptureHandle) {
+        let _ = self
+            .request_tx
+            .send(CaptureRequest::RefreshPeerInfo(handle));
     }
 
     /// Stop capturing until [`Self::reenable`].
@@ -277,6 +286,7 @@ impl CaptureTask {
                         CaptureRequest::Reenable => break,
                         CaptureRequest::Disable => { /* nothing to do yet */ }
                         CaptureRequest::Preconnect(_) => { /* no connection yet */ }
+                        CaptureRequest::RefreshPeerInfo(_) => { /* no connection yet */ }
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
                         CaptureRequest::Release => { /* nothing to do */ }
@@ -434,6 +444,9 @@ impl CaptureTask {
                     CaptureRequest::Release => self.release_capture(capture).await?,
                     CaptureRequest::Preconnect(h) => {
                         self.conn.preconnect(h).await;
+                    }
+                    CaptureRequest::RefreshPeerInfo(h) => {
+                        self.conn.request_peer_info(h).await;
                     }
                     CaptureRequest::Create(h, p, t) => {
                         self.add_capture(h, p, t);

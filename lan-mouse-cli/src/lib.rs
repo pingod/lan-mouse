@@ -98,6 +98,8 @@ enum CliSubcommand {
     },
     /// change the log level at runtime
     SetLogLevel { level: String },
+    /// ask a peer to send its machine details again
+    RefreshPeerInfo { id: ClientHandle },
 }
 
 pub async fn run(args: CliArgs) -> Result<(), CliError> {
@@ -210,6 +212,9 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 .await?
         }
         CliSubcommand::ForceRelease => tx.request(FrontendRequest::ForceRelease).await?,
+        CliSubcommand::RefreshPeerInfo { id } => {
+            tx.request(FrontendRequest::RefreshPeerInfo(id)).await?
+        }
         CliSubcommand::Switch => tx.request(FrontendRequest::SwitchDevice).await?,
         CliSubcommand::Logs { lines } => {
             tx.request(FrontendRequest::EnumerateLogs(lines)).await?;
@@ -281,6 +286,20 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                 if let Some(rtt) = state.rtt_ms {
                     println!("  round trip: {rtt} ms");
                 }
+                // What the peer reported about itself.
+                let detail = |label: &str, value: &str| {
+                    if !value.is_empty() {
+                        println!("  {label}: {value}");
+                    }
+                };
+                detail("os", &state.peer_os);
+                detail("os version", &state.peer_os_version);
+                detail("kernel", &state.peer_kernel);
+                detail("arch", &state.peer_arch);
+                detail("hostname", &state.peer_hostname);
+                detail("version", &state.peer_app_version);
+                detail("commit", &state.peer_commit_short);
+                detail("displays", &state.peer_displays);
                 if let Some(seen) = state.last_seen {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)

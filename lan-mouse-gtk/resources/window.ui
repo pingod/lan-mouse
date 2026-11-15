@@ -138,6 +138,18 @@
                           <object class="AdwPreferencesGroup">
                             <property name="title" translatable="yes">Inbound</property>
                             <property name="description" translatable="yes">Devices currently driving this machine.</property>
+                            <property name="header-suffix">
+                              <object class="GtkButton" id="refresh_peers_button">
+                                <signal name="clicked" handler="handle_refresh_peers_pressed" swapped="true"/>
+                                <property name="child">
+                                  <object class="AdwButtonContent">
+                                    <property name="icon-name">view-refresh-symbolic</property>
+                                    <property name="label" translatable="yes">Refresh</property>
+                                  </object>
+                                </property>
+                                <style><class name="flat"/></style>
+                              </object>
+                            </property>
                             <child>
                               <object class="GtkListBox" id="incoming_list">
                                 <property name="selection-mode">none</property>

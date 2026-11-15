@@ -461,6 +461,20 @@ impl Window {
         self.request(FrontendRequest::SetLogLevel(Some(level.to_owned())));
     }
 
+    /// Ask every connected peer to re-send its machine details.
+    pub(super) fn refresh_peer_details(&self) {
+        let store = self.imp().clients.borrow().clone();
+        if let Some(store) = store {
+            for i in 0..store.n_items() {
+                if let Some(obj) = store.item(i).and_downcast::<ClientObject>() {
+                    self.request(FrontendRequest::RefreshPeerInfo(obj.handle()));
+                }
+            }
+        }
+        // Reload the backlog too, so the view shows what arrived.
+        self.request(FrontendRequest::Enumerate());
+    }
+
     pub(super) fn request_force_release(&self) {
         self.request(FrontendRequest::ForceRelease);
     }

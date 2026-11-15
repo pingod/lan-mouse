@@ -414,6 +414,10 @@ impl Service {
                     log::debug!("log streaming disabled");
                 }
             },
+            FrontendRequest::RefreshPeerInfo(handle) => {
+                log::info!("refreshing machine details for client {handle}");
+                self.capture.request_peer_info(handle);
+            }
             FrontendRequest::EnumerateServiceState => {
                 self.notify_frontend(FrontendEvent::Paused(self.paused));
                 let secs = self.restart_interval.map(|d| d.as_secs());

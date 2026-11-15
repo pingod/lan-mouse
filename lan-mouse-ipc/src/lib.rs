@@ -341,6 +341,8 @@ pub enum FrontendRequest {
     EnumerateLogs(usize),
     /// stream new records as they are written; `None` stops the stream
     SubscribeLogs(Option<usize>),
+    /// re-ask a peer for its machine details
+    RefreshPeerInfo(ClientHandle),
 }
 
 /// One device currently driving (or allowed to drive) this machine.

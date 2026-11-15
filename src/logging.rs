@@ -122,6 +122,11 @@ pub fn init(default_level: LevelFilter) -> bool {
         return false;
     }
     log::set_max_level(default_level);
+    log::debug!(
+        "logging initialised: requested {default_level}, effective {}, max {}",
+        level_name(current_level()),
+        log::max_level()
+    );
     true
 }
 
