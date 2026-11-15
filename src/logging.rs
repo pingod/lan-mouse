@@ -68,6 +68,8 @@ pub fn set_level(name: &str) -> Result<LevelFilter, String> {
     };
     LEVEL.store(index_from_level(level), Ordering::Relaxed);
     log::set_max_level(level);
+    // Announce outside any lock: `log::info!` re-enters this logger, and doing
+    // that while holding the buffer lock would deadlock.
     log::info!("log level set to {level}");
     Ok(level)
 }

@@ -258,8 +258,13 @@ impl ListenTask {
                     EmulationRequest::Terminate => break,
                 },
                 _ = interval.tick() => {
-                    last_response.retain(|&addr,instant| {
-                        if instant.elapsed() > Duration::from_secs(1) {
+                    // The threshold must outlast the peer's keep-alive period,
+                    // otherwise a healthy link is torn down between two pings.
+                    // The connecting side sends one round every
+                    // `PING_ROUND` (2 s), so allow several rounds of slack.
+                    const PEER_TIMEOUT: Duration = Duration::from_secs(10);
+                    last_response.retain(|&addr, instant| {
+                        if instant.elapsed() > PEER_TIMEOUT {
                             log::warn!("releasing keys: {addr} not responding!");
                             self.emulation_proxy.remove(addr);
                             self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
