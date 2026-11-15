@@ -309,7 +309,17 @@ impl CaptureTask {
             tokio::select! {
                 event = capture.next() => match event {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
-                    None => return Ok(()),
+                    None => {
+                        // The backend stream ended while we may still be
+                        // capturing — the compositor took the seat away (lock
+                        // screen, session switch) or the backend died. Release
+                        // first so the peer is told to stop, otherwise the
+                        // pointer stays trapped on the other machine until
+                        // lan-mouse is restarted (issue #545).
+                        log::warn!("capture stream ended — releasing before restarting it");
+                        self.release_capture(capture).await?;
+                        return Ok(());
+                    }
                 },
                 (handle, event) = self.conn.recv() => {
                     if let Some(active) = self.active_client {
