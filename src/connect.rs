@@ -43,6 +43,13 @@ pub(crate) enum LanMouseConnectionError {
 
 const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Spacing between keep-alive rounds.
+///
+/// The round itself sends up to four pings 500 ms apart; this is the floor for
+/// how often a *new* round may start, so a fast reply cannot turn keep-alive
+/// into a flood.
+const PING_ROUND: Duration = Duration::from_secs(2);
+
 /// Reserved `Leave` serial marking a locally-detected disconnect.
 ///
 /// The serial is otherwise unused on the wire, so it cannot collide with a
@@ -375,6 +382,13 @@ async fn ping_pong(
                 break;
             }
         }
+
+        // Wait out the rest of the round before starting another one. Without
+        // this, an immediate pong ended the round instantly and the next four
+        // pings went out at once — measured at ~90 pings per second, which
+        // starved the receiving side.
+        let elapsed = sent_at.map(|t| t.elapsed()).unwrap_or_default();
+        tokio::time::sleep(PING_ROUND.saturating_sub(elapsed)).await;
 
         if !ping_response.borrow_mut().remove(&addr) {
             log::warn!("{addr} did not respond, closing connection");
