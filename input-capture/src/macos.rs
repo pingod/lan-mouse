@@ -8,6 +8,11 @@ use core_foundation::{
     runloop::{CFRunLoop, CFRunLoopSource, kCFRunLoopCommonModes},
     string::{CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8},
 };
+/// Must match `input-emulation`'s tag. Duplicated instead of shared because the
+/// capture and emulation crates are independent; the value is part of the
+/// on-wire behaviour between them.
+const INJECTED_EVENT_TAG: i64 = 0x6c616e6d; // "lanm"
+
 use core_graphics::{
     base::{CGError, kCGErrorSuccess},
     display::{CGDisplay, CGPoint},
@@ -531,6 +536,15 @@ fn create_event_tap<'a>(
                 .unwrap_or_else(|e| {
                     log::error!("Failed to send notification: {e}");
                 });
+            return CallbackResult::Keep;
+        }
+
+        // Skip events this process synthesized. Injected keystrokes are posted
+        // at the HID layer, so without this check the capture tap picks them up
+        // and forwards them straight back to the peer: a hotkey then looks like
+        // local typing and the feedback loop compounds.
+        if cg_ev.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == INJECTED_EVENT_TAG {
+            log::trace!("ignoring synthesized event");
             return CallbackResult::Keep;
         }
 

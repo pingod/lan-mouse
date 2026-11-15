@@ -10,8 +10,8 @@ use core_graphics::display::{
     CGDirectDisplayID, CGDisplayBounds, CGGetDisplaysWithRect, CGPoint, CGRect, CGSize,
 };
 use core_graphics::event::{
-    CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton, EventField,
-    ScrollEventUnit,
+    CGEvent, CGEventField, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton,
+    EventField, ScrollEventUnit,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use input_event::{
@@ -222,6 +222,12 @@ fn is_arrow_key(key: u16) -> bool {
     )
 }
 
+/// Marker written into `kCGEventSourceUserData` on every synthesized event.
+///
+/// `input-capture` skips events carrying it, so injected input is never fed
+/// back into the capture pipeline.
+pub const INJECTED_EVENT_TAG: i64 = 0x6c616e6d; // "lanm"
+
 fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods) {
     let event = match CGEvent::new_keyboard_event(event_source, key, state != 0) {
         Ok(e) => e,
@@ -239,6 +245,11 @@ fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods)
         flags |= CGEventFlags::CGEventFlagNumericPad | CGEventFlags::CGEventFlagSecondaryFn;
     }
     event.set_flags(flags);
+    // Tag the event so this process's own capture tap can tell it apart from
+    // hardware input. Without the tag the injected keystroke is captured again
+    // and forwarded to the peer, which is a feedback loop: the peer's hotkey
+    // looked like local typing here.
+    event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECTED_EVENT_TAG);
     event.post(CGEventTapLocation::HID);
     log::trace!("key event: {key} {state}");
 }

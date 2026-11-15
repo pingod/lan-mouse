@@ -328,9 +328,12 @@ struct EmulationTask {
     /// Without this, an `Input` that arrives after `Leave` silently recreates
     /// a handle and keeps injecting: the sender believes it released the
     /// pointer while the receiver keeps typing into this machine (issue #542,
-    /// "release not taking effect"). Events from a left peer are dropped until
-    /// it enters again.
-    left: std::collections::HashSet<SocketAddr>,
+    /// "release not taking effect").
+    ///
+    /// Only packets that race the Leave are dropped. A hotkey legitimately
+    /// arrives without a preceding Enter, so the latch expires: after
+    /// `LEAVE_GRACE` the peer is treated as starting a new session.
+    left: std::collections::HashMap<SocketAddr, Instant>,
     next_id: EmulationHandle,
 }
 
@@ -404,7 +407,7 @@ impl EmulationTask {
             tokio::select! {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     ProxyRequest::Input(event, addr) => {
-                        if !should_accept_input(&self.left, addr) {
+                        if !should_accept_input(&self.left, addr, Instant::now()) {
                             log::debug!("dropping input from {addr}: peer has left");
                             continue;
                         }
@@ -424,7 +427,7 @@ impl EmulationTask {
                         self.left.remove(&addr);
                     }
                     ProxyRequest::Remove(addr) => {
-                        self.left.insert(addr);
+                        self.left.insert(addr, Instant::now());
                         if let Some(handle) = self.handles.remove(&addr) {
                             emulation.destroy(handle).await;
                         }
@@ -483,14 +486,29 @@ impl<T> Drop for DropGuard<T> {
 ///
 /// A peer that sent `Leave` gave the pointer back; late events must not be
 /// injected until it enters again (issue #542).
-fn should_accept_input(left: &std::collections::HashSet<SocketAddr>, addr: SocketAddr) -> bool {
-    !left.contains(&addr)
+/// How long after a Leave an incoming packet is still considered a straggler.
+///
+/// Late packets race the Leave by milliseconds. A hotkey legitimately arrives
+/// with no preceding Enter, so the latch must not be permanent: after this
+/// window the peer is treated as starting a new session. Kept short so the
+/// #542 protection (a stuck peer must not keep typing here) still holds, but
+/// long enough to cover in-flight packets on a busy link.
+const LEAVE_GRACE: Duration = Duration::from_millis(250);
+
+fn should_accept_input(
+    left: &std::collections::HashMap<SocketAddr, Instant>,
+    addr: SocketAddr,
+    now: Instant,
+) -> bool {
+    match left.get(&addr) {
+        None => true,
+        Some(left_at) => now.duration_since(*left_at) >= LEAVE_GRACE,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([192, 168, 1, 5], port))
@@ -498,30 +516,35 @@ mod tests {
 
     #[test]
     fn input_accepted_before_leave() {
-        let left = HashSet::new();
-        assert!(should_accept_input(&left, addr(1)));
+        let left = HashMap::new();
+        assert!(should_accept_input(&left, addr(1), Instant::now()));
     }
 
     #[test]
-    fn input_dropped_after_leave() {
-        let mut left = HashSet::new();
-        left.insert(addr(1));
-        assert!(!should_accept_input(&left, addr(1)));
+    fn straggler_dropped_right_after_leave() {
+        let mut left = HashMap::new();
+        let now = Instant::now();
+        left.insert(addr(1), now);
+        // A packet racing the Leave is still dropped (issue #542).
+        assert!(!should_accept_input(&left, addr(1), now));
+        assert!(!should_accept_input(&left, addr(1), now + LEAVE_GRACE / 2));
+    }
+
+    #[test]
+    fn hotkey_accepted_after_grace() {
+        let mut left = HashMap::new();
+        let now = Instant::now();
+        left.insert(addr(1), now);
+        // A hotkey arrives with no preceding Enter; after the grace period it
+        // must reach the emulation layer instead of being dropped forever.
+        assert!(should_accept_input(&left, addr(1), now + LEAVE_GRACE));
     }
 
     #[test]
     fn leave_is_per_peer() {
-        let mut left = HashSet::new();
-        left.insert(addr(1));
+        let mut left = HashMap::new();
+        left.insert(addr(1), Instant::now());
         // a different peer is unaffected
-        assert!(should_accept_input(&left, addr(2)));
-    }
-
-    #[test]
-    fn input_accepted_again_after_enter() {
-        let mut left = HashSet::new();
-        left.insert(addr(1));
-        left.remove(&addr(1));
-        assert!(should_accept_input(&left, addr(1)));
+        assert!(should_accept_input(&left, addr(2), Instant::now()));
     }
 }
