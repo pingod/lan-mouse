@@ -18,7 +18,7 @@ env:
 
 jobs:
   linux-release-build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v6
     - name: install dependencies
@@ -45,7 +45,7 @@ jobs:
           target/release/bundle/appimage/lan-mouse_*.AppImage
 
   linux-arm64-release-build:
-    runs-on: ubuntu-22.04-arm
+    runs-on: ubuntu-24.04-arm
     steps:
     - uses: actions/checkout@v6
     - name: install dependencies
