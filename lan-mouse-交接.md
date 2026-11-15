@@ -63,6 +63,28 @@ to = ["KeyZ"]
 
 https://github.com/pingod/lan-mouse
 
+## 重要：macOS 更新流程（别再手工 ditto）
+
+CI 出的包是 **ad-hoc 签名**，而 ad-hoc 下 macOS 把 TCC 授权绑在二进制的
+cdhash 上，换二进制就掉权限（表现为 `accessibility permission is required`
+→ `using emulation backend: dummy`，整个 Mac 侧注入全部失效，不只是媒体键）。
+
+正确做法：**每次更新都走 `scripts/mac-deploy.sh`**，它安装后会用本地自签证书
+`Lan Mouse Local Signing`（SHA-1 `8A3127DAB5EC34226D2EF12788DEA98DFE6338E4`，
+keychain `~/Library/Keychains/signing.keychain-db`）重签：
+
+```bash
+~/githome/lan-mouse/scripts/mac-deploy.sh ~/Downloads/lan-mouse-macos-arm64.zip
+```
+
+重签后 designated requirement 变成
+`identifier "de.feschber.LanMouse" and certificate leaf = H"8a3127…"`，
+锚在证书上而不是二进制，所以授权不会再掉（实测：重装 + 重签 + 重启后
+`Accessibility state (initial = true)`，无需再勾）。
+
+只重签已有 app：`scripts/macos-sign.sh "/Applications/Lan Mouse.app"`。
+签名的 keychain 口令是 `lmsign`，证书丢了就得重做一次身份（脚本头部有步骤）。
+
 ## 重要：macOS 授权
 
 替换 Mac 二进制后**必须重新授权**（辅助功能 + 输入监控）：
