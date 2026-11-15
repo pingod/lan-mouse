@@ -84,6 +84,8 @@ pub struct Service {
     /// the client the pointer is currently handed to, tracked from the
     /// capture event stream rather than inferred from connection state
     active_capture: Option<ClientHandle>,
+    /// reports that arrived before their connection was registered
+    pending_peer_info: HashMap<SocketAddr, lan_mouse_ipc::IncomingInfo>,
     /// when a frontend is streaming logs: how often to poll and where we are
     log_stream: Option<(tokio::time::Interval, usize)>,
 }
@@ -168,6 +170,7 @@ impl Service {
             should_exit: false,
             pending_pause: None,
             active_capture: None,
+            pending_peer_info: Default::default(),
             log_stream: None,
         };
         Ok(service)
@@ -604,16 +607,21 @@ impl Service {
         match event {
             EmulationEvent::PeerInfo { addr, info } => {
                 log::debug!("inbound {}: {}", addr, crate::sysinfo::describe(&info));
-                // Record it on the matching inbound connection so the UI can
-                // show who is driving this machine.
                 let flat = crate::sysinfo::flatten(&info);
-                if let Some(incoming) = self
+                // The report usually arrives before `Entered` has registered the
+                // connection, so hold it until there is a row to attach it to.
+                match self
                     .incoming_conn_info
                     .values_mut()
                     .find(|i| i.addr == addr)
                 {
-                    incoming.info = Some(flat);
-                    self.publish_incoming();
+                    Some(incoming) => {
+                        incoming.info = Some(flat);
+                        self.publish_incoming();
+                    }
+                    None => {
+                        self.pending_peer_info.insert(addr, flat);
+                    }
                 }
             }
             EmulationEvent::ConnectionAttempt { fingerprint } => {
@@ -812,7 +820,8 @@ impl Service {
                 pos,
                 last_seen: Instant::now(),
                 received: 0,
-                info: None,
+                // A report may have arrived before this connection was known.
+                info: self.pending_peer_info.remove(&addr),
             },
         );
     }

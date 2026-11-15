@@ -199,7 +199,7 @@ impl ClientRow {
     /// per connection, so this runs a handful of times, and rebuilding avoids
     /// stale rows when a peer reconnects with different details.
     pub fn set_peer_details(&self, state: &lan_mouse_ipc::ClientState) {
-        // Drop previously added detail rows, keeping the template rows.
+        // Drop previously added rows, keeping the template rows.
         let mut child = self.first_child();
         while let Some(widget) = child {
             let next = widget.next_sibling();
@@ -212,6 +212,16 @@ impl ClientRow {
             child = next;
         }
 
+        // Grouped: a flat list of every field made the expander taller than the
+        // window and buried the settings below it.
+        let group = |title: &str| {
+            let caption = adw::ActionRow::builder()
+                .title(title)
+                .css_classes(["heading", "dim-label", "peer-detail"])
+                .activatable(false)
+                .build();
+            self.add_row(&caption);
+        };
         let add = |label: &str, value: &str| {
             if value.is_empty() {
                 return;
@@ -223,14 +233,18 @@ impl ClientRow {
             row.add_css_class("peer-detail");
             self.add_row(&row);
         };
+
+        group("System");
         add("Operating system", &state.peer_os);
         add("OS version", &state.peer_os_version);
         add("Kernel", &state.peer_kernel);
         add("Architecture", &state.peer_arch);
+        add("Displays", &state.peer_displays);
+
+        group("Build");
         add("Hostname", &state.peer_hostname);
         add("lan-mouse version", &state.peer_app_version);
         add("Build commit", &state.peer_commit_short);
-        add("Displays", &state.peer_displays);
     }
 
     pub fn set_dns_state(&self, resolved: bool) {

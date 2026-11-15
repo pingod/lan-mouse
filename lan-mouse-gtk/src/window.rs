@@ -796,30 +796,26 @@ impl Window {
             ))
             .build();
 
-        let detail = |label: &str, value: &str| {
-            if value.is_empty() {
-                return;
-            }
-            row.add_row(
-                &adw::ActionRow::builder()
-                    .title(label)
-                    .subtitle(value)
-                    .build(),
-            );
-        };
-        detail("Operating system", &info.os);
-        detail("OS version", &info.os_version);
-        detail("Kernel", &info.kernel);
-        detail("Architecture", &info.arch);
-        detail("Hostname", &info.hostname);
-        detail("lan-mouse version", &info.app_version);
-        detail("Build commit", &info.commit);
-        detail("Displays", &info.displays);
-        detail("Address", &info.addr.to_string());
-        detail("Entry side", &info.pos.to_string());
-        detail("Events received", &info.received.to_string());
-        detail("Idle", &format!("{}s", info.idle_secs));
-        detail("Certificate", &info.fingerprint);
+        // Grouped with caption rows: thirteen flat entries pushed everything
+        // else off the page, and a nested expander is not allowed here.
+        add_group(&row, "System");
+        add_detail(&row, "Operating system", &info.os);
+        add_detail(&row, "OS version", &info.os_version);
+        add_detail(&row, "Kernel", &info.kernel);
+        add_detail(&row, "Architecture", &info.arch);
+        add_detail(&row, "Displays", &info.displays);
+
+        add_group(&row, "Network");
+        add_detail(&row, "Address", &info.addr.to_string());
+        add_detail(&row, "Entry side", &info.pos.to_string());
+        add_detail(&row, "Events received", &info.received.to_string());
+        add_detail(&row, "Idle", &format!("{}s", info.idle_secs));
+        add_detail(&row, "Certificate", &info.fingerprint);
+
+        add_group(&row, "Build");
+        add_detail(&row, "Hostname", &info.hostname);
+        add_detail(&row, "lan-mouse version", &info.app_version);
+        add_detail(&row, "Build commit", &info.commit);
         row
     }
 
@@ -1103,6 +1099,29 @@ fn single_char_name(keyval: gtk::gdk::Key) -> Option<&'static str> {
     const NAMES: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let idx = NAMES.chars().position(|n| n == upper)?;
     Some(&NAMES[idx..idx + 1])
+}
+
+/// A caption row separating groups inside an expander.
+fn add_group(row: &adw::ExpanderRow, title: &str) {
+    let caption = adw::ActionRow::builder()
+        .title(title)
+        .css_classes(["heading", "dim-label"])
+        .activatable(false)
+        .build();
+    row.add_row(&caption);
+}
+
+/// A labelled detail row, skipped when the peer did not report the field.
+fn add_detail(row: &adw::ExpanderRow, label: &str, value: &str) {
+    if value.is_empty() {
+        return;
+    }
+    row.add_row(
+        &adw::ActionRow::builder()
+            .title(label)
+            .subtitle(value)
+            .build(),
+    );
 }
 
 #[cfg(test)]
