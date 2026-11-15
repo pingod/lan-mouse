@@ -100,7 +100,7 @@ impl Window {
                         "request-delete",
                         false,
                         closure_local!(
-                            #[strong]
+                            #[weak]
                             window,
                             move |row: KeyRow| {
                                 if let Some(key_obj) = window.authorized_by_idx(row.index() as u32)
@@ -136,7 +136,7 @@ impl Window {
                         "request-hostname-change",
                         false,
                         closure_local!(
-                            #[strong]
+                            #[weak]
                             window,
                             move |row: ClientRow, hostname: String| {
                                 log::debug!("request-hostname-change");
@@ -156,7 +156,7 @@ impl Window {
                         "request-port-change",
                         false,
                         closure_local!(
-                            #[strong]
+                            #[weak]
                             window,
                             move |row: ClientRow, port: u32| {
                                 if let Some(client) = window.client_by_idx(row.index() as u32) {
@@ -172,7 +172,7 @@ impl Window {
                         "request-activate",
                         false,
                         closure_local!(
-                            #[strong]
+                            #[weak]
                             window,
                             move |row: ClientRow, active: bool| {
                                 if let Some(client) = window.client_by_idx(row.index() as u32) {
@@ -192,7 +192,7 @@ impl Window {
                         "request-delete",
                         false,
                         closure_local!(
-                            #[strong]
+                            #[weak]
                             window,
                             move |row: ClientRow| {
                                 if let Some(client) = window.client_by_idx(row.index() as u32) {
@@ -205,7 +205,7 @@ impl Window {
                         "request-dns",
                         false,
                         closure_local!(
-                            #[strong]
+                            #[weak]
                             window,
                             move |row: ClientRow| {
                                 if let Some(client) = window.client_by_idx(row.index() as u32) {
@@ -220,7 +220,7 @@ impl Window {
                         "request-position-change",
                         false,
                         closure_local!(
-                            #[strong]
+                            #[weak]
                             window,
                             move |row: ClientRow, pos_idx: u32| {
                                 if let Some(client) = window.client_by_idx(row.index() as u32) {
@@ -299,6 +299,26 @@ impl Window {
         &self,
         clients: Vec<(ClientHandle, ClientConfig, ClientState)>,
     ) {
+        /* Drop rows that are not part of this snapshot: `Enumerate` is the
+         * authoritative client list, and only upserting left rows of deleted
+         * clients behind (they could never be selected again and re-added
+         * the config on the next edit).
+         */
+        let handles = clients
+            .iter()
+            .map(|(handle, _, _)| *handle)
+            .collect::<Vec<_>>();
+        let stale = self
+            .clients()
+            .iter::<ClientObject>()
+            .filter_map(|client| client.ok().map(|client| client.handle()))
+            .filter(|handle| !handles.contains(handle))
+            .collect::<Vec<_>>();
+        for handle in stale {
+            log::debug!("removing client {handle}: no longer known to the daemon");
+            self.delete_client(handle);
+        }
+
         for (handle, client, state) in clients {
             if self.client_idx(handle).is_some() {
                 self.update_client_config(handle, client);
@@ -678,14 +698,24 @@ impl Window {
     }
 
     fn request_port_change(&self) {
-        let port = self
-            .imp()
-            .port_entry
-            .get()
-            .text()
-            .as_str()
-            .parse::<u16>()
-            .unwrap_or(DEFAULT_PORT);
+        let text = self.imp().port_entry.get().text();
+        let text = text.trim();
+        /* an empty entry means "use the default port", anything else has to
+         * be a valid port number. Silently falling back to the default port
+         * (as `unwrap_or(DEFAULT_PORT)` did) changed the port of a running
+         * session on a typo.
+         */
+        let port = if text.is_empty() {
+            DEFAULT_PORT
+        } else {
+            match text.parse::<u16>() {
+                Ok(port) => port,
+                Err(_) => {
+                    self.show_toast(&format!("invalid port: {text}"));
+                    return;
+                }
+            }
+        };
         self.request(FrontendRequest::ChangePort(port));
     }
 
@@ -708,7 +738,7 @@ impl Window {
             "confirm-clicked",
             false,
             closure_local!(
-                #[strong(rename_to = parent)]
+                #[weak(rename_to = parent)]
                 self,
                 move |w: FingerprintWindow, desc: String, fp: String| {
                     parent.request_fingerprint_add(desc, fp);
@@ -729,7 +759,10 @@ impl Window {
 
     fn request(&self, request: FrontendRequest) {
         let mut requester = self.imp().frontend_request_writer.borrow_mut();
-        let requester = requester.as_mut().unwrap();
+        let Some(requester) = requester.as_mut() else {
+            log::error!("frontend connection is not available");
+            return;
+        };
         if let Err(e) = requester.request(request) {
             log::error!("error sending message: {e}");
         };
@@ -1038,6 +1071,11 @@ impl Window {
         let authorized = self.authorized();
         // clear list
         authorized.remove_all();
+        /* Hashmap iteration order is random, so the list used to reorder
+         * itself on every refresh. Sort it to keep the rows stable.
+         */
+        let mut fingerprints = fingerprints.into_iter().collect::<Vec<_>>();
+        fingerprints.sort();
         // insert fingerprints
         for (fingerprint, description) in fingerprints {
             let key_obj = KeyObject::new(description, fingerprint);
@@ -1060,7 +1098,7 @@ impl Window {
             "confirm-clicked",
             false,
             closure_local!(
-                #[strong(rename_to = parent)]
+                #[weak(rename_to = parent)]
                 self,
                 move |w: AuthorizationWindow, fp: String| {
                     w.close();

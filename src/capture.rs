@@ -134,9 +134,7 @@ impl Capture {
     }
 
     pub(crate) fn reenable(&self) {
-        self.request_tx
-            .send(CaptureRequest::Reenable)
-            .expect("channel closed");
+        send_request(&self.request_tx, CaptureRequest::Reenable);
     }
 
     /// Ask `handle` to send its machine details again.
@@ -169,25 +167,23 @@ impl Capture {
         capture_type: CaptureType,
     ) {
         let pos = to_capture_pos(pos);
-        self.request_tx
-            .send(CaptureRequest::Create(handle, pos, capture_type))
-            .expect("channel closed");
+        send_request(
+            &self.request_tx,
+            CaptureRequest::Create(handle, pos, capture_type),
+        );
     }
 
     pub(crate) fn destroy(&self, handle: CaptureHandle) {
-        self.request_tx
-            .send(CaptureRequest::Destroy(handle))
-            .expect("channel closed");
+        send_request(&self.request_tx, CaptureRequest::Destroy(handle));
     }
 
     pub(crate) fn release(&self) {
-        self.request_tx
-            .send(CaptureRequest::Release)
-            .expect("channel closed");
+        send_request(&self.request_tx, CaptureRequest::Release);
     }
 
-    pub(crate) async fn event(&mut self) -> ICaptureEvent {
-        self.event_rx.recv().await.expect("channel closed")
+    /// Wait for the next event; `None` means the capture task has exited.
+    pub(crate) async fn event(&mut self) -> Option<ICaptureEvent> {
+        self.event_rx.recv().await
     }
 
     pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
@@ -261,20 +257,18 @@ impl CaptureTask {
             .any(|&(_, p, t)| p == pos && t == CaptureType::Default)
     }
 
-    fn get_pos(&self, handle: CaptureHandle) -> Position {
+    fn get_pos(&self, handle: CaptureHandle) -> Option<Position> {
         self.captures
             .iter()
             .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .1
+            .map(|&(_, p, _)| p)
     }
 
-    fn get_type(&self, handle: CaptureHandle) -> CaptureType {
+    fn get_type(&self, handle: CaptureHandle) -> Option<CaptureType> {
         self.captures
             .iter()
             .find(|(h, ..)| *h == handle)
-            .expect("no such capture")
-            .2
+            .map(|&(_, _, t)| t)
     }
 
     async fn run(mut self) {
@@ -284,18 +278,24 @@ impl CaptureTask {
             }
             loop {
                 tokio::select! {
-                    r = self.request_rx.recv() => match r.expect("channel closed") {
-                        CaptureRequest::Reenable => break,
-                        CaptureRequest::Disable => { /* nothing to do yet */ }
-                        CaptureRequest::Preconnect(_) => { /* no connection yet */ }
-                        CaptureRequest::RefreshPeerInfo(_) => { /* no connection yet */ }
-                        CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
-                        CaptureRequest::Destroy(h) => self.remove_capture(h),
-                        CaptureRequest::Release => { /* nothing to do */ }
-                        CaptureRequest::SetReleaseBind(bind) => {
-                            self.release_bind.borrow_mut().clone_from(&bind);
+                    r = self.request_rx.recv() => {
+                        let Some(r) = r else {
+                            log::debug!("capture request channel closed");
+                            return;
+                        };
+                        match r {
+                            CaptureRequest::Reenable => break,
+                            CaptureRequest::Disable => { /* nothing to do yet */ }
+                            CaptureRequest::Preconnect(_) => { /* no connection yet */ }
+                            CaptureRequest::RefreshPeerInfo(_) => { /* no connection yet */ }
+                            CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
+                            CaptureRequest::Destroy(h) => self.remove_capture(h),
+                            CaptureRequest::Release => { /* nothing to do */ }
+                            CaptureRequest::SetReleaseBind(bind) => {
+                                self.release_bind.borrow_mut().clone_from(&bind);
+                            }
+                            CaptureRequest::SetRemapRules(rules) => self.remap.set_rules(rules),
                         }
-                        CaptureRequest::SetRemapRules(rules) => self.remap.set_rules(rules),
                     },
                     _ = self.cancellation_token.cancelled() => return,
                 }
@@ -374,20 +374,27 @@ impl CaptureTask {
                     match event {
                         // connection acknowlegded => set state to Sending
                         ProtoEvent::Ack(_) => {
-                            log::info!("client {handle} acknowledged the connection!");
-                            self.state = State::Sending;
-                            self.entered_at.get_or_insert_with(Instant::now);
-                            // Deliver the input that arrived while the
-                            // handshake was in flight.
-                            if !self.pending_input.is_empty() {
-                                let pending = std::mem::take(&mut self.pending_input);
-                                log::debug!("flushing {} buffered input event(s)", pending.len());
-                                for event in pending {
-                                    if let Err(e) = self.conn.send(event, handle).await {
-                                        log::warn!("failed to flush buffered input: {e}");
-                                        break;
+                            // only the active capture may acknowledge; a late
+                            // Ack from a peer we already left must not unlock
+                            // the state machine for the next capture
+                            if self.active_client == Some(handle) {
+                                log::info!("client {handle} acknowledged the connection!");
+                                self.state = State::Sending;
+                                self.entered_at.get_or_insert_with(Instant::now);
+                                // Deliver the input that arrived while the
+                                // handshake was in flight.
+                                if !self.pending_input.is_empty() {
+                                    let pending = std::mem::take(&mut self.pending_input);
+                                    log::debug!("flushing {} buffered input event(s)", pending.len());
+                                    for event in pending {
+                                        if let Err(e) = self.conn.send(event, handle).await {
+                                            log::warn!("failed to flush buffered input: {e}");
+                                            break;
+                                        }
                                     }
                                 }
+                            } else {
+                                log::debug!("ignoring Ack from inactive client {handle}");
                             }
                         }
                         // The connection dropped locally (peer stopped, network
@@ -435,33 +442,34 @@ impl CaptureTask {
                         },
                         // Machine details are not input; surface them so the
                         // service can refresh the frontend.
-                        ProtoEvent::PeerInfo(_) | ProtoEvent::PeerInfoChunk { .. } => {
-                            self.event_tx
-                                .send(ICaptureEvent::PeerInfo(handle))
-                                .expect("channel closed");
+                        ProtoEvent::PeerInfo(_) | ProtoEvent::PeerInfoChunk { .. }
+                            if self.event_tx.send(ICaptureEvent::PeerInfo(handle)).is_err() =>
+                        {
+                            log::debug!("capture event channel is closed");
                         }
+                        ProtoEvent::PeerInfo(_) | ProtoEvent::PeerInfoChunk { .. } => {}
                         _ => {}
                     }
                 },
-                e = self.request_rx.recv() => match e.expect("channel closed") {
-                    CaptureRequest::Reenable => { /* already active */ },
-                    CaptureRequest::Disable => {
+                e = self.request_rx.recv() => match e {
+                    Some(CaptureRequest::Reenable) => { /* already active */ },
+                    Some(CaptureRequest::Disable) => {
                         log::info!("capture disabled");
                         self.release_capture(capture).await?;
                         capture.release().await?;
                     }
-                    CaptureRequest::Release => self.release_capture(capture).await?,
-                    CaptureRequest::Preconnect(h) => {
+                    Some(CaptureRequest::Release) => self.release_capture(capture).await?,
+                    Some(CaptureRequest::Preconnect(h)) => {
                         self.conn.preconnect(h).await;
                     }
-                    CaptureRequest::RefreshPeerInfo(h) => {
+                    Some(CaptureRequest::RefreshPeerInfo(h)) => {
                         self.conn.request_peer_info(h).await;
                     }
-                    CaptureRequest::Create(h, p, t) => {
+                    Some(CaptureRequest::Create(h, p, t)) => {
                         self.add_capture(h, p, t);
                         capture.create(h, p).await?;
                     }
-                    CaptureRequest::Destroy(h) => {
+                    Some(CaptureRequest::Destroy(h)) => {
                         // If the capture we're tearing down is the
                         // currently-active one, treat this as a
                         // release for hook purposes. The release_capture
@@ -475,10 +483,11 @@ impl CaptureTask {
                         self.remove_capture(h);
                         capture.destroy(h).await?;
                     }
-                    CaptureRequest::SetReleaseBind(bind) => {
+                    Some(CaptureRequest::SetReleaseBind(bind)) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
-                    CaptureRequest::SetRemapRules(rules) => self.remap.set_rules(rules),
+                    Some(CaptureRequest::SetRemapRules(rules)) => self.remap.set_rules(rules),
+                    None => break,
                 },
                 _ = self.cancellation_token.cancelled() => break,
             }
@@ -507,10 +516,27 @@ impl CaptureTask {
             return self.release_capture(capture).await;
         }
 
+        // The capture stream may still hold events for a handle that was
+        // destroyed in the meantime (e.g. a client deactivated while its
+        // events were queued). Drop those instead of panicking the whole
+        // service process.
+        let (Some(capture_type), Some(pos)) = (self.get_type(handle), self.get_pos(handle)) else {
+            log::debug!("dropping event for unknown capture handle {handle}");
+            return Ok(());
+        };
+
         if event == CaptureEvent::Begin {
-            self.event_tx
+            /* The receiver only goes away while the service is shutting down,
+             * so there is nothing left to notify.
+             */
+            if self
+                .event_tx
                 .send(ICaptureEvent::CaptureBegin(handle))
-                .expect("channel closed");
+                .is_err()
+            {
+                log::debug!("capture event channel is closed");
+                return Ok(());
+            }
         }
 
         // Enter-only capture (used for incoming connections).
@@ -521,8 +547,8 @@ impl CaptureTask {
         // what produced the endless "no active client at this position" loop:
         // the peer then saw a Leave storm and the two sides fought over the
         // pointer. Debounce it so one release per crossing is enough.
-        if self.get_type(handle) == CaptureType::EnterOnly {
-            if !self.is_default_capture_at(self.get_pos(handle)) {
+        if capture_type == CaptureType::EnterOnly {
+            if !self.is_default_capture_at(pos) {
                 // Only needs to outlive the in-flight `Begin` storm from a
                 // single crossing. 750 ms made a deliberate second crossing
                 // feel unresponsive; the storm itself settles far sooner.
@@ -545,13 +571,25 @@ impl CaptureTask {
                     // synthetic handle that has no entry in the client manager,
                     // so `conn.send` cannot resolve it. The service knows the
                     // socket address for this handle and replies on it.
-                    self.event_tx
+                    if self
+                        .event_tx
                         .send(ICaptureEvent::ReturnRequested(handle))
-                        .expect("channel closed");
+                        .is_err()
+                    {
+                        log::debug!("capture event channel is closed");
+                    }
                 } else {
                     log::trace!("suppressing repeated enter-only release");
                 }
             }
+            return Ok(());
+        }
+
+        // Without an active client there is nobody to send input to: events
+        // that were already queued upstream when we released (or that arrive
+        // before the first `Begin`) must not recreate a session for a peer we
+        // just left.
+        if self.active_client.is_none() && event != CaptureEvent::Begin {
             return Ok(());
         }
 
@@ -560,12 +598,17 @@ impl CaptureTask {
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
             self.active.set(true);
-            self.event_tx
+            if self
+                .event_tx
                 .send(ICaptureEvent::ClientEntered(handle))
-                .expect("channel closed");
+                .is_err()
+            {
+                log::debug!("capture event channel is closed");
+                return Ok(());
+            }
         }
 
-        let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
+        let opposite_pos = to_proto_pos(pos.opposite());
 
         let events: Vec<ProtoEvent> = match event {
             // already handled above (released the capture)
@@ -614,6 +657,9 @@ impl CaptureTask {
     }
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        // The next session has to wait for its own `Ack` again, so reset the
+        // state machine even when there is no active client left.
+        self.state = State::WaitingForAck;
         // If we have an active client, notify them we're leaving
         self.active.set(false);
         if let Some(handle) = self.active_client.take() {
@@ -621,9 +667,14 @@ impl CaptureTask {
             // the per-client leave_hook. Sent before the network
             // teardown below so we never race against the peer
             // disappearing.
-            self.event_tx
+            if self
+                .event_tx
                 .send(ICaptureEvent::ClientLeft(handle))
-                .expect("channel closed");
+                .is_err()
+            {
+                // the service is shutting down, keep releasing anyway
+                log::debug!("capture event channel is closed");
+            }
             // Synthesize key-up events for every key still held in the
             // capture's pressed_keys set BEFORE sending Leave. Without
             // this, pressing the release-bind chord (typically all four
@@ -673,6 +724,17 @@ impl CaptureTask {
     }
 }
 
+/// Send a request to the capture task.
+///
+/// The task is gone during shutdown and this binary is built with
+/// `panic = "abort"`, so a failed send must not abort the process: dropping the
+/// request is the only sensible reaction when nobody is listening anymore.
+fn send_request(tx: &Sender<CaptureRequest>, request: CaptureRequest) {
+    if tx.send(request).is_err() {
+        log::debug!("capture task is gone, dropping the request");
+    }
+}
+
 thread_local! {
     static PREV_LOG: Cell<Option<Instant>> = const { Cell::new(None) };
 }
@@ -709,7 +771,8 @@ struct DropGuard<T> {
 
 impl<T> DropGuard<T> {
     fn new(tx: Sender<T>, on_new: T, on_drop: T) -> Self {
-        tx.send(on_new).expect("channel closed");
+        // the receiver may already be gone during shutdown
+        let _ = tx.send(on_new);
         let on_drop = Some(on_drop);
         Self { tx, on_drop }
     }
@@ -717,8 +780,10 @@ impl<T> DropGuard<T> {
 
 impl<T> Drop for DropGuard<T> {
     fn drop(&mut self) {
-        self.tx
-            .send(self.on_drop.take().expect("item"))
-            .expect("channel closed");
+        // never panic in `Drop`: during shutdown the receiver is gone and a
+        // panic here would abort the process
+        if let Some(on_drop) = self.on_drop.take() {
+            let _ = self.tx.send(on_drop);
+        }
     }
 }

@@ -50,16 +50,37 @@ use std::{
 };
 use tokio::sync::{
     Mutex,
-    mpsc::{self, Receiver, Sender},
+    mpsc::{self, Sender, UnboundedReceiver, UnboundedSender},
     oneshot,
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Bounds {
     xmin: f64,
     xmax: f64,
     ymin: f64,
     ymax: f64,
+}
+
+impl Default for Bounds {
+    fn default() -> Self {
+        // Start out inverted so that the first display defines the bounds:
+        // seeding with 0.0 would clamp the layout to the origin whenever no
+        // display touches (0, 0).
+        Self {
+            xmin: f64::INFINITY,
+            xmax: f64::NEG_INFINITY,
+            ymin: f64::INFINITY,
+            ymax: f64::NEG_INFINITY,
+        }
+    }
+}
+
+impl Bounds {
+    /// whether at least one display contributed to these bounds
+    fn is_valid(&self) -> bool {
+        self.xmin <= self.xmax && self.ymin <= self.ymax
+    }
 }
 
 #[derive(Debug)]
@@ -112,6 +133,11 @@ impl InputCaptureState {
     const BARRIER_RELEASE_MARGIN: f64 = 24.0;
 
     fn crossed(&mut self, event: &CGEvent) -> Option<Position> {
+        if !self.bounds.is_valid() {
+            // no display geometry known yet (no active display)
+            return None;
+        }
+
         let location = event.location();
         let relative_x = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_X);
         let relative_y = event.get_double_value_field(EventField::MOUSE_EVENT_DELTA_Y);
@@ -151,13 +177,26 @@ impl InputCaptureState {
     fn update_bounds(&mut self) -> Result<(), MacosCaptureCreationError> {
         let active_ids =
             CGDisplay::active_displays().map_err(MacosCaptureCreationError::ActiveDisplays)?;
-        active_ids.iter().for_each(|d| {
-            let bounds = CGDisplay::new(*d).bounds();
-            self.bounds.xmin = self.bounds.xmin.min(bounds.origin.x);
-            self.bounds.xmax = self.bounds.xmax.max(bounds.origin.x + bounds.size.width);
-            self.bounds.ymin = self.bounds.ymin.min(bounds.origin.y);
-            self.bounds.ymax = self.bounds.ymax.max(bounds.origin.y + bounds.size.height);
-        });
+
+        // recompute from scratch, so that disconnected displays do not keep
+        // stretching the bounds
+        let mut bounds = Bounds::default();
+        for d in active_ids {
+            let display_bounds = CGDisplay::new(d).bounds();
+            bounds.xmin = bounds.xmin.min(display_bounds.origin.x);
+            bounds.xmax = bounds
+                .xmax
+                .max(display_bounds.origin.x + display_bounds.size.width);
+            bounds.ymin = bounds.ymin.min(display_bounds.origin.y);
+            bounds.ymax = bounds
+                .ymax
+                .max(display_bounds.origin.y + display_bounds.size.height);
+        }
+
+        if !bounds.is_valid() {
+            log::warn!("no active display found, input capture is disabled");
+        }
+        self.bounds = bounds;
 
         log::debug!("Updated displays bounds: {0:?}", self.bounds);
         Ok(())
@@ -180,7 +219,12 @@ impl InputCaptureState {
 
     /// resets the cursor to the position, where the capture started
     fn reset_cursor(&mut self) -> Result<(), CaptureError> {
-        let pos = self.enter_position.expect("capture active");
+        // this runs inside the event tap callback: a missing position must not
+        // panic across the FFI boundary
+        let Some(pos) = self.enter_position else {
+            log::debug!("no capture entry position, not resetting the cursor");
+            return Ok(());
+        };
         log::trace!("Resetting cursor position to: {}, {}", pos.x, pos.y);
         CGDisplay::warp_mouse_cursor_position(pos).map_err(CaptureError::WarpCursor)
     }
@@ -316,7 +360,14 @@ fn get_events(
             }
 
             // check if pressed or released
-            let state = if depressed > *modifier_state { 1 } else { 0 };
+            // `>` on the raw bitmask is wrong: pressing a second modifier
+            // while a "smaller" one is held (e.g. Shift = 1, Ctrl = 4) would
+            // report a key release. Only a newly set bit is a key down.
+            let state = if depressed.bits() & !modifier_state.bits() != 0 {
+                1
+            } else {
+                0
+            };
             *modifier_state = depressed;
 
             if let Ok(key) = map_key(ev) {
@@ -414,9 +465,12 @@ fn get_events(
             let sign: i64 = if natural { 1 } else { -1 };
 
             if ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS) != 0 {
-                let v = -sign
+                // point deltas use the same sign convention as line deltas:
+                // negating only this branch inverted trackpad scrolling
+                // relative to wheel scrolling
+                let v = sign
                     * ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
-                let h = -sign
+                let h = sign
                     * ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_2);
                 if v != 0 {
                     result.push(CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
@@ -466,7 +520,7 @@ fn get_events(
 fn create_event_tap<'a>(
     client_state: Arc<Mutex<InputCaptureState>>,
     notify_tx: Sender<ProducerEvent>,
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_tx: UnboundedSender<Result<(Position, CaptureEvent), CaptureError>>,
 ) -> Result<CGEventTap<'a>, MacosCaptureCreationError> {
     // Shared slot for the tap's mach port pointer. Stored as `usize`
     // because raw pointers aren't `Send`, but the integer
@@ -497,6 +551,9 @@ fn create_event_tap<'a>(
                                    event_type: CGEventType,
                                    cg_ev: &CGEvent| {
         log::trace!("Got event from tap: {event_type:?}");
+        // NOTE: this runs on the event tap thread and must return within
+        // ~1s, otherwise the kernel disables the tap. Never panic here and
+        // never block on a channel.
         let mut state = client_state.blocking_lock();
         let mut capture_position = None;
         let mut res_events = vec![];
@@ -613,9 +670,12 @@ fn create_event_tap<'a>(
                     .start_capture(cg_ev, new_pos)
                     .unwrap_or_else(|e| log::warn!("{e}"));
                 res_events.push(CaptureEvent::Begin);
-                notify_tx
-                    .blocking_send(ProducerEvent::Grab(new_pos))
-                    .expect("Failed to send notification");
+                if let Err(e) = notify_tx.try_send(ProducerEvent::Grab(new_pos)) {
+                    // a dropped grab notification would leave the cursor
+                    // hidden, so at least it must not panic across the FFI
+                    // boundary
+                    log::warn!("failed to send grab notification: {e}");
+                }
             }
         }
 
@@ -623,7 +683,9 @@ fn create_event_tap<'a>(
             res_events.iter().for_each(|e| {
                 // error must be ignored, since the event channel
                 // may already be closed when the InputCapture instance is dropped.
-                let _ = event_tx.blocking_send((pos, *e));
+                if let Err(e) = event_tx.send(Ok((pos, *e))) {
+                    log::warn!("failed to forward the capture event: {e}");
+                }
             });
             // Returning Drop should stop the event from being processed
             // but core fundation still returns the event
@@ -653,7 +715,7 @@ fn create_event_tap<'a>(
     let tap_source: CFRunLoopSource = tap
         .mach_port()
         .create_runloop_source(0)
-        .expect("Failed creating loop source");
+        .map_err(|_| MacosCaptureCreationError::EventTapCreation)?;
 
     unsafe {
         CFRunLoop::get_current().add_source(&tap_source, kCFRunLoopCommonModes);
@@ -664,7 +726,7 @@ fn create_event_tap<'a>(
 
 fn event_tap_thread(
     client_state: Arc<Mutex<InputCaptureState>>,
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_tx: UnboundedSender<Result<(Position, CaptureEvent), CaptureError>>,
     notify_tx: Sender<ProducerEvent>,
     ready: std::sync::mpsc::Sender<Result<CFRunLoop, MacosCaptureCreationError>>,
     exit: oneshot::Sender<()>,
@@ -674,12 +736,13 @@ fn event_tap_thread(
 
     let _tap = match create_event_tap(client_state, notify_tx, event_tx) {
         Err(e) => {
-            ready.send(Err(e)).expect("channel closed");
+            let _ = ready.send(Err(e));
             return;
         }
         Ok(tap) => {
             let run_loop = CFRunLoop::get_current();
-            ready.send(Ok(run_loop)).expect("channel closed");
+            // the receiver may already be gone if startup failed
+            let _ = ready.send(Ok(run_loop));
             tap
         }
     };
@@ -740,7 +803,7 @@ extern "C" fn display_reconfiguration_callback(_display: u32, flags: u32, user_i
 }
 
 pub struct MacOSInputCapture {
-    event_rx: Receiver<(Position, CaptureEvent)>,
+    event_rx: UnboundedReceiver<Result<(Position, CaptureEvent), CaptureError>>,
     notify_tx: Sender<ProducerEvent>,
     run_loop: CFRunLoop,
 }
@@ -750,7 +813,9 @@ impl MacOSInputCapture {
         request_macos_capture_permissions()?;
 
         let state = Arc::new(Mutex::new(InputCaptureState::new()?));
-        let (event_tx, event_rx) = mpsc::channel(32);
+        /* the tap callback must never block or drop events: a dropped key
+         * release leaves the peer with a stuck key */
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (notify_tx, mut notify_rx) = mpsc::channel(32);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (tap_exit_tx, mut tap_exit_rx) = oneshot::channel();
@@ -762,6 +827,8 @@ impl MacOSInputCapture {
         log::info!("Enabling CGEvent tap");
         let event_tap_thread_state = state.clone();
         let event_tap_notify = notify_tx.clone();
+        // used by the producer task to report a fatal backend error
+        let task_event_tx = event_tx.clone();
         thread::spawn(move || {
             event_tap_thread(
                 event_tap_thread_state,
@@ -773,7 +840,9 @@ impl MacOSInputCapture {
         });
 
         // wait for event tap creation result
-        let run_loop = ready_rx.recv().expect("channel closed")?;
+        let run_loop = ready_rx
+            .recv()
+            .map_err(|_| MacosCaptureCreationError::EventTapCreation)??;
 
         let _tap_task: tokio::task::JoinHandle<()> = tokio::task::spawn_local(async move {
             loop {
@@ -783,9 +852,14 @@ impl MacOSInputCapture {
                             break;
                         };
                         let mut state = state.lock().await;
-                        state.handle_producer_event(producer_event).await.unwrap_or_else(|e| {
+                        if let Err(e) = state.handle_producer_event(producer_event).await {
+                            // swallow-and-continue would leave the capture active
+                            // forever (e.g. a dead event tap: no events arrive, but
+                            // pressed keys are never released). Report it upstream.
                             log::error!("Failed to handle producer event: {e}");
-                        })
+                            let _ = task_event_tx.send(Err(e));
+                            break;
+                        }
                     }
                     _ = &mut tap_exit_rx => break,
                 }
@@ -843,31 +917,34 @@ impl Drop for MacOSInputCapture {
 #[async_trait]
 impl Capture for MacOSInputCapture {
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            log::debug!("creating capture, {pos}");
-            let _ = notify_tx.send(ProducerEvent::Create(pos)).await;
-            log::debug!("done !");
-        });
+        // Send synchronously: a detached task could still be pending when
+        // `destroy`/`release` arrive, reordering the state updates, and on a
+        // quick shutdown the hiding cursor would never be undone.
+        log::debug!("creating capture, {pos}");
+        self.notify_tx
+            .send(ProducerEvent::Create(pos))
+            .await
+            .map_err(|_| CaptureError::EndOfStream)?;
+        log::debug!("done !");
         Ok(())
     }
 
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            log::debug!("destroying capture {pos}");
-            let _ = notify_tx.send(ProducerEvent::Destroy(pos)).await;
-            log::debug!("done !");
-        });
+        log::debug!("destroying capture {pos}");
+        self.notify_tx
+            .send(ProducerEvent::Destroy(pos))
+            .await
+            .map_err(|_| CaptureError::EndOfStream)?;
+        log::debug!("done !");
         Ok(())
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            log::debug!("notifying Release");
-            let _ = notify_tx.send(ProducerEvent::Release).await;
-        });
+        log::debug!("notifying Release");
+        self.notify_tx
+            .send(ProducerEvent::Release)
+            .await
+            .map_err(|_| CaptureError::EndOfStream)?;
         Ok(())
     }
 
@@ -882,7 +959,9 @@ impl Stream for MacOSInputCapture {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match ready!(self.event_rx.poll_recv(cx)) {
             None => Poll::Ready(None),
-            Some(e) => Poll::Ready(Some(Ok(e))),
+            // the backend forwards fatal errors (e.g. a disabled event tap)
+            // through the event channel so the supervisor can release keys
+            Some(e) => Poll::Ready(Some(e)),
         }
     }
 }

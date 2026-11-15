@@ -9,10 +9,10 @@ use std::ops::BitOrAssign;
 use std::time::Duration;
 use tokio::task::AbortHandle;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
-    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
-    MOUSEEVENTF_WHEEL, MOUSEINPUT,
+    INPUT, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
+    KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEINPUT, VK_PAUSE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT_0, KEYEVENTF_EXTENDEDKEY, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, SendInput,
@@ -51,8 +51,22 @@ impl Emulation for WindowsEmulation {
                     time: _,
                     axis,
                     value,
-                } => scroll(axis, value as i32),
-                PointerEvent::AxisDiscrete120 { axis, value } => scroll(axis, value),
+                } => {
+                    /* continuous scroll amounts are in surface units, while
+                     * `mouseData` expects multiples of WHEEL_DELTA (120).
+                     */
+                    let notches = (value / SCROLL_UNITS_PER_NOTCH).round();
+                    let notches = if notches == 0. && value != 0. {
+                        value.signum()
+                    } else {
+                        notches
+                    };
+                    scroll(axis, (notches * WHEEL_DELTA) as i32);
+                }
+                PointerEvent::AxisDiscrete120 { axis, value } => {
+                    // already in units of 120 (one wheel notch)
+                    scroll(axis, value);
+                }
             },
             Event::Keyboard(keyboard_event) => match keyboard_event {
                 KeyboardEvent::Key {
@@ -103,15 +117,34 @@ impl WindowsEmulation {
     }
 }
 
+/// wheel delta of one notch, as expected in `MOUSEINPUT::mouseData`
+const WHEEL_DELTA: f64 = 120.;
+
+/// continuous scroll amount that corresponds to one wheel notch
+const SCROLL_UNITS_PER_NOTCH: f64 = 10.;
+
 fn send_input_safe(input: INPUT) {
-    unsafe {
-        loop {
-            /* retval = number of successfully submitted events */
-            if SendInput(&[input], std::mem::size_of::<INPUT>() as i32) > 0 {
-                break;
-            }
+    /* SendInput returns the number of successfully submitted events. It
+     * returns 0 when it is blocked (e.g. by UIPI when the target window runs
+     * elevated, or while the secure desktop is active). Retrying forever
+     * pegged a whole core at 100% CPU, so give up after a few attempts and
+     * report the error instead.
+     */
+    const MAX_ATTEMPTS: usize = 10;
+    for attempt in 0..MAX_ATTEMPTS {
+        // SAFETY: `input` is a fully initialized INPUT struct
+        let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+        if sent > 0 {
+            return;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
+    log::error!(
+        "failed to send input event: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 fn send_mouse_input(mi: MOUSEINPUT) {
@@ -198,6 +231,27 @@ fn key_event(key: u32, state: u8) {
         Some(code) => code,
         None => return,
     };
+    /* Pause is the only key whose scan code is three bytes long
+     * (E1 1D 45 / E1 9D C5). `linux_keycode_to_windows_scancode` truncates it
+     * to 0x1D45, and truncating it to one byte (0x45) would emit NumLock
+     * instead, so it is sent as a virtual key instead.
+     */
+    const PAUSE_SCANCODE: u16 = 0x1D45;
+    if scancode == PAUSE_SCANCODE {
+        let mut flags = KEYBD_EVENT_FLAGS::default();
+        if state == 0 {
+            flags.bitor_assign(KEYEVENTF_KEYUP);
+        }
+        let ki = KEYBDINPUT {
+            wVk: VK_PAUSE,
+            wScan: 0,
+            dwFlags: flags,
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        send_keyboard_input(ki);
+        return;
+    }
     let extended = scancode > 0xff;
     let scancode = scancode & 0xff;
     let mut flags = KEYEVENTF_SCANCODE;

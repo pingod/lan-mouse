@@ -14,3 +14,9 @@ serde_json = "1.0.107"
 thiserror = "2.0.0"
 tokio = { version = "1.32.0", features = ["macros", "net", "io-util", "time"] }
 tokio-stream = { version = "0.1.15", features = ["io-util"] }
+
+[dev-dependencies]
+# `rt` for `#[tokio::test]`, the listener tests use real unix sockets
+tokio = { version = "1.32.0", features = ["rt", "rt-multi-thread"] }
+futures = "0.3.30"
+serde_json = "1.0.107"

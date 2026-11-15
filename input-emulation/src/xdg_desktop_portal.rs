@@ -104,20 +104,22 @@ impl Emulation for DesktopPortalEmulation {
                     axis,
                     value,
                 } => {
-                    let axis = match axis {
-                        0 => Axis::Vertical,
-                        _ => Axis::Horizontal,
-                    };
+                    // `finish` terminates a scroll sequence; setting it on
+                    // every single event made smooth scrolling stutter
                     let (dx, dy) = match axis {
-                        Axis::Vertical => (0., value),
-                        Axis::Horizontal => (value, 0.),
+                        0 => (0., value),
+                        1 => (value, 0.),
+                        axis => {
+                            log::warn!("unsupported scroll axis: {axis}");
+                            return Ok(());
+                        }
                     };
                     self.proxy
                         .notify_pointer_axis(
                             &self.session,
                             dx,
                             dy,
-                            NotifyPointerAxisOptions::default().set_finish(true),
+                            NotifyPointerAxisOptions::default(),
                         )
                         .await?;
                 }
@@ -154,12 +156,19 @@ impl Emulation for DesktopPortalEmulation {
     async fn create(&mut self, _client: EmulationHandle) {}
     async fn destroy(&mut self, _client: EmulationHandle) {}
     async fn terminate(&mut self) {
-        if let Err(e) = self.session.close().await {
-            log::warn!("session.close(): {e}");
-        };
-        if let Err(e) = self.session.receive_closed().await {
-            log::warn!("session.receive_closed(): {e}");
-        };
+        // the portal may never answer (e.g. the dialog is waiting for user
+        // input), which would hang shutdown forever
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+        match tokio::time::timeout(TIMEOUT, self.session.close()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!("session.close(): {e}"),
+            Err(_) => log::warn!("session.close() timed out"),
+        }
+        match tokio::time::timeout(TIMEOUT, self.session.receive_closed()).await {
+            Ok(Ok(_stream)) => {}
+            Ok(Err(e)) => log::warn!("session.receive_closed(): {e}"),
+            Err(_) => log::warn!("session.receive_closed() timed out"),
+        }
     }
 }
 

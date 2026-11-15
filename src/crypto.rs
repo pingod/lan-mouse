@@ -29,9 +29,19 @@ pub fn generate_fingerprint(cert: &[u8]) -> String {
     bytes.join(":").to_lowercase()
 }
 
+/// Fingerprint of the leaf certificate.
+///
+/// A certificate chain without any certificate cannot be fingerprinted; this
+/// returns an empty string instead of panicking (the process is built with
+/// `panic = "abort"`) so callers can refuse the certificate.
 pub fn certificate_fingerprint(cert: &Certificate) -> String {
-    let certificate = cert.certificate.first().expect("certificate missing");
-    generate_fingerprint(certificate)
+    match cert.certificate.first() {
+        Some(certificate) => generate_fingerprint(certificate),
+        None => {
+            log::warn!("certificate has no leaf certificate, refusing it");
+            String::new()
+        }
+    }
 }
 
 /// load certificate from file
@@ -45,10 +55,25 @@ pub fn load_certificate(path: &Path) -> Result<Certificate, Error> {
 }
 
 pub(crate) fn load_or_generate_key_and_cert(path: &Path) -> Result<Certificate, Error> {
-    if path.exists() && path.is_file() {
-        Ok(load_certificate(path)?)
-    } else {
-        generate_key_and_cert(path)
+    if !path.exists() || !path.is_file() {
+        return generate_key_and_cert(path);
+    }
+    match load_certificate(path) {
+        Ok(cert) => Ok(cert),
+        Err(e) => {
+            /* A truncated or corrupted key file (an interrupted write, a full
+             * disk, a mangled manual edit) cannot be recovered from: fail every
+             * start forever, or move it aside and start over. Keep the broken
+             * file so the user can still restore it, and warn loudly because
+             * the public key - and therefore the peers' authorization - changes.
+             */
+            let backup = path.with_extension("broken");
+            log::error!(
+                "could not load the certificate from {path:?}: {e}; moving it to {backup:?} and generating a new one - peers have to authorize the new public key"
+            );
+            fs::rename(path, &backup)?;
+            generate_key_and_cert(path)
+        }
     }
 }
 
@@ -65,7 +90,13 @@ pub(crate) fn generate_key_and_cert(path: &Path) -> Result<Certificate, Error> {
         f.set_permissions(perm)?;
     }
     /* FIXME windows permissions */
+    /* The PEM is smaller than the writer's buffer, so `write_all` cannot fail
+     * and a `Drop`-flushed writer would swallow every I/O error (ENOSPC, ...).
+     * Flush explicitly so a half written key is reported instead of silently
+     * producing a certificate file that fails to load on the next start.
+     */
     let mut writer = BufWriter::new(f);
     writer.write_all(serialized.as_bytes())?;
+    writer.flush()?;
     Ok(cert)
 }

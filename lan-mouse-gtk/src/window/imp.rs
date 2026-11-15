@@ -314,8 +314,9 @@ impl Window {
 impl ObjectImpl for Window {
     fn constructed(&self) {
         if let Ok(hostname) = hostname::get() {
+            // a non-utf8 hostname must not abort the application
             self.hostname_label
-                .set_text(hostname.to_str().expect("hostname: invalid utf8"));
+                .set_text(hostname.to_string_lossy().as_ref());
         }
         self.parent_constructed();
         self.set_port(DEFAULT_PORT);

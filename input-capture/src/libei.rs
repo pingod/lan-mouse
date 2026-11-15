@@ -79,7 +79,11 @@ enum LibeiNotifyEvent {
 
 #[allow(dead_code)]
 pub struct LibeiInputCapture {
-    input_capture: Pin<Box<InputCapture>>,
+    /* Keeps the portal object alive for the capture task, which only holds a
+     * reference to it. An `Rc` (instead of a raw pointer into a boxed value)
+     * makes the lifetime guaranteed by the type system.
+     */
+    input_capture: Arc<InputCapture>,
     capture_task: JoinHandle<Result<(), CaptureError>>,
     event_rx: Receiver<(Position, CaptureEvent)>,
     notify_capture: Sender<LibeiNotifyEvent>,
@@ -136,9 +140,8 @@ fn select_barriers(
             .iter()
             .map(|r| {
                 let id = *next_barrier_id;
-                *next_barrier_id = next_barrier_id
-                    .checked_add(1)
-                    .expect("barrier id out of range");
+                // ids wrap around instead of overflowing after 4 billion barriers
+                *next_barrier_id = next_barrier_id.checked_add(1).unwrap_or(NonZeroU32::MIN);
                 let position = pos_to_barrier(r, *pos);
                 pos_for_barrier.insert(id, *pos);
                 ICBarrier::new(id, position)
@@ -327,9 +330,8 @@ async fn libei_event_handler(
 
 impl LibeiInputCapture {
     pub async fn new() -> std::result::Result<Self, LibeiCaptureCreationError> {
-        let input_capture = Box::pin(InputCapture::new().await?);
-        let input_capture_ptr = input_capture.as_ref().get_ref() as *const InputCapture;
-        let first_session = Some(create_session(unsafe { &*input_capture_ptr }).await?);
+        let input_capture = Arc::new(InputCapture::new().await?);
+        let first_session = Some(create_session(&input_capture).await?);
 
         let (event_tx, event_rx) = mpsc::channel(1);
         let (notify_capture, notify_rx) = mpsc::channel(1);
@@ -338,7 +340,7 @@ impl LibeiInputCapture {
         let cancellation_token = CancellationToken::new();
 
         let capture = do_capture(
-            input_capture_ptr,
+            Arc::clone(&input_capture),
             notify_rx,
             notify_release.clone(),
             first_session,
@@ -362,7 +364,7 @@ impl LibeiInputCapture {
 }
 
 async fn do_capture(
-    input_capture: *const InputCapture,
+    input_capture: Arc<InputCapture>,
     mut capture_event: Receiver<LibeiNotifyEvent>,
     notify_release: Arc<Notify>,
     session: Option<(Session<InputCapture>, BitFlags<Capabilities>)>,
@@ -371,8 +373,8 @@ async fn do_capture(
 ) -> Result<(), CaptureError> {
     let mut session = session.map(|s| s.0);
 
-    /* safety: libei_task does not outlive Self */
-    let input_capture = unsafe { &*input_capture };
+    /* the task owns the `Arc`, so this borrow is valid for the whole task */
+    let input_capture = input_capture.as_ref();
     let mut active_clients: Vec<Position> = vec![];
     let mut next_barrier_id = NonZeroU32::new(1).expect("id must be non-zero");
 
@@ -384,7 +386,6 @@ async fn do_capture(
         let cancel_update = CancellationToken::new();
 
         let mut capture_event_occured: Option<LibeiNotifyEvent> = None;
-        let mut zones_have_changed = false;
 
         // kill session if clients need to be updated
         let handle_session_update_request = async {
@@ -395,9 +396,18 @@ async fn do_capture(
                 _ = cancel_update.cancelled() => {
                     log::debug!("update task cancelled");
                 }, /* session exited */
-                _ = zones_changed.next() => {
-                    log::debug!("zones changed!");
-                    zones_have_changed = true
+                zones = zones_changed.next() => match zones {
+                    Some(_) => {
+                        log::debug!("zones changed!");
+                    }
+                    None => {
+                        // The portal stream ended (portal restart or session
+                        // invalidated). Leaving the branch ready would make
+                        // this select spin forever and recreate the session in
+                        // a tight loop, so park it instead.
+                        log::warn!("zones changed stream closed");
+                        std::future::pending::<()>().await;
+                    }
                 }, /* zones have changed */
                 e = capture_event.recv() => if let Some(e) = e { /* clients changed */
                     log::debug!("capture event: {e:?}");
@@ -540,27 +550,45 @@ async fn do_capture_session(
                     let activated = activated.ok_or(CaptureError::ActivationClosed)?;
                     log::debug!("activated: {activated:?}");
 
+                    // The compositor is allowed to omit the cursor position. In
+                    // that case we cannot map an unknown barrier back to a
+                    // client, so only activations that report a barrier id can
+                    // be handled.
+                    let cursor_position = activated.cursor_position();
+
                     // get barrier id from activation
                     let barrier_id = match activated.barrier_id() {
-                        Some(ActivatedBarrier::Barrier(id)) => id,
+                        Some(ActivatedBarrier::Barrier(id)) => Some(id),
                         // workaround for KDE plasma not reporting barrier ids
-                        Some(ActivatedBarrier::UnknownBarrier) | None => find_corresponding_client(&barriers, activated.cursor_position().expect("no cursor position reported by compositor")),
+                        Some(ActivatedBarrier::UnknownBarrier) | None => {
+                            cursor_position.and_then(|p| find_corresponding_client(&barriers, p))
+                        }
                     };
 
                     // find client corresponding to barrier
-                    let pos = match pos_for_barrier_id.get(&barrier_id) {
-                        Some(id) => *id,
-                        None => {
-                            log::warn!("INVALID BARRIER ID: Id {barrier_id} does not exist!");
-                            let id = find_corresponding_client(&barriers, activated.cursor_position().expect("no cursor position reported by compositor"));
-                            let pos = *pos_for_barrier_id.get(&id).expect("invalid barrier id");
-                            pos
-                        },
+                    let pos = barrier_id
+                        .and_then(|id| pos_for_barrier_id.get(&id).copied())
+                        .or_else(|| {
+                            let cursor_position = cursor_position?;
+                            // The compositor reported a barrier id that we did not
+                            // create (or none at all): fall back to the closest
+                            // barrier instead of panicking.
+                            log::warn!("invalid barrier id {barrier_id:?}, using the closest barrier");
+                            find_corresponding_client(&barriers, cursor_position)
+                                .and_then(|id| pos_for_barrier_id.get(&id).copied())
+                        });
+
+                    let Some(pos) = pos else {
+                        log::warn!("unable to match the activation to a capture position, ignoring it");
+                        continue;
                     };
                     current_pos.replace(Some(pos));
 
                     // client entered => send event
-                    event_tx.send((pos, CaptureEvent::Begin)).await.expect("no channel");
+                    if event_tx.send((pos, CaptureEvent::Begin)).await.is_err() {
+                        log::debug!("capture event channel closed");
+                        break;
+                    }
 
                     tokio::select! {
                         _ = notify_release.notified() => { /* capture release */
@@ -578,6 +606,10 @@ async fn do_capture_session(
 
                     release_capture(input_capture, session, activated, pos, &barriers).await?;
 
+                    // The session is no longer capturing: stop forwarding
+                    // events to the client we just left, otherwise events left
+                    // in the socket would be replayed to it.
+                    current_pos.replace(None);
                 }
                 _ = zone_check.tick() => {
                     // While the pointer is on a peer, a stale barrier is
@@ -659,9 +691,10 @@ async fn release_capture(
     if let Some(activation_id) = activated.activation_id() {
         log::debug!("releasing input capture {activation_id}");
     }
-    let (x, y) = activated
-        .cursor_position()
-        .expect("compositor did not report cursor position!");
+    let (x, y) = activated.cursor_position().unwrap_or_else(|| {
+        log::debug!("compositor did not report a cursor position, releasing at (0, 0)");
+        (0., 0.)
+    });
     log::debug!("client entered @ ({x}, {y})");
     // Park the cursor a fixed distance inside the edge, measured from the
     // barrier line rather than from wherever the cursor happened to be.
@@ -697,17 +730,16 @@ async fn release_capture(
     Ok(())
 }
 
-fn find_corresponding_client(barriers: &[ICBarrier], pos: (f32, f32)) -> BarrierID {
-    barriers
-        .iter()
-        .copied()
-        .min_by_key(|b| {
-            let (x1, y1, x2, y2) = b.position;
-            let (x1, y1, x2, y2) = (x1 as f32, y1 as f32, x2 as f32, y2 as f32);
-            distance_to_line(((x1, y1), (x2, y2)), pos) as i32
-        })
-        .expect("could not find barrier corresponding to client")
-        .barrier_id
+fn find_corresponding_client(barriers: &[ICBarrier], pos: (f32, f32)) -> Option<BarrierID> {
+    let Some(closest) = barriers.iter().copied().min_by_key(|b| {
+        let (x1, y1, x2, y2) = b.position;
+        let (x1, y1, x2, y2) = (x1 as f32, y1 as f32, x2 as f32, y2 as f32);
+        distance_to_line(((x1, y1), (x2, y2)), pos) as i32
+    }) else {
+        log::warn!("could not find barrier corresponding to client");
+        return None;
+    };
+    Some(closest.barrier_id)
 }
 
 fn distance_to_line(line: ((f32, f32), (f32, f32)), p: (f32, f32)) -> f32 {
@@ -765,10 +797,14 @@ async fn handle_ei_event(
         _ => {
             if let Some(pos) = current_client {
                 for event in Event::from_ei_event(ei_event) {
-                    event_tx
+                    if event_tx
                         .send((pos, CaptureEvent::Input(event)))
                         .await
-                        .expect("no channel");
+                        .is_err()
+                    {
+                        // the consumer is gone, nothing left to deliver to
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -795,7 +831,9 @@ impl LanMouseInputCapture for LibeiInputCapture {
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
-        self.notify_release.notify_waiters();
+        // `notify_one` stores a permit when nobody is waiting, so a release
+        // request can not be lost between two `notified()` polls.
+        self.notify_release.notify_one();
         Ok(())
     }
 
@@ -804,7 +842,15 @@ impl LanMouseInputCapture for LibeiInputCapture {
         let task = &mut self.capture_task;
         log::debug!("waiting for capture to terminate...");
         let res = if !task.is_finished() {
-            task.await.expect("libei task panic")
+            match task.await {
+                Ok(res) => res,
+                Err(e) => {
+                    log::error!("libei capture task panicked: {e}");
+                    Err(CaptureError::Io(io::Error::other(format!(
+                        "libei capture task panicked: {e}"
+                    ))))
+                }
+            }
         } else {
             Ok(())
         };
@@ -818,7 +864,7 @@ impl Drop for LibeiInputCapture {
     fn drop(&mut self) {
         if !self.terminated {
             /* this workaround is needed until async drop is stabilized */
-            panic!("LibeiInputCapture dropped without being terminated!");
+            log::error!("LibeiInputCapture dropped without being terminated!");
         }
     }
 }
@@ -827,12 +873,33 @@ impl Stream for LibeiInputCapture {
     type Item = Result<(Position, CaptureEvent), CaptureError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        // Deliver queued events first: events that were sent just before the
+        // capture task ended must not be dropped.
+        if let Poll::Ready(event) = self.event_rx.poll_recv(cx) {
+            if event.is_some() {
+                return Poll::Ready(event.map(Result::Ok));
+            }
+        }
+
+        if self.terminated {
+            return Poll::Ready(None);
+        }
+
+        // The capture task owns the only sender, so waiting on the channel also
+        // observes the task ending (dropping the sender wakes us). Polling a
+        // finished JoinHandle would panic, so only join once it is done.
+        if !self.capture_task.is_finished() {
+            return Poll::Pending;
+        }
+
+        self.terminated = true;
         match self.capture_task.poll_unpin(cx) {
-            Poll::Ready(r) => match r.expect("failed to join") {
-                Ok(()) => Poll::Ready(None),
-                Err(e) => Poll::Ready(Some(Err(e))),
-            },
-            Poll::Pending => self.event_rx.poll_recv(cx).map(|e| e.map(Result::Ok)),
+            Poll::Ready(Ok(Ok(()))) => Poll::Ready(None),
+            Poll::Ready(Ok(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(CaptureError::Io(io::Error::other(
+                format!("libei capture task failed: {e}"),
+            ))))),
+            Poll::Pending => Poll::Pending,
         }
     }
 }

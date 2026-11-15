@@ -39,6 +39,9 @@ impl Stream for X11InputCapture {
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        Poll::Pending
+        // This backend never produces events (`new()` always fails with
+        // `NotImplemented`), so the stream terminates immediately instead of
+        // returning a `Pending` without a registered waker.
+        Poll::Ready(None)
     }
 }

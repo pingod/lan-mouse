@@ -17,6 +17,17 @@ use tokio::{
     task::{JoinHandle, spawn_local},
 };
 
+/// Send on one of the internal channels.
+///
+/// The receiving half is dropped during shutdown and this binary is built
+/// with `panic = "abort"`, so a failed send must not panic: when nobody is
+/// listening anymore the only sensible thing left to do is to drop the event.
+fn send_event<T>(tx: &Sender<T>, event: T) {
+    if tx.send(event).is_err() {
+        log::debug!("receiver is gone, dropping the event");
+    }
+}
+
 /// emulation handling events received from a listener
 pub(crate) struct Emulation {
     task: JoinHandle<()>,
@@ -104,15 +115,11 @@ impl Emulation {
     }
 
     pub(crate) fn send_leave_event(&self, addr: SocketAddr) {
-        self.request_tx
-            .send(EmulationRequest::Release(addr))
-            .expect("channel closed");
+        send_event(&self.request_tx, EmulationRequest::Release(addr));
     }
 
     pub(crate) fn reenable(&self) {
-        self.request_tx
-            .send(EmulationRequest::Reenable)
-            .expect("channel closed");
+        send_event(&self.request_tx, EmulationRequest::Reenable);
     }
 
     /// Stop emulating input until [`Self::reenable`].
@@ -121,21 +128,21 @@ impl Emulation {
     }
 
     pub(crate) fn request_port_change(&self, port: u16) {
-        self.request_tx
-            .send(EmulationRequest::ChangePort(port))
-            .expect("channel closed")
+        send_event(&self.request_tx, EmulationRequest::ChangePort(port));
     }
 
-    pub(crate) async fn event(&mut self) -> EmulationEvent {
-        self.event_rx.recv().await.expect("channel closed")
+    /// Wait for the next event.
+    ///
+    /// `None` means the emulation task has exited; the service has to shut
+    /// down in that case instead of waiting for events that never arrive.
+    pub(crate) async fn event(&mut self) -> Option<EmulationEvent> {
+        self.event_rx.recv().await
     }
 
     /// wait for termination
     pub(crate) async fn terminate(&mut self) {
         log::debug!("terminating emulation");
-        self.request_tx
-            .send(EmulationRequest::Terminate)
-            .expect("channel closed");
+        send_event(&self.request_tx, EmulationRequest::Terminate);
         if let Err(e) = (&mut self.task).await {
             log::warn!("{e}");
         }
@@ -167,9 +174,9 @@ impl ListenTask {
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
                                     self.emulation_proxy.enter(addr);
-                                    self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
+                                    send_event(&self.event_tx, EmulationEvent::ReleaseNotify);
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
-                                    self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
+                                    send_event(&self.event_tx, EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint});
                                 }
                             }
                             ProtoEvent::Leave(_) => {
@@ -197,7 +204,7 @@ impl ListenTask {
                                 for chunk in crate::sysinfo::chunks(&crate::sysinfo::LOCAL) {
                                     self.listener.reply(addr, chunk).await;
                                 }
-                                self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
+                                send_event(&self.event_tx, EmulationEvent::PeerHello { addr, commit });
                             }
                             ProtoEvent::PeerInfoRequest => {
                                 for chunk in crate::sysinfo::chunks(&crate::sysinfo::LOCAL) {
@@ -205,12 +212,13 @@ impl ListenTask {
                                 }
                             }
                             ProtoEvent::PeerInfo(info) => {
-                                self.event_tx
-                                    .send(EmulationEvent::PeerInfo {
+                                send_event(
+                                    &self.event_tx,
+                                    EmulationEvent::PeerInfo {
                                         addr,
                                         info: Box::new(info),
-                                    })
-                                    .expect("channel closed");
+                                    },
+                                );
                             }
                             ProtoEvent::PeerInfoChunk {
                                 index,
@@ -219,43 +227,46 @@ impl ListenTask {
                             } => {
                                 let entry = self.reassemblers.entry(addr).or_default();
                                 if let Some(info) = entry.push(index, total, &data) {
-                                    self.event_tx
-                                        .send(EmulationEvent::PeerInfo {
+                                    send_event(
+                                        &self.event_tx,
+                                        EmulationEvent::PeerInfo {
                                             addr,
                                             info: Box::new(info),
-                                        })
-                                        .expect("channel closed");
+                                        },
+                                    );
                                 }
                             }
                             _ => {}
                         }
                     }
                     Some(ListenEvent::Accept { addr, fingerprint }) => {
-                        self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
+                        send_event(&self.event_tx, EmulationEvent::Connected { addr, fingerprint });
                     }
                     Some(ListenEvent::Rejected { fingerprint }) => {
                         if rejected_connections.insert(fingerprint.clone(), Instant::now())
                             .is_none_or(|i| i.elapsed() >= Duration::from_secs(2)) {
-                                self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).expect("channel closed");
+                                send_event(&self.event_tx, EmulationEvent::ConnectionAttempt { fingerprint });
                             }
                     }
                     None => break
                 }}
                 event = self.emulation_proxy.event() => {
-                    self.event_tx.send(event).expect("channel closed");
+                    let Some(event) = event else { break };
+                    send_event(&self.event_tx, event);
                 }
-                request = self.request_rx.recv() => match request.expect("channel closed") {
+                request = self.request_rx.recv() => match request {
+                    None => break,
                     // reenable emulation
-                    EmulationRequest::Reenable => self.emulation_proxy.reenable(),
-                    EmulationRequest::Disable => self.emulation_proxy.disable(),
+                    Some(EmulationRequest::Reenable) => self.emulation_proxy.reenable(),
+                    Some(EmulationRequest::Disable) => self.emulation_proxy.disable(),
                     // notify the other end that we hit a barrier (should release capture)
-                    EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
-                    EmulationRequest::ChangePort(port) => {
+                    Some(EmulationRequest::Release(addr)) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                    Some(EmulationRequest::ChangePort(port)) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;
-                        self.event_tx.send(EmulationEvent::PortChanged(result)).expect("channel closed");
+                        send_event(&self.event_tx, EmulationEvent::PortChanged(result));
                     }
-                    EmulationRequest::Terminate => break,
+                    Some(EmulationRequest::Terminate) => break,
                 },
                 _ = interval.tick() => {
                     // The threshold must outlast the peer's keep-alive period,
@@ -267,7 +278,7 @@ impl ListenTask {
                         if instant.elapsed() > PEER_TIMEOUT {
                             log::warn!("releasing keys: {addr} not responding!");
                             self.emulation_proxy.remove(addr);
-                            self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
+                            send_event(&self.event_tx, EmulationEvent::Disconnected { addr });
                             false
                         } else {
                             true
@@ -327,42 +338,34 @@ impl EmulationProxy {
         }
     }
 
-    async fn event(&mut self) -> EmulationEvent {
-        let event = self.event_rx.recv().await.expect("channel closed");
+    async fn event(&mut self) -> Option<EmulationEvent> {
+        let event = self.event_rx.recv().await?;
         if let EmulationEvent::EmulationEnabled = event {
             self.emulation_active.replace(true);
         }
         if let EmulationEvent::EmulationDisabled = event {
             self.emulation_active.replace(false);
         }
-        event
+        Some(event)
     }
 
     fn consume(&self, event: Event, addr: SocketAddr) {
         // ignore events if emulation is currently disabled
         if self.emulation_active.get() {
-            self.request_tx
-                .send(ProxyRequest::Input(event, addr))
-                .expect("channel closed");
+            send_event(&self.request_tx, ProxyRequest::Input(event, addr));
         }
     }
 
     fn enter(&self, addr: SocketAddr) {
-        self.request_tx
-            .send(ProxyRequest::Enter(addr))
-            .expect("channel closed");
+        send_event(&self.request_tx, ProxyRequest::Enter(addr));
     }
 
     fn remove(&self, addr: SocketAddr) {
-        self.request_tx
-            .send(ProxyRequest::Remove(addr))
-            .expect("channel closed");
+        send_event(&self.request_tx, ProxyRequest::Remove(addr));
     }
 
     fn reenable(&self) {
-        self.request_tx
-            .send(ProxyRequest::Reenable)
-            .expect("channel closed");
+        send_event(&self.request_tx, ProxyRequest::Reenable);
     }
 
     fn disable(&self) {
@@ -371,9 +374,7 @@ impl EmulationProxy {
 
     async fn terminate(&mut self) {
         self.exit_requested.replace(true);
-        self.request_tx
-            .send(ProxyRequest::Terminate)
-            .expect("channel closed");
+        send_event(&self.request_tx, ProxyRequest::Terminate);
         let _ = (&mut self.task).await;
     }
 }
@@ -409,13 +410,14 @@ impl EmulationTask {
             }
             // wait for reenable request
             loop {
-                match self.request_rx.recv().await.expect("channel closed") {
-                    ProxyRequest::Reenable => break,
-                    ProxyRequest::Terminate => return,
-                    ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
-                    ProxyRequest::Enter(..) => { /* emulation inactive => ignore */ }
-                    ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
-                    ProxyRequest::Disable => { /* already inactive */ }
+                match self.request_rx.recv().await {
+                    Some(ProxyRequest::Reenable) => break,
+                    // the proxy was dropped: nothing left to emulate for
+                    None | Some(ProxyRequest::Terminate) => return,
+                    Some(ProxyRequest::Input(..)) => { /* emulation inactive => ignore */ }
+                    Some(ProxyRequest::Enter(..)) => { /* emulation inactive => ignore */ }
+                    Some(ProxyRequest::Remove(..)) => { /* emulation inactive => ignore */ }
+                    Some(ProxyRequest::Disable) => { /* already inactive */ }
                 }
             }
         }
@@ -467,8 +469,10 @@ impl EmulationTask {
     ) -> Result<(), InputEmulationError> {
         loop {
             tokio::select! {
-                e = self.request_rx.recv() => match e.expect("channel closed") {
-                    ProxyRequest::Input(event, addr) => {
+                e = self.request_rx.recv() => match e {
+                    // the proxy was dropped: stop emulating
+                    None => break Ok(()),
+                    Some(ProxyRequest::Input(event, addr)) => {
                         let now = Instant::now();
                         // Drop expired latches as we go. The map is keyed by
                         // peer address and a busy network would otherwise keep
@@ -491,18 +495,18 @@ impl EmulationTask {
                         };
                         emulation.consume(event, handle).await?;
                     },
-                    ProxyRequest::Enter(addr) => {
+                    Some(ProxyRequest::Enter(addr)) => {
                         self.left.remove(&addr);
                     }
-                    ProxyRequest::Remove(addr) => {
+                    Some(ProxyRequest::Remove(addr)) => {
                         self.left.insert(addr, Instant::now());
                         if let Some(handle) = self.handles.remove(&addr) {
                             emulation.destroy(handle).await;
                         }
                     }
-                    ProxyRequest::Terminate => break Ok(()),
-                    ProxyRequest::Reenable => continue,
-                    ProxyRequest::Disable => {
+                    Some(ProxyRequest::Terminate) => break Ok(()),
+                    Some(ProxyRequest::Reenable) => continue,
+                    Some(ProxyRequest::Disable) => {
                         // Drop every handle so a resumed session starts clean;
                         // the peer keeps sending until it leaves, and those
                         // events are ignored while no handle exists.
@@ -528,13 +532,13 @@ fn to_ipc_pos(pos: Position) -> lan_mouse_ipc::Position {
 
 async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
     loop {
-        match rx.recv().await.expect("channel closed") {
-            ProxyRequest::Terminate => return,
-            ProxyRequest::Input(_, _) => continue,
-            ProxyRequest::Enter(_) => continue,
-            ProxyRequest::Remove(_) => continue,
-            ProxyRequest::Reenable => continue,
-            ProxyRequest::Disable => continue,
+        match rx.recv().await {
+            None | Some(ProxyRequest::Terminate) => return,
+            Some(ProxyRequest::Input(_, _)) => continue,
+            Some(ProxyRequest::Enter(_)) => continue,
+            Some(ProxyRequest::Remove(_)) => continue,
+            Some(ProxyRequest::Reenable) => continue,
+            Some(ProxyRequest::Disable) => continue,
         }
     }
 }
@@ -546,7 +550,7 @@ struct DropGuard<T> {
 
 impl<T> DropGuard<T> {
     fn new(tx: Sender<T>, on_new: T, on_drop: T) -> Self {
-        tx.send(on_new).expect("channel closed");
+        send_event(&tx, on_new);
         let on_drop = Some(on_drop);
         Self { tx, on_drop }
     }
@@ -554,9 +558,10 @@ impl<T> DropGuard<T> {
 
 impl<T> Drop for DropGuard<T> {
     fn drop(&mut self) {
-        self.tx
-            .send(self.on_drop.take().expect("item"))
-            .expect("channel closed");
+        // never panic in `Drop`: the process would abort on shutdown
+        if let Some(on_drop) = self.on_drop.take() {
+            send_event(&self.tx, on_drop);
+        }
     }
 }
 

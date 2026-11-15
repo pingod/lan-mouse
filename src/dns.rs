@@ -54,16 +54,26 @@ impl DnsResolver {
 
     pub(crate) fn resolve(&self, handle: ClientHandle, hostname: String) {
         let request = DnsRequest { handle, hostname };
-        self.request_tx.send(request).expect("channel closed");
+        /* the task only goes away during shutdown and this binary is built
+         * with `panic = "abort"`, so a failed send must not panic
+         */
+        if self.request_tx.send(request).is_err() {
+            log::debug!("dns task is gone, dropping the resolve request");
+        }
     }
 
-    pub(crate) async fn event(&mut self) -> DnsEvent {
-        self.event_rx.recv().await.expect("channel closed")
+    /// Wait for the next event; `None` means the resolver task has exited.
+    pub(crate) async fn event(&mut self) -> Option<DnsEvent> {
+        self.event_rx.recv().await
     }
 
     pub(crate) async fn terminate(&mut self) {
         self.cancellation_token.cancel();
-        self.task.take().expect("task").await.expect("join error");
+        if let Some(task) = self.task.take() {
+            if let Err(e) = task.await {
+                log::warn!("dns resolver task failed: {e}");
+            }
+        }
     }
 }
 
@@ -88,9 +98,10 @@ impl DnsTask {
                 }
             }
 
-            self.event_tx
-                .send(DnsEvent::Resolving(handle))
-                .expect("channel closed");
+            if self.event_tx.send(DnsEvent::Resolving(handle)).is_err() {
+                // the receiver is gone, so nobody is waiting for results
+                return;
+            }
 
             /* spawn task for dns request */
             let event_tx = self.event_tx.clone();
@@ -119,9 +130,12 @@ impl DnsTask {
                             result = resolve_hostname(&hostname).await;
                             attempt += 1;
                         }
-                        event_tx
+                        if event_tx
                             .send(DnsEvent::Resolved(handle, hostname, result))
-                            .expect("channel closed");
+                            .is_err()
+                        {
+                            log::debug!("dns event receiver is gone");
+                        }
                     }
                     _ = cancellation_token.cancelled() => {},
                 }

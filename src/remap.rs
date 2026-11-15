@@ -36,9 +36,10 @@ pub(crate) struct Remap {
     held: Vec<u32>,
     /// modifiers the peer currently believes are held
     peer_down: Vec<u32>,
-    /// trigger key of a chord that already fired; its auto-repeat and release
-    /// are swallowed
-    fired: Option<u32>,
+    /// trigger keys of chords that already fired; their auto-repeat and
+    /// release are swallowed. A set, because the user can complete a second
+    /// chord while the trigger of the first one is still held.
+    fired: HashSet<u32>,
 }
 
 impl Remap {
@@ -55,7 +56,7 @@ impl Remap {
                 .collect(),
             held: Vec::new(),
             peer_down: Vec::new(),
-            fired: None,
+            fired: HashSet::new(),
         }
     }
 
@@ -84,7 +85,7 @@ impl Remap {
     }
 
     fn key_down(&mut self, time: u32, key: u32) -> Vec<Event> {
-        if self.fired == Some(key) {
+        if self.fired.contains(&key) {
             // auto-repeat of a chord trigger: the tap already happened
             return Vec::new();
         }
@@ -93,10 +94,15 @@ impl Remap {
             if !self.held.contains(&key) {
                 self.held.push(key);
             }
+            // A previous chord force-released the modifiers the user is still
+            // holding; announce them again, otherwise the peer sees this
+            // modifier on its own and every following key unmodified.
+            let mut out = reannounce(&self.held, &mut self.peer_down, Some(key));
             if !self.peer_down.contains(&key) {
                 self.peer_down.push(key);
             }
-            return vec![key_event(time, key, 1)];
+            out.push(key_event(time, key, 1));
+            return out;
         }
 
         let mut candidate: HashSet<u32> = self.held.iter().copied().collect();
@@ -105,28 +111,21 @@ impl Remap {
         if let Some(rule) = self.rules.iter().find(|r| r.from == candidate) {
             let to = rule.to.clone();
             log::info!("chord fired: {candidate:?} -> {to:?}");
-            self.fired = Some(key);
+            self.fired.insert(key);
             let mut out = self.release_peer_mods();
             out.extend(tap(&to));
             return out;
         }
 
-        let mut out = Vec::new();
         // A previous chord force-released the modifiers the user is still
         // holding; announce them again so this key is modified as expected.
-        if self.peer_down.is_empty() && !self.held.is_empty() {
-            for &key in &self.held {
-                out.push(key_event(0, key, 1));
-            }
-            self.peer_down.clone_from(&self.held);
-        }
+        let mut out = reannounce(&self.held, &mut self.peer_down, None);
         out.push(key_event(time, key, 1));
         out
     }
 
     fn key_up(&mut self, time: u32, key: u32) -> Vec<Event> {
-        if self.fired == Some(key) {
-            self.fired = None;
+        if self.fired.remove(&key) {
             return Vec::new();
         }
         if is_modifier(key) {
@@ -146,7 +145,7 @@ impl Remap {
     pub(crate) fn reset(&mut self) {
         self.held.clear();
         self.peer_down.clear();
-        self.fired = None;
+        self.fired.clear();
     }
 
     /// Release the modifiers the peer believes are held.
@@ -163,6 +162,19 @@ impl Remap {
 
 fn key_event(time: u32, key: u32, state: u8) -> Event {
     Event::Keyboard(KeyboardEvent::Key { time, key, state })
+}
+
+/// push `down` events for every key the peer does not believe is held yet
+fn reannounce(down: &[u32], peer_down: &mut Vec<u32>, skip: Option<u32>) -> Vec<Event> {
+    let mut out = Vec::new();
+    for &key in down {
+        if Some(key) == skip || peer_down.contains(&key) {
+            continue;
+        }
+        peer_down.push(key);
+        out.push(key_event(0, key, 1));
+    }
+    out
 }
 
 fn is_modifier(key: u32) -> bool {
@@ -358,6 +370,61 @@ mod tests {
         let mut remap = Remap::new(vec![]);
         let events = vec![key(KeyLeftShift, 1), key(KeyS, 1), key(KeyS, 0)];
         assert_eq!(run(&mut remap, events.clone()), events);
+    }
+
+    /// A modifier pressed after a chord fired has to re-announce the
+    /// modifiers the user still holds, otherwise the peer sees it alone.
+    #[test]
+    fn modifier_pressed_after_chord_reannounces_held_modifiers() {
+        let mut remap = Remap::new(vec![Rule {
+            from: vec![KeyLeftShift as u32, KeyLeftAlt as u32, KeyS as u32],
+            to: vec![KeyS as u32],
+        }]);
+        run(
+            &mut remap,
+            vec![key(KeyLeftShift, 1), key(KeyLeftAlt, 1), key(KeyS, 1)],
+        );
+        // Shift+Alt are still physically held
+        assert_eq!(
+            run(&mut remap, vec![key(KeyLeftMeta, 1)]),
+            vec![
+                key(KeyLeftShift, 1),
+                key(KeyLeftAlt, 1),
+                key(KeyLeftMeta, 1)
+            ]
+        );
+        // ...so the next key is modified by all three
+        assert_eq!(
+            run(&mut remap, vec![key(KeyA, 1)]),
+            vec![key(KeyA, 1)],
+            "modifiers are already announced, only the key itself is new"
+        );
+    }
+
+    /// A second chord must not un-swallow the auto-repeat of the first
+    /// trigger while it is still held.
+    #[test]
+    fn second_chord_keeps_first_trigger_swallowed() {
+        let mut remap = Remap::new(vec![
+            Rule {
+                from: vec![KeyLeftShift as u32, KeyLeftAlt as u32, KeyS as u32],
+                to: vec![KeyS as u32],
+            },
+            Rule {
+                from: vec![KeyLeftShift as u32, KeyLeftAlt as u32, KeyD as u32],
+                to: vec![KeyD as u32],
+            },
+        ]);
+        run(
+            &mut remap,
+            vec![key(KeyLeftShift, 1), key(KeyLeftAlt, 1), key(KeyS, 1)],
+        );
+        run(&mut remap, vec![key(KeyD, 1)]);
+        // auto-repeat of S (still held) must stay swallowed
+        assert_eq!(run(&mut remap, vec![key(KeyS, 1)]), vec![]);
+        assert_eq!(run(&mut remap, vec![key(KeyD, 1)]), vec![]);
+        // releasing both triggers emits nothing
+        assert_eq!(run(&mut remap, vec![key(KeyS, 0), key(KeyD, 0)]), vec![]);
     }
 
     #[test]

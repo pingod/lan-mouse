@@ -66,7 +66,8 @@ impl Display for PointerEvent {
                 if let Some(button) = str {
                     write!(f, "button({button}, {state})")
                 } else {
-                    write!(f, "button({button}, {state}")
+                    // the unknown button is printed instead of a name
+                    write!(f, "button({button}, {state})")
                 }
             }
             PointerEvent::Axis {

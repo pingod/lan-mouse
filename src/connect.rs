@@ -95,11 +95,10 @@ async fn connect_any(
     loop {
         match joinset.join_next().await {
             None => return Err(LanMouseConnectionError::NotConnected),
-            Some(r) => match r.expect("join error") {
-                Ok(conn) => return Ok(conn),
-                Err((a, e)) => {
-                    log::warn!("failed to connect to {a}: `{e}`")
-                }
+            Some(r) => match r {
+                Ok(Ok(conn)) => return Ok(conn),
+                Ok(Err((a, e))) => log::warn!("failed to connect to {a}: `{e}`"),
+                Err(e) => log::warn!("connection task failed: {e}"),
             },
         };
     }
@@ -230,6 +229,10 @@ impl LanMouseConnection {
                             &self.recv_tx,
                         )
                         .await;
+                        // Report the failure: the caller must release the
+                        // capture session, otherwise input stays captured
+                        // for a peer that can no longer receive it.
+                        return Err(e.into());
                     }
                 }
                 log::trace!("{event} >->->->->- {addr}");
@@ -456,7 +459,12 @@ async fn receive_loop(
                             let _ = tx.send((handle, ProtoEvent::PeerInfo(info)));
                         }
                     }
-                    event => tx.send((handle, event)).expect("channel closed"),
+                    event => {
+                        if tx.send((handle, event)).is_err() {
+                            log::debug!("{addr}: event channel closed");
+                            break;
+                        }
+                    }
                 }
             }
             // Skip undecodable datagrams without dropping the
@@ -465,6 +473,8 @@ async fn receive_loop(
             // peers that send event types we don't yet know about.
             Err(e) => log::debug!("ignoring undecodable event from {addr}: {e}"),
         }
+        // a short datagram leaves stale bytes from the previous message behind
+        buf.fill(0);
     }
     log::warn!("recv error");
     disconnect(&client_manager, handle, addr, &conns, &tx).await;

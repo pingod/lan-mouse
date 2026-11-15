@@ -56,7 +56,13 @@ impl ClientRow {
         // bind hostname to title
         let title_binding = client_object
             .bind_property("hostname", self, "title")
-            .transform_to(|_, v: Option<String>| v.or(Some("<span font_style=\"italic\" font_weight=\"light\" foreground=\"darkgrey\">no hostname!</span>".to_string())))
+            .transform_to(|_, v: Option<String>| {
+                /* The expander row renders its title as plain text (it is not
+                 * created with `use-markup`), so Pango markup would show up
+                 * verbatim. Use a plain placeholder instead.
+                 */
+                v.or(Some("no hostname!".to_string()))
+            })
             .sync_create()
             .build();
 
@@ -73,11 +79,34 @@ impl ClientRow {
             .sync_create()
             .build();
 
-        // bind port to subtitle
-        let subtitle_binding = client_object
-            .bind_property("port", self, "subtitle")
-            .sync_create()
-            .build();
+        /* The subtitle shows both the port and the peer version status. A
+         * single property binding can only mirror one of the two sources, and
+         * binding the port here meant that every `refresh_version_status()`
+         * (or a later port change) overwrote the other one. Compose it in
+         * `refresh_version_status()` and re-render on both changes instead.
+         */
+        let subtitle_handlers = [
+            client_object.connect_notify_local(
+                Some("port"),
+                glib::clone!(
+                    #[weak(rename_to = row)]
+                    self,
+                    move |_, _| row.refresh_version_status()
+                ),
+            ),
+            client_object.connect_notify_local(
+                Some("peer-commit"),
+                glib::clone!(
+                    #[weak(rename_to = row)]
+                    self,
+                    move |_, _| row.refresh_version_status()
+                ),
+            ),
+        ];
+        self.imp()
+            .subtitle_handlers
+            .borrow_mut()
+            .extend(subtitle_handlers);
 
         // bind position to selected position
         let position_binding = client_object
@@ -119,7 +148,6 @@ impl ClientRow {
         bindings.push(hostname_binding);
         bindings.push(title_binding);
         bindings.push(port_binding);
-        bindings.push(subtitle_binding);
         bindings.push(position_binding);
         bindings.push(resolve_binding);
         bindings.push(ip_binding);
@@ -134,6 +162,12 @@ impl ClientRow {
     pub fn unbind(&self) {
         for binding in self.imp().bindings.borrow_mut().drain(..) {
             binding.unbind();
+        }
+        let client_object = self.imp().client_object.borrow().clone();
+        if let Some(client_object) = client_object {
+            for handler in self.imp().subtitle_handlers.borrow_mut().drain(..) {
+                client_object.disconnect(handler);
+            }
         }
     }
 
@@ -260,21 +294,22 @@ impl ClientRow {
     /// `set_dns_state` handler so the two indicators don't fight
     /// for the same CSS class.
     pub fn refresh_version_status(&self) {
-        let peer: Option<String> = self
-            .imp()
-            .client_object
-            .borrow()
+        /* Clone the object out of the RefCell: `set_subtitle()` below notifies
+         * handlers that borrow it again.
+         */
+        let client_object = self.imp().client_object.borrow().clone();
+        let peer: Option<String> = client_object
             .as_ref()
             .and_then(|co| co.property::<Option<String>>("peer-commit"));
+        let port: u32 = client_object
+            .as_ref()
+            .map(|co| co.property::<u32>("port"))
+            .unwrap_or(DEFAULT_PORT as u32);
         let local = crate::local_commit_str();
-        let markup = match peer.as_deref() {
-            None => format!("Peer version: unknown · Ours: {local}"),
-            Some(p) if p == local.as_str() => {
-                format!("Peer version: {p} · matched")
-            }
-            Some(p) => {
-                format!("Peer version: {p} · Ours: {local}")
-            }
+        let status = match peer.as_deref() {
+            None => "peer version: unknown".to_string(),
+            Some(p) if p == local.as_str() => format!("peer version: {p} · matched"),
+            Some(p) => format!("peer version: {p} · ours: {local}"),
         };
         self.remove_css_class("peer-mismatch");
         self.remove_css_class("peer-match");
@@ -284,6 +319,9 @@ impl ClientRow {
             Some(_) => self.add_css_class("peer-mismatch"),
             None => self.add_css_class("peer-unknown"),
         };
-        self.set_subtitle(&markup);
+        /* plain text: the peer-* CSS classes do the coloring, markup would be
+         * rendered verbatim by the expander row.
+         */
+        self.set_subtitle(&format!("{port} · {status}"));
     }
 }

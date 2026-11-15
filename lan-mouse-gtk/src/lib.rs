@@ -22,7 +22,7 @@ pub fn exit_non_zero_for_relaunch() -> bool {
 mod macos_status_item;
 mod window;
 
-use std::{env, process, str, sync::OnceLock};
+use std::{env, str, sync::OnceLock, time::Duration};
 
 use gtk::CssProvider;
 use window::Window;
@@ -55,11 +55,23 @@ use self::key_object::KeyObject;
 
 use thiserror::Error;
 
+/// how often to retry connecting to the daemon socket while it is starting up
+const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+/// how many times to retry before giving up (500 * 100ms = 50s of patience)
+const CONNECT_ATTEMPTS: usize = 500;
+
 #[derive(Error, Debug)]
 pub enum GtkError {
     #[error("gtk frontend exited with non zero exit code: {0}")]
     NonZeroExitCode(i32),
+    #[error("could not connect to the lan-mouse daemon: {0}")]
+    DaemonUnavailable(String),
 }
+
+/// Set when the frontend has to quit because of a startup error. The GTK main
+/// loop only returns an [`glib::ExitCode`], so the reason is stashed here and
+/// turned into a [`GtkError`] by [`run`].
+static STARTUP_ERROR: OnceLock<String> = OnceLock::new();
 
 pub fn run(local_commit: [u8; 8]) -> Result<(), GtkError> {
     log::debug!("running gtk frontend");
@@ -77,6 +89,10 @@ pub fn run(local_commit: [u8; 8]) -> Result<(), GtkError> {
         .unwrap();
     #[cfg(not(windows))]
     let ret = gtk_main();
+
+    if let Some(e) = STARTUP_ERROR.get() {
+        return Err(GtkError::DaemonUnavailable(e.clone()));
+    }
 
     match ret {
         glib::ExitCode::SUCCESS => Ok(()),
@@ -226,24 +242,40 @@ fn build_ui(app: &Application) {
     let (mut frontend_rx, frontend_tx) = match lan_mouse_ipc::try_connect() {
         Ok(conn) => conn,
         Err(e) => {
-            log::warn!("could not connect to daemon ({e}), spawning a new one");
-            if let Err(spawn_err) = process::Command::new(
-                env::current_exe().expect("could not determine executable path"),
-            )
-            .args(env::args().skip(1))
-            .arg("daemon")
-            .spawn()
-            {
-                log::error!("failed to spawn daemon: {spawn_err}");
-                process::exit(1);
-            }
-            match lan_mouse_ipc::connect() {
-                Ok(conn) => conn,
-                Err(e) => {
-                    log::error!("{e}");
-                    process::exit(1);
+            /* The caller already started the daemon as a child process, so do
+             * not spawn a second one here: both would race for the same
+             * socket. Wait for the daemon to come up instead — but bail out
+             * after a while, because `lan_mouse_ipc::connect` retries
+             * forever and this runs on the GTK main thread (the GUI would
+             * hang with no window at all if the daemon cannot start).
+             */
+            log::warn!("could not connect to daemon ({e}), waiting for it to start");
+            let mut connected = None;
+            for attempt in 0..CONNECT_ATTEMPTS {
+                std::thread::sleep(CONNECT_RETRY_INTERVAL);
+                match lan_mouse_ipc::try_connect() {
+                    Ok(conn) => {
+                        connected = Some(conn);
+                        break;
+                    }
+                    Err(e) => log::debug!("still not connected (attempt {attempt}): {e}"),
                 }
             }
+            let Some(conn) = connected else {
+                let msg = format!(
+                    "no answer from the daemon after {}s",
+                    (CONNECT_ATTEMPTS as f32 * CONNECT_RETRY_INTERVAL.as_secs_f32()) as u32
+                );
+                log::error!("could not connect to the lan-mouse daemon: {msg}");
+                /* Quit through the application instead of `process::exit`:
+                 * the caller spawned the daemon and terminates it once the
+                 * GTK loop returns, so exiting here would orphan it.
+                 */
+                let _ = STARTUP_ERROR.set(msg);
+                app.quit();
+                return;
+            };
+            conn
         }
     };
     log::debug!("connected to lan-mouse-socket");
@@ -253,7 +285,12 @@ fn build_ui(app: &Application) {
     gio::spawn_blocking(move || {
         while let Some(e) = frontend_rx.next_event() {
             match e {
-                Ok(e) => sender.send_blocking(e).unwrap(),
+                // the receiver is gone once the window is closed
+                Ok(e) => {
+                    if sender.send_blocking(e).is_err() {
+                        break;
+                    }
+                }
                 Err(e) => {
                     log::error!("{e}");
                     break;
@@ -305,9 +342,22 @@ fn build_ui(app: &Application) {
     glib::spawn_future_local(clone!(
         #[weak]
         window,
+        #[weak]
+        app,
         async move {
             loop {
-                let notify = receiver.recv().await.unwrap_or_else(|_| process::exit(1));
+                let Ok(notify) = receiver.recv().await else {
+                    /* The daemon connection is gone (the reader thread ended).
+                     * Quit through the application so the main loop returns and
+                     * the caller can clean up the daemon it spawned. Closing the
+                     * window is not enough on macOS, where the close-request
+                     * handler only hides it.
+                     */
+                    log::error!("lost connection to the lan-mouse daemon");
+                    let _ = STARTUP_ERROR.set("the connection to the daemon was lost".to_owned());
+                    app.quit();
+                    return;
+                };
                 match notify {
                     FrontendEvent::Created(handle, client, state) => {
                         window.new_client(handle, client, state)

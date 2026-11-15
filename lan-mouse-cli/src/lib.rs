@@ -5,8 +5,8 @@ use std::{net::IpAddr, time::Duration};
 use thiserror::Error;
 
 use lan_mouse_ipc::{
-    ClientHandle, ConnectionError, FrontendEvent, FrontendRequest, IpcError, Position,
-    connect_async,
+    AsyncFrontendEventReader, AsyncFrontendRequestWriter, ClientHandle, ConnectionError,
+    FrontendEvent, FrontendRequest, IpcError, Position, connect_async,
 };
 
 #[derive(Debug, Error)]
@@ -16,6 +16,15 @@ pub enum CliError {
     ServiceNotRunning(#[from] ConnectionError),
     #[error("error communicating with service: {0}")]
     Ipc(#[from] IpcError),
+    /// the service reported an error
+    #[error("service error: {0}")]
+    Service(String),
+    /// the service does not know the given client
+    #[error("no such client: {0}")]
+    NoSuchClient(ClientHandle),
+    /// the service closed the connection before it answered
+    #[error("the service closed the connection before answering")]
+    ConnectionClosed,
 }
 
 #[derive(Parser, Clone, Debug, PartialEq, Eq)]
@@ -118,71 +127,109 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             leave_hook,
         }) => {
             tx.request(FrontendRequest::Create).await?;
-            while let Some(e) = rx.next().await {
-                if let FrontendEvent::Created(handle, _, _) = e? {
-                    if let Some(hostname) = hostname {
-                        tx.request(FrontendRequest::UpdateHostname(handle, Some(hostname)))
-                            .await?;
+            loop {
+                let event = rx.next().await.ok_or(CliError::ConnectionClosed)??;
+                match event {
+                    FrontendEvent::Created(handle, _, _) => {
+                        if let Some(hostname) = hostname {
+                            tx.request(FrontendRequest::UpdateHostname(handle, Some(hostname)))
+                                .await?;
+                        }
+                        if let Some(port) = port {
+                            tx.request(FrontendRequest::UpdatePort(handle, port))
+                                .await?;
+                        }
+                        if let Some(ips) = ips {
+                            tx.request(FrontendRequest::UpdateFixIps(handle, ips))
+                                .await?;
+                        }
+                        if let Some(enter_hook) = enter_hook {
+                            tx.request(FrontendRequest::UpdateEnterHook(handle, Some(enter_hook)))
+                                .await?;
+                        }
+                        if let Some(leave_hook) = leave_hook {
+                            tx.request(FrontendRequest::UpdateLeaveHook(handle, Some(leave_hook)))
+                                .await?;
+                        }
+                        break;
                     }
-                    if let Some(port) = port {
-                        tx.request(FrontendRequest::UpdatePort(handle, port))
-                            .await?;
+                    FrontendEvent::Error(msg) => return Err(CliError::Service(msg)),
+                    FrontendEvent::NoSuchClient(handle) => {
+                        return Err(CliError::NoSuchClient(handle));
                     }
-                    if let Some(ips) = ips {
-                        tx.request(FrontendRequest::UpdateFixIps(handle, ips))
-                            .await?;
-                    }
-                    if let Some(enter_hook) = enter_hook {
-                        tx.request(FrontendRequest::UpdateEnterHook(handle, Some(enter_hook)))
-                            .await?;
-                    }
-                    if let Some(leave_hook) = leave_hook {
-                        tx.request(FrontendRequest::UpdateLeaveHook(handle, Some(leave_hook)))
-                            .await?;
-                    }
-                    break;
+                    // ignore unrelated events while waiting for the client
+                    _ => {}
                 }
             }
         }
-        CliSubcommand::RemoveClient { id } => tx.request(FrontendRequest::Delete(id)).await?,
-        CliSubcommand::Activate { id } => tx.request(FrontendRequest::Activate(id, true)).await?,
+        CliSubcommand::RemoveClient { id } => {
+            tx.request(FrontendRequest::Delete(id)).await?;
+            loop {
+                match rx.next().await.ok_or(CliError::ConnectionClosed)?? {
+                    FrontendEvent::Deleted(handle) if handle == id => break,
+                    FrontendEvent::NoSuchClient(handle) if handle == id => {
+                        return Err(CliError::NoSuchClient(handle));
+                    }
+                    FrontendEvent::Error(msg) => return Err(CliError::Service(msg)),
+                    _ => {}
+                }
+            }
+        }
+        CliSubcommand::Activate { id } => {
+            ensure_client_exists(&mut rx, &mut tx, id).await?;
+            tx.request(FrontendRequest::Activate(id, true)).await?
+        }
         CliSubcommand::Deactivate { id } => {
+            ensure_client_exists(&mut rx, &mut tx, id).await?;
             tx.request(FrontendRequest::Activate(id, false)).await?
         }
         CliSubcommand::List => {
             tx.request(FrontendRequest::Enumerate()).await?;
-            while let Some(e) = rx.next().await {
-                if let FrontendEvent::Enumerate(clients) = e? {
-                    for (handle, config, state) in clients {
-                        let host = config.hostname.unwrap_or("unknown".to_owned());
-                        let port = config.port;
-                        let pos = config.pos;
-                        let active = state.active;
-                        let ips = state.ips;
-                        let health = match (state.connected, state.rtt_ms) {
-                            (true, Some(rtt)) => format!("connected, rtt {rtt} ms"),
-                            (true, None) => "connected".to_owned(),
-                            (false, _) => "not connected".to_owned(),
-                        };
-                        println!(
-                            "id {handle}: {host}:{port} ({pos}) active: {active}, {health}, ips: {ips:?}"
-                        );
+            loop {
+                let event = rx.next().await.ok_or(CliError::ConnectionClosed)??;
+                match event {
+                    FrontendEvent::Error(msg) => return Err(CliError::Service(msg)),
+                    FrontendEvent::NoSuchClient(handle) => {
+                        return Err(CliError::NoSuchClient(handle));
                     }
-                    break;
+                    FrontendEvent::Enumerate(clients) => {
+                        for (handle, config, state) in clients {
+                            let host = config.hostname.unwrap_or("unknown".to_owned());
+                            let port = config.port;
+                            let pos = config.pos;
+                            let active = state.active;
+                            let ips = state.ips;
+                            let health = match (state.connected, state.rtt_ms) {
+                                (true, Some(rtt)) => format!("connected, rtt {rtt} ms"),
+                                (true, None) => "connected".to_owned(),
+                                (false, _) => "not connected".to_owned(),
+                            };
+                            println!(
+                                "id {handle}: {host}:{port} ({pos}) active: {active}, {health}, ips: {ips:?}"
+                            );
+                        }
+                        break;
+                    }
+                    // ignore unrelated events while waiting for the list
+                    _ => {}
                 }
             }
         }
         CliSubcommand::SetHost { id, host } => {
+            ensure_client_exists(&mut rx, &mut tx, id).await?;
             tx.request(FrontendRequest::UpdateHostname(id, host))
                 .await?
         }
         CliSubcommand::SetPort { id, port } => {
+            ensure_client_exists(&mut rx, &mut tx, id).await?;
             tx.request(FrontendRequest::UpdatePort(id, port)).await?
         }
         CliSubcommand::SetPosition { id, pos } => {
+            ensure_client_exists(&mut rx, &mut tx, id).await?;
             tx.request(FrontendRequest::UpdatePosition(id, pos)).await?
         }
         CliSubcommand::SetIps { id, ips } => {
+            ensure_client_exists(&mut rx, &mut tx, id).await?;
             tx.request(FrontendRequest::UpdateFixIps(id, ips)).await?
         }
         CliSubcommand::EnableCapture => tx.request(FrontendRequest::EnableCapture).await?,
@@ -314,4 +361,31 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+/// Make sure the daemon knows the given client before sending a request for it.
+///
+/// The one-shot commands used to exit successfully even for unknown client
+/// handles because the daemon silently ignores requests for clients that do
+/// not exist. `Enumerate` returns the authoritative snapshot, so a missing
+/// handle can be reported as an error.
+async fn ensure_client_exists(
+    rx: &mut AsyncFrontendEventReader,
+    tx: &mut AsyncFrontendRequestWriter,
+    id: ClientHandle,
+) -> Result<(), CliError> {
+    tx.request(FrontendRequest::Enumerate()).await?;
+    loop {
+        match rx.next().await.ok_or(CliError::ConnectionClosed)?? {
+            FrontendEvent::Error(msg) => return Err(CliError::Service(msg)),
+            FrontendEvent::Enumerate(clients) => {
+                if clients.iter().any(|(handle, _, _)| *handle == id) {
+                    return Ok(());
+                }
+                return Err(CliError::NoSuchClient(id));
+            }
+            // unrelated notifications may arrive while waiting
+            _ => {}
+        }
+    }
 }

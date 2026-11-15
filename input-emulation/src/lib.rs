@@ -194,14 +194,56 @@ impl InputEmulation {
             }
         }
 
+        /* Send the modifier state that is actually still held: blindly
+         * zeroing the modifiers would also release keys that are still held
+         * by another client, since the emulation backends share a single
+         * keyboard.
+         */
+        let (depressed, locked) = self.pressed_modifier_masks();
         let event = Event::Keyboard(KeyboardEvent::Modifiers {
-            depressed: 0,
+            depressed,
             latched: 0,
-            locked: 0,
+            locked,
             group: 0,
         });
         self.emulation.consume(event, handle).await?;
         Ok(())
+    }
+
+    /// compute the modifier masks (X11 convention) of every key that is
+    /// currently held by any client
+    fn pressed_modifier_masks(&self) -> (u32, u32) {
+        // X11 modifier masks
+        const SHIFT: u32 = 1 << 0;
+        const LOCK: u32 = 1 << 1;
+        const CONTROL: u32 = 1 << 2;
+        const MOD1: u32 = 1 << 3;
+        const MOD2: u32 = 1 << 4;
+        const MOD3: u32 = 1 << 5;
+        const MOD4: u32 = 1 << 6;
+
+        let mut depressed = 0;
+        let mut locked = 0;
+        for key in self.pressed_keys.values().flatten() {
+            let Ok(key) = input_event::scancode::Linux::try_from(*key) else {
+                continue;
+            };
+            match key {
+                input_event::scancode::Linux::KeyLeftShift
+                | input_event::scancode::Linux::KeyRightShift => depressed |= SHIFT,
+                input_event::scancode::Linux::KeyLeftCtrl
+                | input_event::scancode::Linux::KeyRightCtrl => depressed |= CONTROL,
+                input_event::scancode::Linux::KeyLeftAlt
+                | input_event::scancode::Linux::KeyRightalt => depressed |= MOD1,
+                input_event::scancode::Linux::KeyLeftMeta
+                | input_event::scancode::Linux::KeyRightmeta => depressed |= MOD4,
+                input_event::scancode::Linux::KeyCapsLock => locked |= LOCK,
+                input_event::scancode::Linux::KeyNumlock => locked |= MOD2,
+                input_event::scancode::Linux::KeyScrollLock => locked |= MOD3,
+                _ => {}
+            }
+        }
+        (depressed, locked)
     }
 
     pub fn has_pressed_keys(&self, handle: EmulationHandle) -> bool {

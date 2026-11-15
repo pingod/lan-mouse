@@ -6,8 +6,8 @@ use bitflags::bitflags;
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use wayland_client::WEnum;
 use wayland_client::backend::WaylandError;
 
@@ -37,6 +37,10 @@ use super::error::WaylandBindError;
 
 struct State {
     keymap: Option<(u32, OwnedFd, u32)>,
+    /// whether the seat already reported its capabilities
+    capabilities_known: bool,
+    /// whether the seat advertised a keyboard (and thus a keymap)
+    keyboard_available: bool,
     /// shared by all clients, so the keymap fd is sent once instead of once per client
     keyboard: Option<Vk>,
     input_for_client: HashMap<EmulationHandle, VirtualInput>,
@@ -76,6 +80,8 @@ impl WlrootsEmulation {
             last_flush_failed: false,
             state: State {
                 keymap: None,
+                capabilities_known: false,
+                keyboard_available: false,
                 keyboard: None,
                 input_for_client,
                 seat,
@@ -85,8 +91,35 @@ impl WlrootsEmulation {
             },
             queue,
         };
-        while emulate.state.keymap.is_none() {
+        /* The compositor answers the bind requests promptly, but a compositor
+         * that never sends a keymap (e.g. a seat without keyboard capability)
+         * used to hang the whole startup in an unconditional busy wait.
+         */
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !emulate.state.capabilities_known {
+            if Instant::now() > deadline {
+                return Err(WlrootsEmulationCreationError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for the seat capabilities",
+                )));
+            }
             emulate.queue.blocking_dispatch(&mut emulate.state)?;
+        }
+
+        if emulate.state.keyboard_available {
+            while emulate.state.keymap.is_none() {
+                if Instant::now() > deadline {
+                    return Err(WlrootsEmulationCreationError::Io(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for the keyboard keymap",
+                    )));
+                }
+                emulate.queue.blocking_dispatch(&mut emulate.state)?;
+            }
+        } else {
+            log::warn!(
+                "the seat does not advertise a keyboard: key events can not be emulated yet"
+            );
         }
         // let fd = unsafe { &File::from_raw_fd(emulate.state.keymap.unwrap().1.as_raw_fd()) };
         // let mmap = unsafe { MmapOptions::new().map_copy(fd).unwrap() };
@@ -102,11 +135,12 @@ impl State {
         let keyboard = match self.keyboard.as_ref() {
             Some(keyboard) => keyboard.clone(),
             None => {
-                let keyboard: Vk = self.vkm.create_virtual_keyboard(&self.seat, &self.qh, ());
                 // TODO: use server side keymap
                 let Some((format, fd, size)) = self.keymap.as_ref() else {
-                    panic!("no keymap");
+                    log::error!("cannot create virtual keyboard: no keymap available");
+                    return;
                 };
+                let keyboard: Vk = self.vkm.create_virtual_keyboard(&self.seat, &self.qh, ());
                 keyboard.keymap(*format, fd.as_fd(), *size);
                 self.keyboard = Some(keyboard.clone());
                 keyboard
@@ -149,20 +183,26 @@ impl Emulation for WlrootsEmulation {
                         log::warn!("can't keep up, discarding event: ({handle}) - {event:?}");
                         return Ok(());
                     }
-                    _ => {}
+                    Ok(()) => self.last_flush_failed = false,
+                    // do not swallow real errors here: the connection may be
+                    // gone and the caller has to tear the backend down
+                    Err(e) => {
+                        log::error!("failed to flush wayland connection: {e}");
+                        return Err(e.into());
+                    }
                 }
             }
-            virtual_input
-                .consume_event(event)
-                .unwrap_or_else(|_| panic!("failed to convert event: {event:?}"));
+            virtual_input.consume_event(event)?;
             match self.queue.flush() {
                 Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
                     self.last_flush_failed = true;
                     log::warn!("can't keep up, discarding event: ({handle}) - {event:?}");
                 }
-                Err(WaylandError::Protocol(e)) => panic!("wayland protocol violation: {e}"),
                 Ok(()) => self.last_flush_failed = false,
-                Err(e) => Err(e)?,
+                Err(e) => {
+                    log::error!("failed to flush wayland connection: {e}");
+                    return Err(e.into());
+                }
             }
         }
         Ok(())
@@ -192,34 +232,54 @@ struct VirtualInput {
 }
 
 impl VirtualInput {
-    fn consume_event(&self, event: Event) -> Result<(), ()> {
-        // the peer's timestamps use its own clock and unit (libei sends microseconds,
-        // windows and macos send 0); clients compare them to detect double clicks
-        let now: u32 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u32;
+    fn consume_event(&self, event: Event) -> Result<(), EmulationError> {
+        /* The peer's timestamps use its own clock and unit (libei sends
+         * microseconds, windows and macos send 0), so they are useless here.
+         * Clients compare the timestamps to detect double clicks, so a
+         * monotonic millisecond clock fits much better than the wall clock
+         * (which jumps on NTP updates and wraps every 49.7 days).
+         */
+        static START: OnceLock<Instant> = OnceLock::new();
+        let now: u32 = START
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u32::MAX);
 
         match event {
             Event::Pointer(e) => {
                 match e {
                     PointerEvent::Motion { dx, dy, .. } => self.pointer.motion(now, dx, dy),
                     PointerEvent::Button { button, state, .. } => {
-                        let state: ButtonState = state.try_into()?;
+                        // the event comes from the network, so the state can be
+                        // garbage instead of 0/1/2
+                        let Ok(state): Result<ButtonState, _> = state.try_into() else {
+                            log::warn!("invalid button state: {state}");
+                            return Ok(());
+                        };
                         self.pointer.button(now, button, state);
                     }
                     PointerEvent::Axis { axis, value, .. } => {
-                        let axis: Axis = (axis as u32).try_into()?;
+                        let Ok(axis): Result<Axis, _> = (axis as u32).try_into() else {
+                            log::warn!("invalid axis: {axis}");
+                            return Ok(());
+                        };
                         self.pointer.axis(now, axis, value);
                         self.pointer.axis_source(AxisSource::Continuous);
-                        self.pointer.frame();
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
-                        let axis: Axis = (axis as u32).try_into()?;
-                        self.pointer
-                            .axis_discrete(now, axis, value as f64 / 8., value / 120);
+                        let Ok(axis): Result<Axis, _> = (axis as u32).try_into() else {
+                            log::warn!("invalid axis: {axis}");
+                            return Ok(());
+                        };
+                        // `axis_discrete` takes the scroll amount in units of
+                        // 120 (one wheel notch) and `axis` the same amount in
+                        // surface units (10 per notch)
+                        let notches = value as f64 / 120.;
+                        self.pointer.axis_discrete(now, axis, notches, value / 120);
+                        self.pointer.axis(now, axis, notches * 10.);
                         self.pointer.axis_source(AxisSource::Wheel);
-                        self.pointer.frame();
                     }
                 }
                 self.pointer.frame();
@@ -292,7 +352,7 @@ impl Dispatch<WlKeyboard, ()> for State {
 
 impl Dispatch<WlSeat, ()> for State {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         seat: &WlSeat,
         event: <WlSeat as wayland_client::Proxy>::Event,
         _: &(),
@@ -303,7 +363,9 @@ impl Dispatch<WlSeat, ()> for State {
             capabilities: WEnum::Value(capabilities),
         } = event
         {
-            if capabilities.contains(wl_seat::Capability::Keyboard) {
+            state.capabilities_known = true;
+            state.keyboard_available = capabilities.contains(wl_seat::Capability::Keyboard);
+            if state.keyboard_available {
                 seat.get_keyboard(qhandle, ());
             }
         }
@@ -365,11 +427,13 @@ impl XMods {
                 return false;
             }
             match state {
-                1 => self.insert(pressed_mask),
-                _ => {
-                    self.remove(pressed_mask);
+                1 => {
+                    self.insert(pressed_mask);
+                    // lock keys toggle when they go down, e.g. CapsLock must
+                    // already be locked for the character typed after it
                     self.toggle(locked_mask);
                 }
+                _ => self.remove(pressed_mask),
             }
             true
         } else {

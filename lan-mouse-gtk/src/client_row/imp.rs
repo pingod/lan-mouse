@@ -33,6 +33,8 @@ pub struct ClientRow {
     #[template_child]
     pub status_row: TemplateChild<ActionRow>,
     pub bindings: RefCell<Vec<Binding>>,
+    /// handlers of the notify signals that compose the subtitle
+    pub subtitle_handlers: RefCell<Vec<SignalHandlerId>>,
     hostname_change_handler: RefCell<Option<SignalHandlerId>>,
     port_change_handler: RefCell<Option<SignalHandlerId>>,
     position_change_handler: RefCell<Option<SignalHandlerId>>,
@@ -99,8 +101,17 @@ impl ObjectImpl for ClientRow {
             #[upgrade_or]
             glib::Propagation::Proceed,
             move |switch, state| {
-                row.handle_activate_switch(state, switch);
-                glib::Propagation::Proceed
+                /* The default handler of `state-set` would flip the switch
+                 * immediately. The switch state is bound to the client state
+                 * reported by the daemon instead, so the row must not show an
+                 * optimistic state that never gets re-synced when the request
+                 * is rejected.
+                 */
+                if row.handle_activate_switch(state, switch) {
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
             }
         ));
         self.set_state_handler.replace(Some(handler));
@@ -148,9 +159,14 @@ impl ClientRow {
     }
 
     fn handle_port_changed(&self, port_entry: &Entry) {
-        if let Ok(port) = port_entry.text().parse::<u16>() {
-            self.obj()
-                .emit_by_name::<()>("request-port-change", &[&(port as u32)]);
+        match port_entry.text().parse::<u16>() {
+            Ok(port) => {
+                self.obj()
+                    .emit_by_name::<()>("request-port-change", &[&(port as u32)]);
+            }
+            Err(_) => {
+                log::debug!("ignoring invalid port {:?}", port_entry.text());
+            }
         }
     }
 
@@ -167,53 +183,73 @@ impl ClientRow {
     pub(super) fn set_hostname(&self, hostname: Option<String>) {
         let position = self.hostname.position();
         let handler = self.hostname_change_handler.borrow();
-        let handler = handler.as_ref().expect("signal handler");
-        self.hostname.block_signal(handler);
-        self.client_object
-            .borrow_mut()
-            .as_mut()
-            .expect("client object")
-            .set_property("hostname", hostname);
-        self.hostname.unblock_signal(handler);
+        if let Some(handler) = handler.as_ref() {
+            self.hostname.block_signal(handler);
+        }
+        /* Clone the object out of the RefCell first: writing a property
+         * notifies handlers that borrow it again.
+         */
+        let client_object = self.client_object.borrow().clone();
+        if let Some(client_object) = client_object {
+            client_object.set_property("hostname", hostname);
+        }
+        if let Some(handler) = handler.as_ref() {
+            self.hostname.unblock_signal(handler);
+        }
         self.hostname.set_position(position);
     }
 
     pub(super) fn set_port(&self, port: u16) {
         let position = self.port.position();
         let handler = self.port_change_handler.borrow();
-        let handler = handler.as_ref().expect("signal handler");
-        self.port.block_signal(handler);
-        self.client_object
-            .borrow_mut()
-            .as_mut()
-            .expect("client object")
-            .set_port(port as u32);
-        self.port.unblock_signal(handler);
+        if let Some(handler) = handler.as_ref() {
+            self.port.block_signal(handler);
+        }
+        /* Clone the object out of the RefCell first: writing a property
+         * notifies handlers that borrow it again.
+         */
+        let client_object = self.client_object.borrow().clone();
+        if let Some(client_object) = client_object {
+            client_object.set_port(port as u32);
+        }
+        if let Some(handler) = handler.as_ref() {
+            self.port.unblock_signal(handler);
+        }
         self.port.set_position(position);
     }
 
     pub(super) fn set_pos(&self, pos: Position) {
         let handler = self.position_change_handler.borrow();
-        let handler = handler.as_ref().expect("signal handler");
-        self.position.block_signal(handler);
-        self.client_object
-            .borrow_mut()
-            .as_mut()
-            .expect("client object")
-            .set_position(pos.to_string());
-        self.position.unblock_signal(handler);
+        if let Some(handler) = handler.as_ref() {
+            self.position.block_signal(handler);
+        }
+        /* Clone the object out of the RefCell first: writing a property
+         * notifies handlers that borrow it again.
+         */
+        let client_object = self.client_object.borrow().clone();
+        if let Some(client_object) = client_object {
+            client_object.set_position(pos.to_string());
+        }
+        if let Some(handler) = handler.as_ref() {
+            self.position.unblock_signal(handler);
+        }
     }
 
     pub(super) fn set_active(&self, active: bool) {
         let handler = self.set_state_handler.borrow();
-        let handler = handler.as_ref().expect("signal handler");
-        self.enable_switch.block_signal(handler);
-        self.client_object
-            .borrow_mut()
-            .as_mut()
-            .expect("client object")
-            .set_active(active);
-        self.enable_switch.unblock_signal(handler);
+        if let Some(handler) = handler.as_ref() {
+            self.enable_switch.block_signal(handler);
+        }
+        /* Clone the object out of the RefCell first: writing a property
+         * notifies handlers that borrow it again.
+         */
+        let client_object = self.client_object.borrow().clone();
+        if let Some(client_object) = client_object {
+            client_object.set_active(active);
+        }
+        if let Some(handler) = handler.as_ref() {
+            self.enable_switch.unblock_signal(handler);
+        }
     }
 
     pub(super) fn set_dns_state(&self, resolved: bool) {

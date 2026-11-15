@@ -61,6 +61,26 @@ core-foundation = "0.10.0"
 core-foundation-sys = "0.8.6"
 core-graphics = { version = "0.25.0", features = ["highsierra"] }
 keycode = "1.0.0"
+# only needed for the system defined (media key) events, which cannot be
+# created through CoreGraphics alone (see `media_key_event` in macos.rs)
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSEvent",
+    "NSResponder",
+    "NSGraphicsContext",
+    "objc2-core-graphics",
+] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CGEvent",
+    "CGEventTypes",
+    "objc2",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSGeometry",
+] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61.2", features = [

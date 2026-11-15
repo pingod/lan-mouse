@@ -14,6 +14,7 @@ use std::{
     future::Future,
     io,
     process::{self, Child},
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::task::LocalSet;
@@ -100,7 +101,9 @@ fn run() -> Result<(), LanMouseError> {
                         unsafe {
                             libc::kill(pid, libc::SIGINT);
                         }
-                        service.wait()?;
+                        // ...but not forever: a wedged daemon must not keep the
+                        // frontend process (and the shell that started it) alive
+                        wait_for_exit(service, Duration::from_secs(2))?;
                     }
                     service.kill()?;
                 }
@@ -141,6 +144,21 @@ where
 
     // run async event loop
     Ok(runtime.block_on(LocalSet::new().run_until(f))?)
+}
+
+/// Wait until `child` exits or `timeout` elapses, polling instead of blocking.
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> Result<(), io::Error> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            log::warn!("the daemon did not exit within {timeout:?}, killing it");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn start_service() -> Result<Child, io::Error> {

@@ -47,6 +47,9 @@ pub enum ProtocolError {
     /// position type does not exist
     #[error("invalid event id: `{0}`")]
     InvalidPosition(#[from] TryFromPrimitiveError<Position>),
+    /// the datagram was shorter than the event it claims to encode
+    #[error("truncated event: needed {needed} more byte(s) than the {len} byte(s) that were sent")]
+    Truncated { needed: usize, len: usize },
 }
 
 /// Position of a client
@@ -351,6 +354,25 @@ impl TryFrom<&[u8]> for ProtoEvent {
     }
 }
 
+impl ProtoEvent {
+    /// Decode an event from a datagram of `buf.len()` bytes.
+    ///
+    /// Unlike [`TryFrom<[u8; MAX_EVENT_SIZE]>`] this never inspects trailing
+    /// zeroes of an oversized buffer and reports a truncated datagram instead
+    /// of panicking.
+    pub fn decode(buf: &[u8]) -> Result<Self, ProtocolError> {
+        Self::try_from(buf)
+    }
+}
+
+impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
+    type Error = ProtocolError;
+
+    fn try_from(buf: [u8; MAX_EVENT_SIZE]) -> Result<Self, Self::Error> {
+        Self::decode(&buf[..])
+    }
+}
+
 impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
     fn from(event: ProtoEvent) -> Self {
         let mut buf = [0u8; MAX_EVENT_SIZE];
@@ -441,7 +463,17 @@ macro_rules! decode_impl {
     ($t:ty) => {
         paste! {
             fn [<decode_ $t>](data: &mut &[u8]) -> Result<$t, ProtocolError> {
-                let (int_bytes, rest) = data.split_at(size_of::<$t>());
+                /* `split_at` panics when the datagram is shorter than the
+                 * event it claims to encode, which a peer can trigger with a
+                 * single short UDP payload. Report it as a protocol error
+                 * instead of aborting the process.
+                 */
+                let Some((int_bytes, rest)) = data.split_at_checked(size_of::<$t>()) else {
+                    return Err(ProtocolError::Truncated {
+                        needed: size_of::<$t>(),
+                        len: data.len(),
+                    });
+                };
                 *data = rest;
                 Ok($t::from_be_bytes(int_bytes.try_into().unwrap()))
             }

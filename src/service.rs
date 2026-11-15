@@ -226,8 +226,20 @@ impl Service {
                     }
                 }
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
-                event = self.emulation.event() => self.handle_emulation_event(event),
-                event = self.capture.event() => self.handle_capture_event(event),
+                event = self.emulation.event() => match event {
+                    Some(event) => self.handle_emulation_event(event),
+                    None => {
+                        log::error!("the emulation task exited, shutting down");
+                        break;
+                    }
+                },
+                event = self.capture.event() => match event {
+                    Some(event) => self.handle_capture_event(event),
+                    None => {
+                        log::error!("the capture task exited, shutting down");
+                        break;
+                    }
+                },
                 fire = self.hotkeys.next() => match fire {
                     crate::hotkey_task::HotkeyFire::Keys(keys) => {
                         self.hotkeys.send(crate::hotkey_task::HotkeyFire::Keys(keys), self.capture.is_active()).await
@@ -240,7 +252,13 @@ impl Service {
                         }
                     },
                 },
-                event = self.resolver.event() => self.handle_resolver_event(event),
+                event = self.resolver.event() => match event {
+                    Some(event) => self.handle_resolver_event(event),
+                    None => {
+                        log::error!("the dns resolver task exited, shutting down");
+                        break;
+                    }
+                },
                 _ = self.config.changed() => self.handle_config_change(),
                 _ = log_tick(&mut self.log_stream) => self.flush_log_stream(),
                 _ = runtime_tick.tick() => self.publish_runtime(),
@@ -250,7 +268,9 @@ impl Service {
                     self.should_exit = true;
                 }
                 r = signal::ctrl_c() => {
-                    r.expect("failed to wait for CTRL+C");
+                    if let Err(e) = r {
+                        log::error!("failed to wait for CTRL+C: {e}");
+                    }
                     break;
                 }
             }
@@ -473,10 +493,12 @@ impl Service {
                 self.save_config();
             }
             FrontendRequest::UpdateEnterHook(handle, enter_hook) => {
-                self.update_enter_hook(handle, enter_hook)
+                self.update_enter_hook(handle, enter_hook);
+                self.save_config();
             }
             FrontendRequest::UpdateLeaveHook(handle, leave_hook) => {
-                self.update_leave_hook(handle, leave_hook)
+                self.update_leave_hook(handle, leave_hook);
+                self.save_config();
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
             FrontendRequest::EnumerateHotkeys => self.notify_hotkeys(),
@@ -585,6 +607,7 @@ impl Service {
             })
             .collect();
         self.config.set_clients(clients);
+        self.config.set_port(self.port);
         let authorized_keys = self.authorized_keys.read().expect("lock").clone();
         self.config.set_authorized_keys(authorized_keys);
         if let Err(e) = self.config.write_back() {
@@ -599,7 +622,10 @@ impl Service {
         for c in self.config.clients() {
             let handle = self.client_manager.add_with_config(c);
             log::info!("added client {handle}");
-            let (c, s) = self.client_manager.get_state(handle).unwrap();
+            let Some((c, s)) = self.client_manager.get_state(handle) else {
+                log::warn!("client {handle} disappeared while applying the config");
+                continue;
+            };
             if s.active {
                 self.client_manager.deactivate_client(handle);
                 self.activate_client(handle);
@@ -615,6 +641,17 @@ impl Service {
             .write()
             .unwrap()
             .clone_from(&authorized_keys);
+        /* a port edited in the config file has to be applied right away,
+         * otherwise it silently differs from the port we are listening on
+         */
+        let port = self.config.port();
+        if port != self.port {
+            log::info!(
+                "config changed the listen port from {} to {port}",
+                self.port
+            );
+            self.emulation.request_port_change(port);
+        }
         self.sync_frontend();
     }
 
@@ -683,6 +720,8 @@ impl Service {
             EmulationEvent::PortChanged(port) => match port {
                 Ok(port) => {
                     self.port = port;
+                    /* otherwise the new port is gone after a restart */
+                    self.save_config();
                     self.notify_frontend(FrontendEvent::PortChanged(port, None));
                 }
                 Err(e) => self
@@ -887,12 +926,17 @@ impl Service {
     }
 
     fn update_incoming(&mut self, addr: SocketAddr, pos: Position, fingerprint: String) {
-        let incoming = self
+        let Some(incoming) = self
             .incoming_conn_info
-            .iter_mut()
-            .find(|(_, i)| i.addr == addr)
-            .map(|(_, i)| i)
-            .expect("no such client");
+            .values_mut()
+            .find(|i| i.addr == addr)
+        else {
+            // No entry for this address: the initial `Enter` was lost or the
+            // peer reconnected. Just register it instead of panicking.
+            log::debug!("update for unknown incoming connection {addr}, adding it");
+            self.add_incoming(addr, pos, fingerprint);
+            return;
+        };
         let mut changed = false;
         if incoming.fingerprint != fingerprint {
             incoming.fingerprint = fingerprint.clone();
@@ -1020,12 +1064,17 @@ impl Service {
     }
 
     fn remove_client(&mut self, handle: ClientHandle) {
-        if self
-            .client_manager
-            .remove_client(handle)
-            .map(|(_, s)| s.active)
-            .unwrap_or(false)
-        {
+        /* Only report `Deleted` for a client that actually existed: sending
+         * it unconditionally hid failed deletions from the frontend (the CLI
+         * waited for a confirmation that never distinguished success from a
+         * no-op).
+         */
+        let Some((_, state)) = self.client_manager.remove_client(handle) else {
+            log::warn!("cannot remove client {handle}: no such client");
+            self.notify_frontend(FrontendEvent::NoSuchClient(handle));
+            return;
+        };
+        if state.active {
             self.capture.destroy(handle);
         }
         self.notify_frontend(FrontendEvent::Deleted(handle));

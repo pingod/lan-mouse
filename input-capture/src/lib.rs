@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Display,
-    mem::swap,
     task::{Poll, ready},
 };
 
@@ -140,7 +139,14 @@ pub struct InputCapture {
 impl InputCapture {
     /// create a new client with the given id
     pub async fn create(&mut self, id: CaptureHandle, pos: Position) -> Result<(), CaptureError> {
-        assert!(!self.id_map.contains_key(&id));
+        /* The service only creates a handle once, but a duplicate must not
+         * abort the process (this crate is built with `panic = "abort"`):
+         * move the handle to its new position instead.
+         */
+        if self.id_map.contains_key(&id) {
+            log::warn!("capture handle {id} already exists, moving it to {pos}");
+            self.destroy(id).await?;
+        }
 
         self.id_map.insert(id, pos);
 
@@ -155,13 +161,19 @@ impl InputCapture {
 
     /// destroy the client with the given id, if it exists
     pub async fn destroy(&mut self, id: CaptureHandle) -> Result<(), CaptureError> {
-        let pos = self
-            .id_map
-            .remove(&id)
-            .expect("no position for this handle");
+        let Some(pos) = self.id_map.remove(&id) else {
+            log::debug!("capture handle {id} does not exist, nothing to destroy");
+            return Ok(());
+        };
+
+        // events that are still queued for this handle must not be delivered
+        self.pending.retain(|(handle, _)| *handle != id);
 
         log::debug!("destroying capture {id} @ {pos}");
-        let remaining = self.position_map.get_mut(&pos).expect("id vector");
+        let Some(remaining) = self.position_map.get_mut(&pos) else {
+            log::warn!("capture position {pos} has no handles, discarding it");
+            return Ok(());
+        };
         remaining.retain(|&i| i != id);
 
         log::debug!("remaining ids @ {pos}: {remaining:?}");
@@ -210,8 +222,12 @@ impl InputCapture {
     }
 
     /// check whether the given keys are pressed
+    ///
+    /// An empty `keys` slice means "no release bind configured" and never
+    /// matches: `[].iter().all(..)` is vacuously true, which would otherwise
+    /// release the capture on every single event.
     pub fn keys_pressed(&self, keys: &[scancode::Linux]) -> bool {
-        keys.iter().all(|k| self.pressed_keys.contains(k))
+        !keys.is_empty() && keys.iter().all(|k| self.pressed_keys.contains(k))
     }
 
     fn update_pressed_keys(&mut self, key: u32, state: u8) {
@@ -232,54 +248,51 @@ impl Stream for InputCapture {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        if let Some(e) = self.pending.pop_front() {
-            return Poll::Ready(Some(Ok(e)));
-        }
-
-        // ready
-        let event = ready!(self.capture.poll_next_unpin(cx));
-
-        // stream closed
-        let event = match event {
-            Some(e) => e,
-            None => return Poll::Ready(None),
-        };
-
-        // error occurred
-        let (pos, event) = match event {
-            Ok(e) => e,
-            Err(e) => return Poll::Ready(Some(Err(e))),
-        };
-
-        // handle key presses
-        if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) = event {
-            self.update_pressed_keys(key, state);
-        }
-
-        let len = self
-            .position_map
-            .get(&pos)
-            .map(|ids| ids.len())
-            .unwrap_or(0);
-
-        match len {
-            0 => Poll::Pending,
-            1 => Poll::Ready(Some(Ok((
-                self.position_map.get(&pos).expect("no id")[0],
-                event,
-            )))),
-            _ => {
-                let mut position_map = HashMap::new();
-                swap(&mut self.position_map, &mut position_map);
-                {
-                    for &id in position_map.get(&pos).expect("position") {
-                        self.pending.push_back((id, event));
-                    }
-                }
-                swap(&mut self.position_map, &mut position_map);
-
-                Poll::Ready(Some(Ok(self.pending.pop_front().expect("event"))))
+        loop {
+            if let Some(e) = self.pending.pop_front() {
+                return Poll::Ready(Some(Ok(e)));
             }
+
+            // ready
+            let event = ready!(self.capture.poll_next_unpin(cx));
+
+            // stream closed
+            let event = match event {
+                Some(e) => e,
+                None => return Poll::Ready(None),
+            };
+
+            // error occurred
+            let (pos, event) = match event {
+                Ok(e) => e,
+                Err(e) => return Poll::Ready(Some(Err(e))),
+            };
+
+            // handle key presses
+            if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) =
+                event
+            {
+                self.update_pressed_keys(key, state);
+            }
+
+            /* The backend produced an event for a position that no longer has
+             * any handle (it was destroyed while the event was queued).
+             * Dropping it is fine, but we have to keep polling instead of
+             * returning `Pending`: that would swallow the event without
+             * registering a waker.
+             */
+            let Some(ids) = self.position_map.get(&pos).cloned() else {
+                continue;
+            };
+            let Some((first, rest)) = ids.split_first() else {
+                continue;
+            };
+
+            /* deliver a copy to every handle registered at this position */
+            for id in rest {
+                self.pending.push_back((*id, event));
+            }
+            return Poll::Ready(Some(Ok((*first, event))));
         }
     }
 }

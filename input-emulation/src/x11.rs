@@ -39,15 +39,20 @@ impl X11Emulation {
     }
 
     fn emulate_mouse_button(&self, button: u32, state: u32) {
+        let x11_button = match button {
+            BTN_RIGHT => 3,
+            BTN_MIDDLE => 2,
+            BTN_BACK => 8,
+            BTN_FORWARD => 9,
+            BTN_LEFT => 1,
+            // defaulting to BTN_LEFT would turn an unknown button (e.g. a
+            // side button) into a left click
+            _ => {
+                log::warn!("unsupported mouse button: {button}");
+                return;
+            }
+        };
         unsafe {
-            let x11_button = match button {
-                BTN_RIGHT => 3,
-                BTN_MIDDLE => 2,
-                BTN_BACK => 8,
-                BTN_FORWARD => 9,
-                BTN_LEFT => 1,
-                _ => 1,
-            };
             xtest::XTestFakeButtonEvent(self.display, x11_button, state as i32, 0);
         };
     }
@@ -57,31 +62,35 @@ impl X11Emulation {
     const SCROLL_LEFT: u32 = 6;
     const SCROLL_RIGHT: u32 = 7;
 
-    fn emulate_scroll(&self, axis: u8, value: f64) {
-        let direction = match axis {
-            1 => {
-                if value < 0.0 {
-                    Self::SCROLL_LEFT
-                } else {
-                    Self::SCROLL_RIGHT
-                }
-            }
-            _ => {
-                if value < 0.0 {
-                    Self::SCROLL_UP
-                } else {
-                    Self::SCROLL_DOWN
-                }
+    /// emulate `steps` wheel clicks on the given axis.
+    ///
+    /// XTest only knows the discrete wheel buttons, so continuous scroll
+    /// amounts are converted to whole wheel clicks.
+    fn emulate_scroll(&self, axis: u8, steps: i64) {
+        // a scroll amount of 0 is not a scroll down/right
+        if steps == 0 {
+            return;
+        }
+
+        let direction = match (axis, steps < 0) {
+            (0, true) => Self::SCROLL_UP,
+            (0, false) => Self::SCROLL_DOWN,
+            (1, true) => Self::SCROLL_LEFT,
+            (1, false) => Self::SCROLL_RIGHT,
+            (axis, _) => {
+                log::warn!("unsupported scroll axis: {axis}");
+                return;
             }
         };
 
         unsafe {
-            xtest::XTestFakeButtonEvent(self.display, direction, 1, 0);
-            xtest::XTestFakeButtonEvent(self.display, direction, 0, 0);
+            for _ in 0..steps.unsigned_abs() {
+                xtest::XTestFakeButtonEvent(self.display, direction, 1, 0);
+                xtest::XTestFakeButtonEvent(self.display, direction, 0, 0);
+            }
         }
     }
 
-    #[allow(dead_code)]
     fn emulate_key(&self, key: u32, state: u8) {
         let key = key + 8; // xorg keycodes are shifted by 8
         unsafe {
@@ -118,10 +127,27 @@ impl Emulation for X11Emulation {
                     axis,
                     value,
                 } => {
-                    self.emulate_scroll(axis, value);
+                    // `value` is a continuous scroll amount; emit at least one
+                    // wheel click for every started notch so that slow
+                    // trackpad scrolling is not dropped entirely
+                    const NOTCH: f64 = 10.;
+                    let steps = (value / NOTCH).round();
+                    let steps = if steps == 0. && value != 0. {
+                        value.signum()
+                    } else {
+                        steps
+                    };
+                    self.emulate_scroll(axis, steps as i64);
                 }
                 PointerEvent::AxisDiscrete120 { axis, value } => {
-                    self.emulate_scroll(axis, value as f64);
+                    // `value` is in units of 120 (one wheel notch)
+                    let steps = value / 120;
+                    let steps = if steps == 0 && value != 0 {
+                        value.signum()
+                    } else {
+                        steps
+                    };
+                    self.emulate_scroll(axis, steps as i64);
                 }
             },
             Event::Keyboard(KeyboardEvent::Key {

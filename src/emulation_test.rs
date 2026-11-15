@@ -1,7 +1,7 @@
 use crate::config::Config;
 use clap::Args;
 use input_emulation::{InputEmulation, InputEmulationError};
-use input_event::{Event, PointerEvent};
+use input_event::{Event, KeyboardEvent, PointerEvent, scancode};
 use std::f64::consts::PI;
 use std::time::{Duration, Instant};
 
@@ -18,8 +18,21 @@ pub struct TestEmulationArgs {
     scroll: bool,
 }
 
-pub async fn run(config: Config, _args: TestEmulationArgs) -> Result<(), InputEmulationError> {
-    log::info!("running input emulation test");
+pub async fn run(config: Config, args: TestEmulationArgs) -> Result<(), InputEmulationError> {
+    let TestEmulationArgs {
+        mut mouse,
+        keyboard,
+        scroll,
+    } = args;
+    /* no flag at all: exercise the pointer, which is what this test was
+     * originally written for
+     */
+    if !mouse && !keyboard && !scroll {
+        mouse = true;
+    }
+    log::info!(
+        "running input emulation test (mouse: {mouse}, keyboard: {keyboard}, scroll: {scroll})"
+    );
 
     let backend = config.emulation_backend().map(|b| b.into());
     let mut emulation = InputEmulation::new(backend).await?;
@@ -27,8 +40,52 @@ pub async fn run(config: Config, _args: TestEmulationArgs) -> Result<(), InputEm
 
     let start = Instant::now();
     let mut offset = (0, 0);
+    /* the key and scroll tests run at a human-readable pace instead of the
+     * 1 ms pointer cadence
+     */
+    let mut last_toggle = Instant::now();
+    let mut key_down = false;
+    let mut scroll_direction = 1;
     loop {
         tokio::time::sleep(Duration::from_millis(1)).await;
+
+        if (keyboard || scroll) && last_toggle.elapsed() >= Duration::from_millis(500) {
+            last_toggle = Instant::now();
+            if keyboard {
+                key_down = !key_down;
+                let state = u8::from(key_down);
+                let key = scancode::Linux::KeyA as u32;
+                log::info!("keyboard test: KeyA state {state}");
+                emulation
+                    .consume(
+                        Event::Keyboard(KeyboardEvent::Key {
+                            time: 0,
+                            key,
+                            state,
+                        }),
+                        0,
+                    )
+                    .await?;
+            }
+            if scroll {
+                scroll_direction = -scroll_direction;
+                log::info!("scroll test: {scroll_direction} notch(es)");
+                emulation
+                    .consume(
+                        Event::Pointer(PointerEvent::AxisDiscrete120 {
+                            axis: 0,
+                            value: scroll_direction,
+                        }),
+                        0,
+                    )
+                    .await?;
+            }
+        }
+
+        if !mouse {
+            continue;
+        }
+
         let elapsed = start.elapsed();
         let elapsed_sec_f64 = elapsed.as_secs_f64();
         let second_fraction = elapsed_sec_f64 - elapsed_sec_f64 as u64 as f64;

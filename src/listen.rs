@@ -30,6 +30,9 @@ pub enum ListenerCreationError {
     WebrtcUtil(#[from] webrtc_util::Error),
     #[error(transparent)]
     WebrtcDtls(#[from] webrtc_dtls::Error),
+    /// the listener task exited before it reported the new port
+    #[error("the listener task exited before reporting the new port")]
+    Closed,
 }
 
 type ArcConn = Arc<dyn Conn + Send + Sync>;
@@ -80,19 +83,24 @@ impl LanMouseListener {
             let connection_attempts = connection_attempts.clone();
             Some(Arc::new(
                 move |certs: &[Vec<u8>], _chains: &[CertificateDer<'static>]| {
-                    assert!(certs.len() == 1);
-                    let fingerprints = certs
-                        .iter()
-                        .map(|c| crypto::generate_fingerprint(c))
-                        .collect::<Vec<_>>();
-                    if authorized
-                        .read()
-                        .expect("lock")
-                        .contains_key(&fingerprints[0])
-                    {
+                    // A well behaved peer sends exactly one certificate, but this
+                    // runs in a DTLS callback fed by remote data: never panic here
+                    // (a panic would take down the whole daemon). Reject an empty
+                    // chain and use the leaf certificate of a longer chain.
+                    let Some(cert) = certs.first() else {
+                        log::warn!("dtls client did not present a certificate");
+                        return Err(webrtc_dtls::Error::ErrVerifyDataMismatch);
+                    };
+                    if certs.len() > 1 {
+                        log::warn!(
+                            "dtls client presented {} certificates, verifying the first one",
+                            certs.len()
+                        );
+                    }
+                    let fingerprint = crypto::generate_fingerprint(cert);
+                    if authorized.read().expect("lock").contains_key(&fingerprint) {
                         Ok(())
                     } else {
-                        let fingerprint = fingerprints.into_iter().next().expect("fingerprint");
                         connection_attempts
                             .lock()
                             .expect("lock")
@@ -129,13 +137,23 @@ impl LanMouseListener {
                         c = listener.accept() => match c {
                             Ok((conn, addr)) => {
                                 log::info!("dtls client connected, ip: {addr}");
-                                let mut conns = conns_clone.lock().await;
-                                conns.push((addr, conn.clone()));
-                                let dtls_conn: &DTLSConn = conn.as_any().downcast_ref().expect("dtls conn");
+                                let Some(dtls_conn) = conn.as_any().downcast_ref::<DTLSConn>() else {
+                                    log::error!("accepted a connection that is not a dtls connection, dropping it");
+                                    let _ = conn.close().await;
+                                    continue;
+                                };
                                 let certs = dtls_conn.connection_state().await.peer_certificates;
-                                let cert = certs.first().expect("cert");
+                                let Some(cert) = certs.first() else {
+                                    log::warn!("dtls client {addr} sent no certificate, dropping the connection");
+                                    let _ = conn.close().await;
+                                    continue;
+                                };
                                 let fingerprint = crypto::generate_fingerprint(cert);
-                                listen_tx.send(ListenEvent::Accept { addr, fingerprint }).expect("channel closed");
+                                conns_clone.lock().await.push((addr, conn.clone()));
+                                if listen_tx.send(ListenEvent::Accept { addr, fingerprint }).is_err() {
+                                    // listener was dropped, nothing left to do
+                                    break;
+                                }
                                 spawn_local(read_loop(conns_clone.clone(), addr, conn, listen_tx.clone()));
                             },
                             Err(e) => {
@@ -144,7 +162,7 @@ impl LanMouseListener {
                                         match e {
                                             webrtc_dtls::Error::ErrVerifyDataMismatch => {
                                                 if let Some(fingerprint) = connection_attempts.lock().expect("lock").pop_front() {
-                                                    listen_tx.send(ListenEvent::Rejected { fingerprint }).expect("channel closed");
+                                                    let _ = listen_tx.send(ListenEvent::Rejected { fingerprint });
                                                 }
                                             }
                                             _ => log::warn!("accept: {e}"),
@@ -155,20 +173,27 @@ impl LanMouseListener {
                                 } else {
                                     log::warn!("accept: {e:?}");
                                 }
+                                /* A persistent accept error (e.g. EMFILE) would
+                                 * spin this loop, so wait a bit before retrying.
+                                 */
+                                tokio::time::sleep(Duration::from_millis(100)).await;
                             }
                         },
                         port = request_port_change_rx.recv() => {
-                            let port = port.expect("channel closed");
+                            let Some(port) = port else {
+                                log::debug!("port change channel closed");
+                                break;
+                            };
                             let listen_addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
                             match listen(listen_addr, cfg.clone()).await {
                                 Ok(new_listener) => {
                                     let _ = listener.close().await;
                                     listener = new_listener;
-                                    port_changed_tx.send(Ok(port)).expect("channel closed");
+                                    let _ = port_changed_tx.send(Ok(port));
                                 }
                                 Err(e) => {
                                     log::warn!("unable to change port: {e}");
-                                    port_changed_tx.send(Err(e.into())).expect("channel closed");
+                                    let _ = port_changed_tx.send(Err(e.into()));
                                 }
                             };
                         },
@@ -188,19 +213,28 @@ impl LanMouseListener {
     }
 
     pub(crate) fn request_port_change(&mut self, port: u16) {
-        self.request_port_change.send(port).expect("channel closed");
+        /* the listener task only goes away during shutdown; this binary is
+         * built with `panic = "abort"`, so a failed send must not panic
+         */
+        if self.request_port_change.send(port).is_err() {
+            log::debug!("listener task is gone, dropping the port change request");
+        }
     }
 
     pub(crate) async fn port_changed(&mut self) -> Result<u16, ListenerCreationError> {
-        self.port_changed.recv().await.expect("channel closed")
+        self.port_changed
+            .recv()
+            .await
+            .unwrap_or(Err(ListenerCreationError::Closed))
     }
 
     pub(crate) async fn terminate(&mut self) {
         self.listen_task.abort();
-        let conns = self.conns.lock().await;
+        let mut conns = self.conns.lock().await;
         for (_, conn) in conns.iter() {
             let _ = conn.close().await;
         }
+        conns.clear();
         self.listen_tx.close();
     }
 
@@ -272,9 +306,12 @@ async fn read_loop(
             Err(_) => break,
         };
         match b[..n].try_into() {
-            Ok(event) => dtls_tx
-                .send(ListenEvent::Msg { event, addr })
-                .expect("channel closed"),
+            Ok(event) => {
+                if dtls_tx.send(ListenEvent::Msg { event, addr }).is_err() {
+                    // the emulation task is gone, stop buffering events
+                    break;
+                }
+            }
             Err(e) => {
                 // Skip the malformed/unknown datagram and keep
                 // listening. Each DTLS recv returns one full
@@ -291,10 +328,14 @@ async fn read_loop(
     }
     log::info!("dtls client disconnected {addr:?}");
     let mut conns = conns.lock().await;
-    let index = conns
+    // Compare the connection itself, not just the address: a client that
+    // reconnects from the same address can have two entries here and removing
+    // the wrong one would kill the fresh connection.
+    if let Some(index) = conns
         .iter()
-        .position(|(a, _)| *a == addr)
-        .expect("connection not found");
-    conns.remove(index);
+        .position(|(a, c)| *a == addr && Arc::ptr_eq(c, &conn))
+    {
+        conns.remove(index);
+    }
     Ok(())
 }

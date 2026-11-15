@@ -18,10 +18,7 @@ use ashpd::desktop::{
 use async_trait::async_trait;
 
 use reis::{
-    ei::{
-        self, Button, Keyboard, Pointer, Scroll, button::ButtonState, handshake::ContextType,
-        keyboard::KeyState,
-    },
+    ei::{self, button::ButtonState, handshake::ContextType, keyboard::KeyState},
     event::{self, Connection, DeviceCapability, DeviceEvent, EiEvent, SeatEvent},
     tokio::EiConvertEventStream,
 };
@@ -40,6 +37,52 @@ struct Devices {
     keyboard: Arc<RwLock<Option<(ei::Device, ei::Keyboard)>>>,
 }
 
+impl Devices {
+    /// store an interface of `device`, replacing whatever was stored before
+    fn set<T>(slot: &Arc<RwLock<Option<(ei::Device, T)>>>, device: &ei::Device, interface: T) {
+        match slot.write() {
+            Ok(mut slot) => *slot = Some((device.clone(), interface)),
+            // the lock is only ever held by short, non-panicking sections
+            Err(e) => log::error!("device lock is poisoned: {e}"),
+        }
+    }
+
+    /// store every interface that `device` provides
+    fn register(&self, device: &event::Device) {
+        if let Some(pointer) = device.interface::<ei::Pointer>() {
+            Self::set(&self.pointer, device.device(), pointer);
+        }
+        if let Some(keyboard) = device.interface::<ei::Keyboard>() {
+            Self::set(&self.keyboard, device.device(), keyboard);
+        }
+        if let Some(scroll) = device.interface::<ei::Scroll>() {
+            Self::set(&self.scroll, device.device(), scroll);
+        }
+        if let Some(button) = device.interface::<ei::Button>() {
+            Self::set(&self.button, device.device(), button);
+        }
+    }
+
+    /// clear a device slot if it currently holds the given device
+    fn clear_if(slot: &Arc<RwLock<Option<(ei::Device, impl ei::Interface)>>>, device: &ei::Device) {
+        if slot
+            .read()
+            .is_ok_and(|d| d.as_ref().is_some_and(|(el, _)| el == device))
+        {
+            let _ = slot.write().map(|mut d| *d = None);
+        }
+    }
+
+    /// drop every reference to `device` so that no further events are sent to
+    /// a paused or removed device
+    fn remove(&self, device: &ei::Device) {
+        Self::clear_if(&self.pointer, device);
+        Self::clear_if(&self.keyboard, device);
+        Self::clear_if(&self.scroll, device);
+        Self::clear_if(&self.button, device);
+    }
+}
+
 pub(crate) struct LibeiEmulation {
     context: ei::Context,
     conn: event::Connection,
@@ -55,10 +98,22 @@ pub(crate) struct LibeiEmulation {
 fn get_token_file_path() -> PathBuf {
     let cache_dir = env::var("XDG_CACHE_HOME")
         .ok()
+        .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
+        .or_else(|| {
+            // neither XDG_CACHE_HOME nor HOME may be set (e.g. when started
+            // from a systemd unit): fall back to the current directory
+            // instead of panicking
+            env::var("HOME")
+                .ok()
+                .filter(|home| !home.is_empty())
+                .map(|home| PathBuf::from(home).join(".cache"))
+        })
         .unwrap_or_else(|| {
-            let home = env::var("HOME").expect("HOME not set");
-            PathBuf::from(home).join(".cache")
+            log::warn!(
+                "neither XDG_CACHE_HOME nor HOME is set, storing the token in the current directory"
+            );
+            PathBuf::from(".")
         });
 
     cache_dir.join("lan-mouse").join("remote-desktop.token")
@@ -168,7 +223,7 @@ impl Emulation for LibeiEmulation {
     ) -> Result<(), EmulationError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_micros() as u64;
         if self.libei_error.load(Ordering::SeqCst) {
             // don't break sending additional events but signal error
@@ -310,46 +365,23 @@ async fn ei_event_handler(
                 log::debug!("seat removed: {:?}", e.seat());
             }
             EiEvent::DeviceAdded(e) => {
-                let device_type = e.device().device_type();
-                log::debug!("device added: {device_type:?}");
-                let device = e.device();
-                if let Some(pointer) = e.device().interface::<Pointer>() {
-                    devices
-                        .pointer
-                        .write()
-                        .unwrap()
-                        .replace((device.device().clone(), pointer));
-                }
-                if let Some(keyboard) = e.device().interface::<Keyboard>() {
-                    devices
-                        .keyboard
-                        .write()
-                        .unwrap()
-                        .replace((device.device().clone(), keyboard));
-                }
-                if let Some(scroll) = e.device().interface::<Scroll>() {
-                    devices
-                        .scroll
-                        .write()
-                        .unwrap()
-                        .replace((device.device().clone(), scroll));
-                }
-                if let Some(button) = e.device().interface::<Button>() {
-                    devices
-                        .button
-                        .write()
-                        .unwrap()
-                        .replace((device.device().clone(), button));
-                }
+                log::debug!("device added: {:?}", e.device().device_type());
+                devices.register(e.device());
             }
             EiEvent::DeviceRemoved(e) => {
                 log::debug!("device removed: {:?}", e.device().device_type());
+                // the device is gone: drop any reference to it so that no
+                // events are sent to a stale device
+                devices.remove(e.device().device());
             }
             EiEvent::DevicePaused(e) => {
                 log::debug!("device paused: {:?}", e.device().device_type());
+                // while paused the device must not receive events
+                devices.remove(e.device().device());
             }
             EiEvent::DeviceResumed(e) => {
                 log::debug!("device resumed: {:?}", e.device().device_type());
+                devices.register(e.device());
                 e.device().device().start_emulating(0, 0);
             }
             EiEvent::KeyboardModifiers(e) => {
@@ -370,7 +402,11 @@ async fn ei_event_handler(
             // EiEvent::TouchDown(_) => { },
             // EiEvent::TouchUp(_) => { },
             // EiEvent::TouchMotion(_) => { },
-            _ => unreachable!("unexpected ei event"),
+            e => {
+                // the event stream is controlled by the compositor, never
+                // abort the whole process on an unexpected event
+                log::debug!("ignoring unexpected ei event: {e:?}");
+            }
         }
         context.flush().map_err(|e| io::Error::new(e.kind(), e))?;
     }

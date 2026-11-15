@@ -6,8 +6,7 @@ use std::default::Default;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use tokio::sync::mpsc::Sender;
-use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::UnboundedSender;
 use windows::Win32::Foundation::{FALSE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     DEVMODEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS,
@@ -19,11 +18,12 @@ use windows::core::{PCWSTR, w};
 
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DispatchMessageW, EDD_GET_DEVICE_INTERFACE_NAME, GetMessageW,
-    HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PostThreadMessageW,
-    RegisterClassW, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_STYLE,
-    WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC,
+    HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW,
+    PostThreadMessageW, RegisterClassW, SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN,
+    WM_XBUTTONUP, WNDCLASSW, WNDPROC,
 };
 
 use input_event::{
@@ -40,7 +40,7 @@ pub(crate) struct EventThread {
 }
 
 impl EventThread {
-    pub(crate) fn new(event_tx: Sender<(Position, CaptureEvent)>) -> Self {
+    pub(crate) fn new(event_tx: UnboundedSender<(Position, CaptureEvent)>) -> Self {
         let request_buffer = Default::default();
         let (thread, thread_id) = start(event_tx, Arc::clone(&request_buffer));
         Self {
@@ -75,8 +75,16 @@ impl EventThread {
     }
 
     fn signal(&self, event_type: RequestType) {
+        /* `PostThreadMessageW` fails for a thread without a message queue or
+         * after the thread exited; this runs on the caller's thread and must
+         * not abort the process
+         */
         let id = self.thread_id;
-        unsafe { PostThreadMessageW(id, WM_USER, WPARAM(event_type as usize), LPARAM(0)).unwrap() };
+        if let Err(e) =
+            unsafe { PostThreadMessageW(id, WM_USER, WPARAM(event_type as usize), LPARAM(0)) }
+        {
+            log::warn!("failed to post message to the event thread: {e}");
+        }
     }
 }
 
@@ -98,15 +106,23 @@ enum ClientUpdate {
     Destroy(Position),
 }
 
-fn blocking_send_event(pos: Position, event: CaptureEvent) {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().blocking_send((pos, event)).unwrap())
-}
-
-fn try_send_event(
-    pos: Position,
-    event: CaptureEvent,
-) -> Result<(), TrySendError<(Position, CaptureEvent)>> {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().try_send((pos, event)))
+/// Forward a captured event to the capture task.
+///
+/// The channel is unbounded because this runs inside a low level Windows hook:
+/// blocking there stalls input system wide (the hook is removed after
+/// `LowLevelHooksTimeout`) and dropping events there loses pointer movement
+/// and key-up events, which leaves the remote peer with stuck keys/buttons.
+fn send_event(pos: Position, event: CaptureEvent) {
+    EVENT_TX.with_borrow_mut(|tx| {
+        // this runs inside a low level hook: never panic here
+        let Some(tx) = tx.as_mut() else {
+            log::error!("event channel is not initialized");
+            return;
+        };
+        if let Err(e) = tx.send((pos, event)) {
+            log::error!("failed to send capture event: {e}");
+        }
+    })
 }
 
 thread_local! {
@@ -115,9 +131,11 @@ thread_local! {
     /// currently active client
     static ACTIVE_CLIENT: Cell<Option<Position>> = const { Cell::new(None) };
     /// input event channel
-    static EVENT_TX: RefCell<Option<Sender<(Position, CaptureEvent)>>> = const { RefCell::new(None) };
-    /// position of barrier entry
-    static ENTRY_POINT: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
+    static EVENT_TX: RefCell<Option<UnboundedSender<(Position, CaptureEvent)>>> =
+        const { RefCell::new(None) };
+    /// mouse position of the previously reported motion event; initialised to
+    /// the barrier entry point when a client captures the pointer
+    static LAST_POS: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
     /// previous mouse position
     static PREV_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
     /// displays and generation counter
@@ -137,7 +155,7 @@ fn get_msg() -> Option<MSG> {
 }
 
 fn start(
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_tx: UnboundedSender<(Position, CaptureEvent)>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
 ) -> (thread::JoinHandle<()>, u32) {
     /* condition variable to wait for thead id */
@@ -157,10 +175,20 @@ fn start(
 
 fn start_routine(
     ready: Arc<(Condvar, Mutex<Option<u32>>)>,
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_tx: UnboundedSender<(Position, CaptureEvent)>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
 ) {
     EVENT_TX.replace(Some(event_tx));
+
+    /* `PostThreadMessageW` is documented to fail when the target thread has no
+     * message queue yet, so create it before the id is handed out. Otherwise
+     * the very first `create`/`destroy`/`release` can race the hook setup.
+     */
+    unsafe {
+        let mut msg = MSG::default();
+        let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+    }
+
     /* communicate thread id */
     {
         let (cnd, mtx) = &*ready;
@@ -294,12 +322,12 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     let entry_point = DISPLAYS.with_borrow(|(displays, _)| {
         display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos)
     });
-    ENTRY_POINT.replace(entry_point);
+    /* motion deltas are measured from the entry point on */
+    LAST_POS.replace(entry_point);
 
     /* notify main thread */
     log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
-    let active = ACTIVE_CLIENT.get().expect("active client");
-    blocking_send_event(active, CaptureEvent::Begin);
+    send_event(pos, CaptureEvent::Begin);
 
     ret
 }
@@ -323,9 +351,7 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     };
 
     /* notify mainthread (drop events if sending too fast) */
-    if let Err(e) = try_send_event(pos, CaptureEvent::Input(Event::Pointer(pointer_event))) {
-        log::warn!("e: {e}");
-    }
+    send_event(pos, CaptureEvent::Input(Event::Pointer(pointer_event)));
 
     /* don't pass event to applications */
     LRESULT(1)
@@ -342,9 +368,7 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
         return LRESULT(1);
     };
 
-    if let Err(e) = try_send_event(client, CaptureEvent::Input(Event::Keyboard(key_event))) {
-        log::warn!("e: {e}");
-    }
+    send_event(client, CaptureEvent::Input(Event::Keyboard(key_event)));
 
     /* don't pass event to applications */
     LRESULT(1)
@@ -401,7 +425,12 @@ fn enumerate_displays(display_rects: &mut Vec<RECT>) {
                 &mut dev_mode,
             );
             if ret == FALSE {
-                log::warn!("no display mode");
+                /* Pushing a rect from the zeroed DEVMODEW would create a phantom
+                 * display at (0,0) with size 0, which makes the left and top
+                 * barrier always report "still in bounds".
+                 */
+                log::warn!("no display mode for {device:?}, skipping it");
+                continue;
             }
 
             let pos = dev_mode.Anonymous1.Anonymous2.dmPosition;
@@ -512,8 +541,14 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
         }),
         WPARAM(p) if p == WM_MOUSEMOVE as usize => {
             let (x, y) = (mouse_low_level.pt.x, mouse_low_level.pt.y);
-            let (ex, ey) = ENTRY_POINT.get();
-            let (dx, dy) = (x - ex, y - ey);
+            /* The delta must be relative to the previous mouse event, not to
+             * the barrier entry point: using the entry point makes every event
+             * repeat the accumulated offset, which massively accelerates the
+             * remote pointer.
+             */
+            let (lx, ly) = LAST_POS.get();
+            LAST_POS.replace((x, y));
+            let (dx, dy) = (x - lx, y - ly);
             let (dx, dy) = (dx as f64, dy as f64);
             Some(PointerEvent::Motion { time: 0, dx, dy })
         }

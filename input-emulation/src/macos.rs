@@ -19,10 +19,10 @@ use input_event::{
     scancode,
 };
 use keycode::{KeyMap, KeyMapping};
-use std::cell::Cell;
+use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
+use objc2_foundation::NSPoint;
 use std::collections::HashSet;
-use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::{sync::Notify, task::JoinHandle};
 
@@ -47,12 +47,18 @@ pub(crate) struct MacOSEmulation {
     /// click state, i.e. number of clicks in quick succession
     button_click_state: i64,
     /// current modifier state
-    modifier_state: Rc<Cell<XMods>>,
+    modifier_state: Arc<Mutex<XMods>>,
     /// notify to cancel key repeats
     notify_repeat_task: Arc<Notify>,
     /// cached key for `natural_scroll_enabled`
     natural_scroll_key: CFString,
 }
+
+/* `CGEventSource` and `CFString` are plain reference-counted Core Foundation
+ * handles without a `Send` impl in core-graphics/core-foundation, but every
+ * method used here is documented as thread safe and the emulation is driven
+ * from a single task, so moving it between threads is fine. */
+unsafe impl Send for MacOSEmulation {}
 
 /// Maps an evdev button code to the CGEventType used for drag events.
 fn drag_event_type(button: u32) -> CGEventType {
@@ -80,8 +86,6 @@ fn natural_scroll_enabled(key: &CFString) -> bool {
     key_exists_and_valid == 0 || value != 0
 }
 
-unsafe impl Send for MacOSEmulation {}
-
 impl MacOSEmulation {
     pub(crate) fn new() -> Result<Self, MacOSEmulationCreationError> {
         request_macos_emulation_permissions()?;
@@ -96,7 +100,7 @@ impl MacOSEmulation {
             button_click_state: 0,
             repeat_task: None,
             notify_repeat_task: Arc::new(Notify::new()),
-            modifier_state: Rc::new(Cell::new(XMods::empty())),
+            modifier_state: Arc::new(Mutex::new(XMods::empty())),
             natural_scroll_key: CFString::new("com.apple.swipescrolldirection"),
         })
     }
@@ -117,7 +121,12 @@ impl MacOSEmulation {
     async fn spawn_repeat_task(&mut self, key: u16) {
         self.stop_repeat_task().await;
         // initial key event
-        key_event(self.event_source.clone(), key, 1, self.modifier_state.get());
+        key_event(
+            self.event_source.clone(),
+            key,
+            1,
+            modifiers_of(&self.modifier_state),
+        );
         // repeat task
         let event_source = self.event_source.clone();
         let notify = self.notify_repeat_task.clone();
@@ -129,7 +138,7 @@ impl MacOSEmulation {
             };
             if !stop {
                 loop {
-                    key_event(event_source.clone(), key, 1, modifiers.get());
+                    key_event(event_source.clone(), key, 1, modifiers_of(&modifiers));
                     tokio::select! {
                         _ = tokio::time::sleep(DEFAULT_REPEAT_INTERVAL) => {},
                         _ = notify.notified() => break,
@@ -169,7 +178,12 @@ impl MacOSEmulation {
         if matches!(&self.repeat_task, Some((repeating, _)) if *repeating == key) {
             self.stop_repeat_task().await;
         }
-        key_event(self.event_source.clone(), key, 0, self.modifier_state.get());
+        key_event(
+            self.event_source.clone(),
+            key,
+            0,
+            modifiers_of(&self.modifier_state),
+        );
     }
 }
 
@@ -238,6 +252,79 @@ pub const INJECTED_EVENT_TAG: i64 = 0x6c616e6d; // "lanm"
 fn post_synthesized(event: &CGEvent) {
     event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECTED_EVENT_TAG);
     event.post(CGEventTapLocation::HID);
+}
+
+/// `NX_KEYTYPE_*` identifiers of the "system defined" events macOS uses for the
+/// special keys above the number row (IOKit `hidsystem/IOLLEvent.h`).
+///
+/// These keys have no macOS virtual keycode that a posted `CGEvent` acts on:
+/// the Chromium derived table maps evdev 113/114/115 to the legacy
+/// `kVK_VolumeUp`/`kVK_VolumeDown`/`kVK_Mute` codes (0x48/0x49/0x4a), but posting
+/// those as ordinary keyboard events does nothing — the volume knob on a
+/// keyboard was silently swallowed while the pointer was captured by macOS.
+const NX_KEYTYPE_SOUND_UP: isize = 0;
+const NX_KEYTYPE_SOUND_DOWN: isize = 1;
+const NX_KEYTYPE_BRIGHTNESS_UP: isize = 2;
+const NX_KEYTYPE_BRIGHTNESS_DOWN: isize = 3;
+const NX_KEYTYPE_MUTE: isize = 7;
+const NX_KEYTYPE_PLAY: isize = 16;
+const NX_KEYTYPE_NEXT: isize = 17;
+const NX_KEYTYPE_PREVIOUS: isize = 18;
+
+/// maps a Linux evdev keycode to the `NX_KEYTYPE_*` identifier of the
+/// system defined event macOS expects for it, if it is one of those keys
+fn media_key_type(key: u32) -> Option<isize> {
+    match scancode::Linux::try_from(key).ok()? {
+        scancode::Linux::KeyVolumeUp => Some(NX_KEYTYPE_SOUND_UP),
+        scancode::Linux::KeyVolumeDown => Some(NX_KEYTYPE_SOUND_DOWN),
+        scancode::Linux::KeyMute => Some(NX_KEYTYPE_MUTE),
+        scancode::Linux::KeyBrightnessup => Some(NX_KEYTYPE_BRIGHTNESS_UP),
+        scancode::Linux::KeyBrightnessdown => Some(NX_KEYTYPE_BRIGHTNESS_DOWN),
+        scancode::Linux::KeyPlaypause => Some(NX_KEYTYPE_PLAY),
+        scancode::Linux::KeyNextsong => Some(NX_KEYTYPE_NEXT),
+        scancode::Linux::KeyPrevioussong => Some(NX_KEYTYPE_PREVIOUS),
+        _ => None,
+    }
+}
+
+/// Posts a "system defined" event, which is how the media keys (volume, mute,
+/// playback, brightness) have to be synthesized on macOS.
+///
+/// `CGEvent::new_keyboard_event` cannot express them: macOS routes them through
+/// `NSEventTypeSystemDefined` events whose `data1` carries the `NX_KEYTYPE_*`
+/// identifier in the high word and the up/down marker (0x0a / 0x0b) in the
+/// second byte, exactly like the events a real Apple keyboard emits.
+fn media_key_event(key_type: isize, state: u8) {
+    // NX_KEYDOWN (0x0a) / NX_KEYUP (0x0b)
+    let down = state != 0;
+    let marker: isize = if down { 0x0a } else { 0x0b };
+    let data1 = (key_type << 16) | (marker << 8);
+    let flags = NSEventModifierFlags::from_bits_truncate(if down { 0xa00 } else { 0xb00 });
+    let Some(event) =
+        NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+            NSEventType::SystemDefined,
+            NSPoint::ZERO,
+            flags,
+            0.0,
+            0,
+            None,
+            8, // NX_SUBTYPE_AUX_CONTROL_BUTTONS
+            data1,
+            -1,
+        )
+    else {
+        log::warn!("unable to create the media key event");
+        return;
+    };
+    let Some(cg_event) = event.CGEvent() else {
+        log::warn!("the media key event carries no CGEvent");
+        return;
+    };
+    objc2_core_graphics::CGEvent::post(
+        objc2_core_graphics::CGEventTapLocation::HIDEventTap,
+        Some(&cg_event),
+    );
+    log::trace!("media key event: {key_type} {state}");
 }
 
 fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods) {
@@ -446,19 +533,31 @@ impl Emulation for MacOSEmulation {
                         mouse_location.x = new_mouse_x;
                         mouse_location.y = new_mouse_y;
 
-                        // If any button is held, emit a drag event for it;
-                        // otherwise emit a normal mouse-moved event.
-                        let event_type = self
-                            .pressed_buttons
-                            .iter()
-                            .next()
-                            .map(|&btn| drag_event_type(btn))
-                            .unwrap_or(CGEventType::MouseMoved);
+                        /* If a button is held, emit a drag event for the most
+                         * recently pressed one; otherwise emit a normal
+                         * mouse-moved event. A HashSet iteration order would
+                         * pick an arbitrary button when several are held.
+                         */
+                        let drag_button = self
+                            .previous_button
+                            .filter(|btn| self.pressed_buttons.contains(btn))
+                            .or_else(|| self.pressed_buttons.iter().next().copied());
+                        let (event_type, cg_button) = match drag_button {
+                            Some(btn) => (
+                                drag_event_type(btn),
+                                match btn {
+                                    BTN_LEFT => CGMouseButton::Left,
+                                    BTN_RIGHT => CGMouseButton::Right,
+                                    _ => CGMouseButton::Center,
+                                },
+                            ),
+                            None => (CGEventType::MouseMoved, CGMouseButton::Left),
+                        };
                         let event = match CGEvent::new_mouse_event(
                             self.event_source.clone(),
                             event_type,
                             mouse_location,
-                            CGMouseButton::Left,
+                            cg_button,
                         ) {
                             Ok(e) => e,
                             Err(_) => {
@@ -524,7 +623,10 @@ impl Emulation for MacOSEmulation {
                         }
 
                         log::debug!("click_state: {}", self.button_click_state);
-                        let location = self.get_mouse_location().unwrap();
+                        let Some(location) = self.get_mouse_location() else {
+                            log::warn!("could not determine the mouse location");
+                            return Ok(());
+                        };
                         let event = match CGEvent::new_mouse_event(
                             self.event_source.clone(),
                             event_type,
@@ -617,10 +719,11 @@ impl Emulation for MacOSEmulation {
                     }
                 }
 
-                // reset button click state in case it's not a button event
-                if !matches!(pointer_event, PointerEvent::Button { .. }) {
-                    self.button_click_state = 0;
-                }
+                /* Do not reset the click state here: the double click window
+                 * is tracked by `previous_button_click` and a mouse movement
+                 * between the two clicks of a double click (which is normal,
+                 * the pointer rarely stays perfectly still) used to reset it.
+                 */
             }
             Event::Keyboard(keyboard_event) => match keyboard_event {
                 KeyboardEvent::Key {
@@ -628,6 +731,17 @@ impl Emulation for MacOSEmulation {
                     key,
                     state,
                 } => {
+                    // The media keys above the number row (volume, mute, playback,
+                    // brightness) are not keyboard events on macOS: they have to be
+                    // posted as "system defined" events, which is what a real Apple
+                    // keyboard emits. Routing them through the keycode table below
+                    // posted the legacy kVK_VolumeUp/Down/Mute codes instead, which
+                    // the window server ignores — the volume knob on the keyboard
+                    // did nothing while the pointer was captured by this machine.
+                    if let Some(key_type) = media_key_type(key) {
+                        media_key_event(key_type, state);
+                        return Ok(());
+                    }
                     // Fallback table for Linux evdev keys that have no macOS CGKeyCode in
                     // the keycode crate's Chromium-derived table. F13/F14/F15 are the
                     // conventional macOS stand-ins for Print Screen / Scroll Lock / Pause,
@@ -655,7 +769,7 @@ impl Emulation for MacOSEmulation {
                         modifier_key_event(
                             self.event_source.clone(),
                             code,
-                            self.modifier_state.get(),
+                            modifiers_of(&self.modifier_state),
                         );
                     } else {
                         match state {
@@ -692,7 +806,12 @@ impl Emulation for MacOSEmulation {
     async fn terminate(&mut self) {}
 }
 
-fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
+/// read a copy of the current modifier state
+fn modifiers_of(modifiers: &Mutex<XMods>) -> XMods {
+    modifiers.lock().map(|mods| *mods).unwrap_or_default()
+}
+
+fn update_modifiers(modifiers: &Mutex<XMods>, key: u32, state: u8) -> bool {
     if let Ok(key) = scancode::Linux::try_from(key) {
         // Caps Lock is a LOCKING modifier: a press toggles a persistent state
         // rather than being active only while physically held. Toggle on
@@ -703,9 +822,9 @@ fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
         // leaves the number-row symbols unshifted.)
         if matches!(key, scancode::Linux::KeyCapsLock) {
             if state == 1 {
-                let mut mods = modifiers.get();
-                mods.toggle(XMods::LockMask);
-                modifiers.set(mods);
+                if let Ok(mut mods) = modifiers.lock() {
+                    mods.toggle(XMods::LockMask);
+                }
             }
             return true;
         }
@@ -720,12 +839,12 @@ fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
         if mask.is_empty() {
             return false;
         }
-        let mut mods = modifiers.get();
-        match state {
-            1 => mods.insert(mask),
-            _ => mods.remove(mask),
+        if let Ok(mut mods) = modifiers.lock() {
+            match state {
+                1 => mods.insert(mask),
+                _ => mods.remove(mask),
+            }
         }
-        modifiers.set(mods);
         true
     } else {
         false
@@ -733,18 +852,20 @@ fn update_modifiers(modifiers: &Cell<XMods>, key: u32, state: u8) -> bool {
 }
 
 fn set_modifiers(
-    active_modifiers: &Cell<XMods>,
+    active_modifiers: &Mutex<XMods>,
     depressed: u32,
     latched: u32,
     locked: u32,
     group: u32,
 ) {
-    let depressed = XMods::from_bits(depressed).unwrap_or_default();
-    let _latched = XMods::from_bits(latched).unwrap_or_default();
+    // the masks come from the network, so unknown bits must not panic
+    let depressed = XMods::from_bits_truncate(depressed);
     let locked = XMods::from_bits_truncate(locked);
-    let _group = XMods::from_bits(group).unwrap_or_default();
+    let _ = (latched, group);
 
-    active_modifiers.replace(depressed | (locked & XMods::LockMask));
+    if let Ok(mut mods) = active_modifiers.lock() {
+        *mods = depressed | (locked & XMods::LockMask);
+    }
 }
 
 fn to_cgevent_flags(depressed: XMods) -> CGEventFlags {

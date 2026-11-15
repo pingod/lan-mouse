@@ -23,22 +23,9 @@ fn is_within_dp_boundary(point: (i32, i32), display: &RECT, pos: Position) -> bo
     }
 }
 
-/// returns whether the given position is within the display bounds with respect to the given
-/// barrier position
-///
-/// # Arguments
-///
-/// * `x`:
-/// * `y`:
-/// * `displays`:
-/// * `pos`:
-///
-/// returns: bool
-///
-fn in_bounds(point: (i32, i32), displays: &[RECT], pos: Position) -> bool {
-    displays
-        .iter()
-        .any(|d| is_within_dp_boundary(point, d, pos))
+/// the display that contains the given point, if any
+fn display_at(point: (i32, i32), displays: &[RECT]) -> Option<&RECT> {
+    displays.iter().find(|&d| is_within_dp_region(point, d))
 }
 
 fn in_display_region(point: (i32, i32), displays: &[RECT]) -> bool {
@@ -51,8 +38,15 @@ fn moved_across_boundary(
     displays: &[RECT],
     pos: Position,
 ) -> bool {
-    /* was within bounds, but is not anymore */
-    in_display_region(prev_pos, displays) && !in_bounds(curr_pos, displays, pos)
+    /* The cursor has to leave the edge of the display it currently sits on and
+     * must not land on any other display. Testing every display instead makes
+     * a barrier never fire when some other (e.g. larger, vertically offset)
+     * display still lies beyond the crossing point.
+     */
+    let Some(display) = display_at(prev_pos, displays) else {
+        return false;
+    };
+    !is_within_dp_boundary(curr_pos, display, pos) && !in_display_region(curr_pos, displays)
 }
 
 pub(crate) fn entered_barrier(
@@ -86,10 +80,10 @@ pub(crate) fn clamp_to_display_bounds(
     point: (i32, i32),
 ) -> (i32, i32) {
     /* find display where movement came from */
-    let display = display_regions
-        .iter()
-        .find(|&d| is_within_dp_region(prev_point, d))
-        .unwrap();
+    let Some(display) = display_at(prev_point, display_regions) else {
+        /* the display layout changed underneath us: leave the point untouched */
+        return point;
+    };
 
     /* clamp to bounds (inclusive) */
     let (x, y) = point;

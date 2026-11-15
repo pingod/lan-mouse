@@ -463,8 +463,22 @@ impl Config {
 
     pub async fn changed(&mut self) -> Result<(), notify::Error> {
         loop {
-            let event = self.watch_rx.recv().await.expect("channel closed");
-            let event = event.expect("filesystem event");
+            let Some(event) = self.watch_rx.recv().await else {
+                /* The watcher is gone; keep waiting instead of returning
+                 * immediately, which would spin the service event loop.
+                 */
+                log::error!("config file watcher stopped");
+                std::future::pending::<()>().await;
+                continue;
+            };
+            let event = match event {
+                Ok(event) => event,
+                Err(e) => {
+                    // e.g. the OS ran out of inotify watches
+                    log::warn!("error watching the config file: {e}");
+                    continue;
+                }
+            };
             if event.paths.contains(&self.config_path)
                 && matches!(
                     event.kind,
@@ -635,25 +649,28 @@ impl Config {
 
     /// set configured clients
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
-        if clients.is_empty() {
-            return;
-        }
-        if self.config_toml.is_none() {
-            self.config_toml = Some(Default::default());
-        }
-        self.config_toml.as_mut().expect("config").clients =
-            Some(clients.into_iter().map(|c| c.into()).collect::<Vec<_>>());
+        // An empty list is meaningful: deleting the last client has to be
+        // persisted, otherwise the watcher reloads the old list and the
+        // deleted client comes back.
+        let config = self.toml_mut();
+        config.clients = Some(clients.into_iter().map(|c| c.into()).collect::<Vec<_>>());
     }
 
     /// set authorized keys
     pub fn set_authorized_keys(&mut self, fingerprints: HashMap<String, String>) {
-        if self.config_toml.is_none() {
-            self.config_toml = Some(Default::default());
-        }
-        self.config_toml
-            .as_mut()
-            .expect("config")
-            .authorized_fingerprints = Some(fingerprints);
+        self.toml_mut().authorized_fingerprints = Some(fingerprints);
+    }
+
+    /// store the currently used listen port so a runtime port change survives
+    /// a restart
+    pub fn set_port(&mut self, port: u16) {
+        self.toml_mut().port = Some(port);
+    }
+
+    /// mutable access to the in-memory config, creating a default one if the
+    /// config file could not be read
+    fn toml_mut(&mut self) -> &mut ConfigToml {
+        self.config_toml.get_or_insert_with(Default::default)
     }
 
     pub fn read_from_disk(&mut self) -> Result<bool, io::Error> {

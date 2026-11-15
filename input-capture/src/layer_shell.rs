@@ -104,7 +104,7 @@ impl Display for Output {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct OutputInfo {
     description: String,
     name: String,
@@ -127,7 +127,7 @@ struct State {
     qh: QueueHandle<Self>,
     pending_events: VecDeque<(Position, CaptureEvent)>,
     outputs: Vec<Output>,
-    scroll_discrete_pending: bool,
+    scroll_discrete_pending: HashSet<u8>,
 }
 
 struct Inner {
@@ -157,7 +157,7 @@ impl Window {
         output: &WlOutput,
         pos: Position,
         size: (i32, i32),
-    ) -> Window {
+    ) -> Option<Window> {
         log::debug!("creating window output: {output:?}, size: {size:?}");
         let g = &state.globals;
 
@@ -165,7 +165,13 @@ impl Window {
             Position::Left | Position::Right => (1, size.1 as u32),
             Position::Top | Position::Bottom => (size.0 as u32, 1),
         };
-        let mut file = tempfile::tempfile().unwrap();
+        let mut file = match tempfile::tempfile() {
+            Ok(f) => f,
+            Err(e) => {
+                log::error!("unable to create a temporary file for the capture window: {e}");
+                return None;
+            }
+        };
         draw(&mut file, (width, height));
         let pool = g
             .shm
@@ -179,6 +185,9 @@ impl Window {
             qh,
             (),
         );
+        // the pool object is no longer needed once the buffer exists, and the
+        // buffer keeps the underlying mapping alive
+        pool.destroy();
         let surface = g.compositor.create_surface(qh, ());
 
         let layer_surface = g.layer_shell.get_layer_surface(
@@ -202,12 +211,12 @@ impl Window {
         layer_surface.set_margin(0, 0, 0, 0);
         surface.set_input_region(None);
         surface.commit();
-        Window {
+        Some(Window {
             pos,
             buffer,
             surface,
             layer_surface,
-        }
+        })
     }
 }
 
@@ -334,7 +343,7 @@ impl LayerShellInputCapture {
             read_guard: None,
             pending_events: VecDeque::new(),
             outputs: vec![],
-            scroll_discrete_pending: false,
+            scroll_discrete_pending: Default::default(),
         };
 
         for global in state.global_list.contents().clone_list() {
@@ -367,22 +376,30 @@ impl LayerShellInputCapture {
     fn delete_client(&mut self, pos: Position) {
         let inner = self.0.get_mut();
         inner.state.active_positions.remove(&pos);
+        // Release the grab before dropping the window it belongs to: leaving
+        // `pointer_lock`/`rel_pointer` set would make `grab()` skip creating
+        // them for the next session, which permanently disables pointer
+        // motion (it is only delivered via the relative pointer object).
+        if inner.state.focused.as_ref().is_some_and(|w| w.pos == pos) {
+            inner.state.ungrab();
+            inner.state.focused = None;
+        }
         // remove all windows corresponding to this client
         while let Some(i) = inner.state.active_windows.iter().position(|w| w.pos == pos) {
             inner.state.active_windows.remove(i);
-            inner.state.focused = None;
         }
     }
 }
 
 impl State {
     fn update_output_info(&mut self, name: u32) {
-        let output = self
-            .outputs
-            .iter_mut()
-            .find(|o| o.global.name == name)
-            .expect("output not found");
-        if output.has_xdg_info {
+        let Some(output) = self.outputs.iter_mut().find(|o| o.global.name == name) else {
+            // the output can be gone already when both `GlobalRemove` and the
+            // output's `Done` arrive in the same dispatch batch
+            log::debug!("output {name} is gone, ignoring its info update");
+            return;
+        };
+        if output.has_xdg_info && output.info.as_ref() != Some(&output.pending_info) {
             output.info.replace(output.pending_info.clone());
             self.update_windows();
         }
@@ -429,7 +446,10 @@ impl State {
         serial: u32,
         qh: &QueueHandle<State>,
     ) {
-        let window = self.focused.as_ref().unwrap();
+        let Some(window) = self.focused.clone() else {
+            log::debug!("grab requested without a focused window");
+            return;
+        };
 
         // hide the cursor
         pointer.set_cursor(serial, None, 0, 0);
@@ -475,17 +495,13 @@ impl State {
     }
 
     fn ungrab(&mut self) {
-        // get focused client
-        let window = match self.focused.as_ref() {
-            Some(focused) => focused,
-            None => return,
-        };
-
-        // ungrab surface
-        window
-            .layer_surface
-            .set_keyboard_interactivity(KeyboardInteractivity::None);
-        window.surface.commit();
+        // ungrab surface (the focused window may already be gone)
+        if let Some(window) = self.focused.as_ref() {
+            window
+                .layer_surface
+                .set_keyboard_interactivity(KeyboardInteractivity::None);
+            window.surface.commit();
+        }
 
         // destroy pointer lock
         if let Some(pointer_lock) = &self.pointer_lock {
@@ -523,9 +539,9 @@ impl State {
         );
         outputs.iter().for_each(|o| {
             if let Some(info) = o.info.as_ref() {
-                let window = Window::new(self, &self.qh, &o.wl_output, pos, info.size);
-                let window = Arc::new(window);
-                self.active_windows.push(window);
+                if let Some(window) = Window::new(self, &self.qh, &o.wl_output, pos, info.size) {
+                    self.active_windows.push(Arc::new(window));
+                }
             }
         });
     }
@@ -536,6 +552,11 @@ impl State {
             log::info!(" * {output}");
         }
 
+        // The windows are about to be recreated, so drop the grabs first: they
+        // are bound to surfaces that would be destroyed underneath them, and a
+        // stale `Some` would prevent `grab()` from recreating them.
+        self.ungrab();
+        self.focused = None;
         self.active_windows.clear();
 
         let active_positions = self.active_positions.iter().cloned().collect::<Vec<_>>();
@@ -546,15 +567,22 @@ impl State {
 }
 
 impl Inner {
-    fn read(&mut self) {
-        match self.state.read_guard.take().unwrap().read() {
-            Ok(_) => {}
-            Err(WaylandError::Io(e)) if e.kind() == ErrorKind::WouldBlock => {}
+    fn read(&mut self) -> io::Result<()> {
+        let Some(guard) = self.state.read_guard.take() else {
+            log::debug!("read called without a prepared read guard");
+            return Ok(());
+        };
+        match guard.read() {
+            Ok(_) => Ok(()),
+            Err(WaylandError::Io(e)) if e.kind() == ErrorKind::WouldBlock => Ok(()),
             Err(WaylandError::Io(e)) => {
                 log::error!("error reading from wayland socket: {e}");
+                Ok(())
             }
             Err(WaylandError::Protocol(e)) => {
-                panic!("wayland protocol violation: {e}")
+                // A broken connection must be reported, not abort the process:
+                // the compositor may have restarted, which is recoverable.
+                Err(io::Error::other(format!("wayland protocol violation: {e}")))
             }
         }
     }
@@ -565,44 +593,38 @@ impl Inner {
                 self.state.read_guard = Some(guard);
                 break Ok(());
             } else {
-                self.dispatch_events();
+                self.dispatch_events()?;
             }
         }
     }
 
-    fn dispatch_events(&mut self) {
+    fn dispatch_events(&mut self) -> io::Result<()> {
         match self.queue.dispatch_pending(&mut self.state) {
-            Ok(_) => {}
+            Ok(_) => Ok(()),
             Err(DispatchError::Backend(WaylandError::Io(e))) => {
                 log::error!("Wayland Error: {e}");
+                Ok(())
             }
-            Err(DispatchError::Backend(e)) => {
-                panic!("backend error: {e}");
-            }
+            Err(DispatchError::Backend(e)) => Err(io::Error::other(format!("backend error: {e}"))),
             Err(DispatchError::BadMessage {
                 sender_id,
                 interface,
                 opcode,
-            }) => {
-                panic!("bad message {sender_id}, {interface} , {opcode}");
-            }
+            }) => Err(io::Error::other(format!(
+                "bad message {sender_id}, {interface} , {opcode}"
+            ))),
         }
     }
 
     fn flush_events(&mut self) -> io::Result<()> {
         // flush outgoing events
         match self.queue.flush() {
-            Ok(_) => (),
-            Err(e) => match e {
-                WaylandError::Io(e) => {
-                    return Err(e);
-                }
-                WaylandError::Protocol(e) => {
-                    panic!("wayland protocol violation: {e}")
-                }
-            },
+            Ok(_) => Ok(()),
+            Err(WaylandError::Io(e)) => Err(e),
+            Err(WaylandError::Protocol(e)) => {
+                Err(io::Error::other(format!("wayland protocol violation: {e}")))
+            }
         }
-        Ok(())
     }
 }
 
@@ -647,10 +669,10 @@ impl Stream for LayerShellInputCapture {
                 let inner = guard.get_inner_mut();
 
                 // read events
-                inner.read();
+                inner.read()?;
 
                 // dispatch the events
-                inner.dispatch_events();
+                inner.dispatch_events()?;
 
                 // flush outgoing events
                 if let Err(e) = inner.flush_events() {
@@ -660,10 +682,7 @@ impl Stream for LayerShellInputCapture {
                 }
 
                 // prepare for the next read
-                match inner.prepare_read() {
-                    Ok(_) => {}
-                    Err(e) => return Poll::Ready(Some(Err(e.into()))),
-                }
+                inner.prepare_read()?;
             }
 
             // clear read readiness for tokio read guard
@@ -702,7 +721,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
                 if let Some(k) = state.keyboard.take() {
                     k.release();
                 }
-                seat.get_keyboard(qh, ());
+                state.keyboard = Some(seat.get_keyboard(qh, ()));
             }
         }
     }
@@ -772,9 +791,11 @@ impl Dispatch<WlPointer, ()> for State {
                 button,
                 state,
             } => {
-                let window = app.focused.as_ref().unwrap();
+                let Some(pos) = app.focused.as_ref().map(|w| w.pos) else {
+                    return;
+                };
                 app.pending_events.push_back((
-                    window.pos,
+                    pos,
                     CaptureEvent::Input(Event::Pointer(PointerEvent::Button {
                         time,
                         button,
@@ -783,15 +804,20 @@ impl Dispatch<WlPointer, ()> for State {
                 ));
             }
             wl_pointer::Event::Axis { time, axis, value } => {
-                let window = app.focused.as_ref().unwrap();
-                if app.scroll_discrete_pending {
+                let Some(pos) = app.focused.as_ref().map(|w| w.pos) else {
+                    return;
+                };
+                if app
+                    .scroll_discrete_pending
+                    .contains(&(u32::from(axis) as u8))
+                {
                     // each axisvalue120 event is coupled with
                     // a corresponding axis event, which needs to
                     // be ignored to not duplicate the scrolling
-                    app.scroll_discrete_pending = false;
+                    app.scroll_discrete_pending.remove(&(u32::from(axis) as u8));
                 } else {
                     app.pending_events.push_back((
-                        window.pos,
+                        pos,
                         CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
                             time,
                             axis: u32::from(axis) as u8,
@@ -801,10 +827,12 @@ impl Dispatch<WlPointer, ()> for State {
                 }
             }
             wl_pointer::Event::AxisValue120 { axis, value120 } => {
-                let window = app.focused.as_ref().unwrap();
-                app.scroll_discrete_pending = true;
+                let Some(pos) = app.focused.as_ref().map(|w| w.pos) else {
+                    return;
+                };
+                app.scroll_discrete_pending.insert(u32::from(axis) as u8);
                 app.pending_events.push_back((
-                    window.pos,
+                    pos,
                     CaptureEvent::Input(Event::Pointer(PointerEvent::AxisDiscrete120 {
                         axis: u32::from(axis) as u8,
                         value: value120,
@@ -812,9 +840,10 @@ impl Dispatch<WlPointer, ()> for State {
                 ));
             }
             wl_pointer::Event::Frame => {
-                // TODO properly handle frame events
-                // we simply insert a frame event on the client side
-                // after each event for now
+                // A frame is complete: any pending discrete scroll event that
+                // was not paired with a continuous axis event in this frame
+                // must not swallow the next, unrelated one.
+                app.scroll_discrete_pending.clear();
             }
             _ => {}
         }
