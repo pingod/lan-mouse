@@ -61,7 +61,9 @@ pub(crate) enum HotkeyAction {
 }
 
 /// How long to wait for an on-demand connection before giving up on a hotkey.
+#[cfg(unix)]
 const CONNECT_ATTEMPTS: usize = 20;
+#[cfg(unix)]
 const CONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// Type a hotkey's key sequence on the peer.
