@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use lan_mouse_ipc::{
     AsyncFrontendEventReader, AsyncFrontendRequestWriter, ClientHandle, ConnectionError,
-    FrontendEvent, FrontendRequest, IpcError, Position, connect_async,
+    DEFAULT_PORT, FrontendEvent, FrontendRequest, IpcError, Position, connect_async,
 };
 
 #[derive(Debug, Error)]
@@ -126,31 +126,39 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             enter_hook,
             leave_hook,
         }) => {
-            tx.request(FrontendRequest::Create).await?;
+            // Create the client with its whole configuration in one request:
+            // `Create` followed by `Update*` requests is racy because the
+            // `Created` answer is broadcast to every connected frontend, so
+            // two concurrent `add-client` runs send their updates for the
+            // wrong handle.
+            let port = port.unwrap_or(DEFAULT_PORT);
+            let fix_ips = ips.unwrap_or_default();
+            tx.request(FrontendRequest::CreateClient {
+                hostname: hostname.clone(),
+                port,
+                position: Position::default(),
+                fix_ips: fix_ips.clone(),
+                enter_hook,
+                leave_hook,
+            })
+            .await?;
             loop {
                 let event = rx.next().await.ok_or(CliError::ConnectionClosed)??;
                 match event {
-                    FrontendEvent::Created(handle, _, _) => {
-                        if let Some(hostname) = hostname {
-                            tx.request(FrontendRequest::UpdateHostname(handle, Some(hostname)))
-                                .await?;
-                        }
-                        if let Some(port) = port {
-                            tx.request(FrontendRequest::UpdatePort(handle, port))
-                                .await?;
-                        }
-                        if let Some(ips) = ips {
-                            tx.request(FrontendRequest::UpdateFixIps(handle, ips))
-                                .await?;
-                        }
-                        if let Some(enter_hook) = enter_hook {
-                            tx.request(FrontendRequest::UpdateEnterHook(handle, Some(enter_hook)))
-                                .await?;
-                        }
-                        if let Some(leave_hook) = leave_hook {
-                            tx.request(FrontendRequest::UpdateLeaveHook(handle, Some(leave_hook)))
-                                .await?;
-                        }
+                    // Match on the configuration we sent so a `Created` event
+                    // of a concurrent `add-client` is not mistaken for ours.
+                    FrontendEvent::Created(handle, config, state)
+                        if config.hostname == hostname
+                            && config.port == port
+                            && config.fix_ips == fix_ips =>
+                    {
+                        println!(
+                            "id {handle}: {}:{} ({:?}) active: {}",
+                            config.hostname.as_deref().unwrap_or("unknown"),
+                            config.port,
+                            config.pos,
+                            state.active
+                        );
                         break;
                     }
                     FrontendEvent::Error(msg) => return Err(CliError::Service(msg)),

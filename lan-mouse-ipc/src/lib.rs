@@ -281,6 +281,30 @@ pub enum FrontendRequest {
     Activate(ClientHandle, bool),
     /// add a new client
     Create,
+    /// add a new client together with its full configuration
+    ///
+    /// `Create` has to be followed by `UpdateHostname`/`UpdatePort`/
+    /// `UpdatePosition`/`UpdateFixIps`, and the answers to those are broadcast
+    /// to every connected frontend: two frontends creating a client at the
+    /// same time therefore apply each other's `Created(handle)` to the wrong
+    /// handle and leave half-configured clients behind. Sending the whole
+    /// configuration at once makes creating a client atomic, so a single
+    /// request is all a caller needs (the resulting handle is looked up with
+    /// `Enumerate`).
+    CreateClient {
+        /// hostname of the new client
+        hostname: Option<String>,
+        /// port of the new client
+        port: u16,
+        /// position of the new client on screen
+        position: Position,
+        /// fix ips, determined by the user
+        fix_ips: Vec<IpAddr>,
+        /// command to run when the pointer enters this client
+        enter_hook: Option<String>,
+        /// command to run when the pointer leaves this client
+        leave_hook: Option<String>,
+    },
     /// change the listen port (recreate udp listener)
     ChangePort(u16),
     /// remove a client

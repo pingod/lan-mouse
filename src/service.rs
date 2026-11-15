@@ -11,7 +11,7 @@ use crate::{
 };
 use futures::StreamExt;
 use lan_mouse_ipc::{
-    AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
+    AsyncFrontendListener, ClientConfig, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
     IpcListenerCreationError, Position, Status,
 };
 use log;
@@ -397,6 +397,33 @@ impl Service {
             FrontendRequest::ChangePort(port) => self.change_port(port),
             FrontendRequest::Create => {
                 self.add_client();
+                self.save_config();
+            }
+            FrontendRequest::CreateClient {
+                hostname,
+                port,
+                position,
+                fix_ips,
+                enter_hook,
+                leave_hook,
+            } => {
+                let handle = self.add_client_with(ClientConfig {
+                    hostname,
+                    port,
+                    pos: position,
+                    fix_ips,
+                    cmd: enter_hook,
+                    leave_cmd: leave_hook,
+                });
+                // `UpdateHostname` starts a lookup; a client created with a
+                // hostname must do the same, otherwise it never gets an address.
+                if self
+                    .client_manager
+                    .get_state(handle)
+                    .is_some_and(|(c, _)| c.hostname.is_some())
+                {
+                    self.resolve(handle);
+                }
                 self.save_config();
             }
             FrontendRequest::Delete(handle) => {
@@ -1002,10 +1029,24 @@ impl Service {
     }
 
     fn add_client(&mut self) {
+        self.add_client_with(ClientConfig::default());
+    }
+
+    /// add a client with a known configuration in one step
+    ///
+    /// Splitting this into `Create` plus a sequence of `Update*` requests is
+    /// racy: the `Created(handle)` answer is broadcast to every frontend, so
+    /// two frontends creating a client at the same time send their updates for
+    /// the wrong handle and leave half-configured clients behind.
+    fn add_client_with(&mut self, config: ClientConfig) -> ClientHandle {
         let handle = self.client_manager.add_client();
         log::info!("added client {handle}");
-        let (c, s) = self.client_manager.get_state(handle).unwrap();
-        self.notify_frontend(FrontendEvent::Created(handle, c, s));
+        self.client_manager.set_config(handle, config);
+        match self.client_manager.get_state(handle) {
+            Some((c, s)) => self.notify_frontend(FrontendEvent::Created(handle, c, s)),
+            None => log::error!("client {handle} disappeared right after it was created"),
+        }
+        handle
     }
 
     fn set_client_active(&mut self, handle: ClientHandle, active: bool) {

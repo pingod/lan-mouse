@@ -608,6 +608,14 @@ impl CaptureTask {
             }
         }
 
+        // Debug logging of the key stream: media keys and other "special" keys
+        // only show up here if the backend captured them at all, which is the
+        // first thing to rule out when such a key does nothing on the peer.
+        if let CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key { key, state, .. })) = &event
+        {
+            log::debug!("capture: forwarding key {key} state {state} to client {handle}");
+        }
+
         let opposite_pos = to_proto_pos(pos.opposite());
 
         let events: Vec<ProtoEvent> = match event {
