@@ -476,6 +476,11 @@ impl Window {
     }
 
     /// Prompt for `from` and `to`, then add the rule.
+    /// Record a chord by pressing it, instead of typing key names by hand.
+    ///
+    /// Hand-typed names are easy to get wrong (`KeyLeftAlt` vs `LeftAlt`), and
+    /// a mistyped rule silently never fires. Capturing the actual keystroke
+    /// removes that class of mistake.
     pub(super) fn open_hotkey_dialog(&self) {
         let dialog = gtk::Dialog::builder()
             .transient_for(self)
@@ -484,12 +489,17 @@ impl Window {
             .build();
 
         let from_entry = gtk::Entry::builder()
-            .placeholder_text("Shift+Alt+Z")
-            .text("Shift+Alt+Z")
+            .placeholder_text("press the keys, or type e.g. Shift+Alt+Z")
             .build();
         let to_entry = gtk::Entry::builder()
             .placeholder_text("Z")
             .text("Z")
+            .build();
+        let recorder = gtk::Label::builder()
+            .label("Click Record, then press the combination")
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["dim-label"])
             .build();
 
         let box_ = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -497,6 +507,7 @@ impl Window {
         box_.set_margin_bottom(12);
         box_.set_margin_start(12);
         box_.set_margin_end(12);
+
         box_.append(
             &gtk::Label::builder()
                 .label("Local keys — sent to the other machine, your own keystroke still works")
@@ -504,7 +515,17 @@ impl Window {
                 .wrap(true)
                 .build(),
         );
-        box_.append(&from_entry);
+
+        let from_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        from_row.append(&from_entry);
+        let record_button = gtk::ToggleButton::builder()
+            .label("Record")
+            .tooltip_text("capture the next key combination you press")
+            .build();
+        from_row.append(&record_button);
+        box_.append(&from_row);
+        box_.append(&recorder);
+
         box_.append(
             &gtk::Label::builder()
                 .label("Keys sent to the peer")
@@ -512,6 +533,29 @@ impl Window {
                 .build(),
         );
         box_.append(&to_entry);
+
+        // Capture keys while recording. `capture` phase runs before the entry
+        // sees them, so a chord does not also get typed into the field.
+        let controller = gtk::EventControllerKey::new();
+        controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+        {
+            let from_entry = from_entry.clone();
+            let recorder = recorder.clone();
+            let record_button = record_button.clone();
+            controller.connect_key_pressed(move |_, keyval, _code, state| {
+                if !record_button.is_active() {
+                    return glib::Propagation::Proceed;
+                }
+                let Some(chord) = chord_from_key(keyval, state) else {
+                    return glib::Propagation::Stop;
+                };
+                from_entry.set_text(&chord);
+                recorder.set_text("Captured — click Add");
+                record_button.set_active(false);
+                glib::Propagation::Stop
+            });
+        }
+        dialog.add_controller(controller);
 
         dialog.content_area().append(&box_);
         dialog.add_button("Cancel", gtk::ResponseType::Cancel);
@@ -523,7 +567,9 @@ impl Window {
             if response == gtk::ResponseType::Accept {
                 let from = from_entry.text().to_string();
                 let to = to_entry.text().to_string();
-                window.request(FrontendRequest::AddHotkey(from, to));
+                if !from.trim().is_empty() {
+                    window.request(FrontendRequest::AddHotkey(from, to));
+                }
             }
             dialog.close();
         });
@@ -880,5 +926,151 @@ impl Window {
         );
         window.present();
         self.imp().authorization_window.replace(Some(window));
+    }
+}
+
+/// Build a chord string (`Shift+Alt+Z`) from a key press.
+///
+/// Returns `None` when the press is a bare modifier: the user is still
+/// assembling the combination, so there is nothing to record yet.
+fn chord_from_key(keyval: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> Option<String> {
+    use gtk::gdk::ModifierType;
+
+    let mut parts: Vec<&str> = Vec::new();
+    if state.contains(ModifierType::SHIFT_MASK) {
+        parts.push("KeyLeftShift");
+    }
+    if state.contains(ModifierType::CONTROL_MASK) {
+        parts.push("KeyLeftCtrl");
+    }
+    if state.contains(ModifierType::ALT_MASK) {
+        parts.push("KeyLeftAlt");
+    }
+    if state.contains(ModifierType::SUPER_MASK) {
+        parts.push("KeyLeftMeta");
+    }
+
+    // A modifier alone is not a complete chord.
+    let is_modifier = matches!(
+        keyval,
+        gtk::gdk::Key::Shift_L
+            | gtk::gdk::Key::Shift_R
+            | gtk::gdk::Key::Control_L
+            | gtk::gdk::Key::Control_R
+            | gtk::gdk::Key::Alt_L
+            | gtk::gdk::Key::Alt_R
+            | gtk::gdk::Key::Super_L
+            | gtk::gdk::Key::Super_R
+            | gtk::gdk::Key::Meta_L
+            | gtk::gdk::Key::Meta_R
+            | gtk::gdk::Key::ISO_Level3_Shift
+    );
+    if is_modifier {
+        return None;
+    }
+
+    let name = key_name(keyval)?;
+    if !parts.is_empty() {
+        return Some(format!("{}+{}", parts.join("+"), name));
+    }
+    Some(name.to_owned())
+}
+
+/// Map a GDK keyval to the config's key spelling.
+///
+/// The daemon accepts friendly names (`Z`, `LeftShift`) and canonicalises them,
+/// so only the shape has to be right here.
+fn key_name(keyval: gtk::gdk::Key) -> Option<&'static str> {
+    let name = match keyval {
+        gtk::gdk::Key::space => "Space",
+        gtk::gdk::Key::Return => "Enter",
+        gtk::gdk::Key::Tab => "Tab",
+        gtk::gdk::Key::Escape => "Escape",
+        gtk::gdk::Key::BackSpace => "Backspace",
+        gtk::gdk::Key::Delete => "Delete",
+        gtk::gdk::Key::Left => "Left",
+        gtk::gdk::Key::Right => "Right",
+        gtk::gdk::Key::Up => "Up",
+        gtk::gdk::Key::Down => "Down",
+        gtk::gdk::Key::Home => "Home",
+        gtk::gdk::Key::End => "End",
+        gtk::gdk::Key::Page_Up => "PageUp",
+        gtk::gdk::Key::Page_Down => "PageDown",
+        gtk::gdk::Key::F1 => "F1",
+        gtk::gdk::Key::F2 => "F2",
+        gtk::gdk::Key::F3 => "F3",
+        gtk::gdk::Key::F4 => "F4",
+        gtk::gdk::Key::F5 => "F5",
+        gtk::gdk::Key::F6 => "F6",
+        gtk::gdk::Key::F7 => "F7",
+        gtk::gdk::Key::F8 => "F8",
+        gtk::gdk::Key::F9 => "F9",
+        gtk::gdk::Key::F10 => "F10",
+        gtk::gdk::Key::F11 => "F11",
+        gtk::gdk::Key::F12 => "F12",
+        _ => return single_char_name(keyval),
+    };
+    Some(name)
+}
+
+/// Printable characters are named by themselves (`z` -> `KeyZ` upstream).
+fn single_char_name(keyval: gtk::gdk::Key) -> Option<&'static str> {
+    let c = keyval.to_unicode()?;
+    let upper = c.to_ascii_uppercase();
+    if !upper.is_ascii_alphanumeric() {
+        return None;
+    }
+    // A small fixed table keeps the returned value `'static`; only the letters
+    // and digits a hotkey realistically uses are covered.
+    const NAMES: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let idx = NAMES.chars().position(|n| n == upper)?;
+    Some(&NAMES[idx..idx + 1])
+}
+
+#[cfg(test)]
+mod chord_tests {
+    use super::*;
+    use gtk::gdk::{Key, ModifierType};
+
+    #[test]
+    fn letter_with_modifiers() {
+        assert_eq!(
+            chord_from_key(Key::z, ModifierType::SHIFT_MASK | ModifierType::ALT_MASK),
+            Some("KeyLeftShift+KeyLeftAlt+Z".to_owned())
+        );
+    }
+
+    #[test]
+    fn bare_modifier_is_not_a_chord() {
+        // The user is still assembling the combination.
+        assert_eq!(chord_from_key(Key::Shift_L, ModifierType::SHIFT_MASK), None);
+        assert_eq!(chord_from_key(Key::Alt_L, ModifierType::ALT_MASK), None);
+    }
+
+    #[test]
+    fn single_key_without_modifiers() {
+        assert_eq!(chord_from_key(Key::z, ModifierType::empty()), Some("Z".to_owned()));
+    }
+
+    #[test]
+    fn named_keys_map_to_config_spelling() {
+        assert_eq!(
+            chord_from_key(Key::F5, ModifierType::CONTROL_MASK),
+            Some("KeyLeftCtrl+F5".to_owned())
+        );
+        assert_eq!(
+            chord_from_key(Key::space, ModifierType::empty()),
+            Some("Space".to_owned())
+        );
+        assert_eq!(
+            chord_from_key(Key::Page_Down, ModifierType::empty()),
+            Some("PageDown".to_owned())
+        );
+    }
+
+    #[test]
+    fn punctuation_is_rejected_rather_than_misnamed() {
+        // Better to record nothing than a name the daemon cannot resolve.
+        assert_eq!(chord_from_key(Key::semicolon, ModifierType::empty()), None);
     }
 }
