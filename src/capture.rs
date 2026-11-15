@@ -38,6 +38,9 @@ pub(crate) enum ICaptureEvent {
     CaptureDisabled,
     /// capture disabled
     CaptureEnabled,
+    /// the pointer reached this machine's own edge; ask the driving peer to
+    /// release it
+    ReturnRequested(CaptureHandle),
     /// A (new) client was entered.
     /// In contrast to [`ICaptureEvent::CaptureBegin`] this
     /// event is only triggered when the capture was
@@ -509,6 +512,20 @@ impl CaptureTask {
                     self.last_enter_release = Some(Instant::now());
                     log::info!("releasing capture: no active client at this position");
                     capture.release().await?;
+                    // Tell the peer that is driving us to let go. Without this
+                    // the receiver notices the cursor reaching its own edge and
+                    // releases locally, but the sender keeps forwarding into a
+                    // machine that is no longer emulating — the pointer stays
+                    // hidden on the remote edge and never comes back.
+                    //
+                    // The notification goes out as an event rather than a
+                    // direct send: an enter-only capture is identified by a
+                    // synthetic handle that has no entry in the client manager,
+                    // so `conn.send` cannot resolve it. The service knows the
+                    // socket address for this handle and replies on it.
+                    self.event_tx
+                        .send(ICaptureEvent::ReturnRequested(handle))
+                        .expect("channel closed");
                 } else {
                     log::trace!("suppressing repeated enter-only release");
                 }

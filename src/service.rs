@@ -628,6 +628,18 @@ impl Service {
                 self.active_capture = Some(handle);
                 self.spawn_hook_command(handle, HookKind::Enter);
             }
+            ICaptureEvent::ReturnRequested(handle) => {
+                // The pointer came back to this machine's own edge while a peer
+                // was driving it. Tell that peer to release, otherwise it keeps
+                // forwarding into a machine that stopped emulating and the
+                // pointer never returns.
+                if let Some(incoming) = self.incoming_conn_info.get(&handle) {
+                    log::info!("pointer returned: asking {} to release", incoming.addr);
+                    self.emulation.send_leave_event(incoming.addr);
+                } else {
+                    log::debug!("return requested for unknown handle {handle}");
+                }
+            }
             ICaptureEvent::ClientLeft(handle) => {
                 log::info!("leaving client {handle} ...");
                 if self.active_capture == Some(handle) {

@@ -256,6 +256,8 @@ mod imp {
 mod noop {
     use crate::{config::Config, connect::LanMouseConnection};
 
+    use super::HotkeyFire;
+
     /// Placeholder for platforms without an evdev listener.
     ///
     /// The service references this field from its `select!` unconditionally, so
@@ -271,11 +273,11 @@ mod noop {
 
         pub(crate) fn reload(&mut self, _config: &Config) {}
 
-        pub(crate) async fn next(&mut self) -> Vec<u32> {
+        pub(crate) async fn next(&mut self) -> HotkeyFire {
             std::future::pending::<()>().await;
             unreachable!()
         }
 
-        pub(crate) async fn send(&self, _keys: Vec<u32>, _capture_active: bool) {}
+        pub(crate) async fn send(&self, _fire: HotkeyFire, _capture_active: bool) {}
     }
 }

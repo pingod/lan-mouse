@@ -13,6 +13,17 @@ use core_foundation::{
 /// on-wire behaviour between them.
 const INJECTED_EVENT_TAG: i64 = 0x6c616e6d; // "lanm"
 
+/// Whether `event_type` reports pointer movement.
+fn is_pointer_motion(event_type: CGEventType) -> bool {
+    matches!(
+        event_type,
+        CGEventType::MouseMoved
+            | CGEventType::LeftMouseDragged
+            | CGEventType::RightMouseDragged
+            | CGEventType::OtherMouseDragged
+    )
+}
+
 use core_graphics::{
     base::{CGError, kCGErrorSuccess},
     display::{CGDisplay, CGPoint},
@@ -539,27 +550,50 @@ fn create_event_tap<'a>(
             return CallbackResult::Keep;
         }
 
-        // Skip events this process synthesized. Injected keystrokes are posted
-        // at the HID layer, so without this check the capture tap picks them up
-        // and forwards them straight back to the peer: a hotkey then looks like
+        // Skip synthesized *keyboard* events. Injected keystrokes are posted at
+        // the HID layer, so without this check the capture tap picks them up and
+        // forwards them straight back to the peer: a hotkey then looks like
         // local typing and the feedback loop compounds.
-        if cg_ev.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == INJECTED_EVENT_TAG {
-            log::trace!("ignoring synthesized event");
+        //
+        // Pointer motion is deliberately NOT skipped. The pointer position that
+        // `crossed()` reads comes from these very events, so ignoring them left
+        // the receiver unable to notice the cursor reaching its own edge — the
+        // pointer could enter the peer but never come back. Feedback is avoided
+        // instead by latching the barrier and by parking the cursor inside the
+        // edge after a release, not by hiding the motion.
+        let synthesized =
+            cg_ev.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA) == INJECTED_EVENT_TAG;
+        // Keys are always filtered: a re-captured keystroke would be forwarded
+        // straight back to the peer.
+        //
+        // Pointer motion is let through, because `crossed()` reads the position
+        // from these events. Filtering them out made a remote-driven machine
+        // blind to the cursor reaching its own edge, so the pointer could enter
+        // it but never come back. The feedback loop that the filter originally
+        // guarded against is prevented by the barrier latch and by parking the
+        // cursor inside the edge on release instead.
+        if synthesized && !is_pointer_motion(event_type) {
+            log::trace!("ignoring synthesized key event");
             return CallbackResult::Keep;
         }
 
         // Are we in a client?
         if let Some(current_pos) = state.current_pos {
             capture_position = Some(current_pos);
-            get_events(
-                &event_type,
-                cg_ev,
-                &mut res_events,
-                &mut state.modifier_state,
-            )
-            .unwrap_or_else(|e| {
-                log::error!("Failed to get events: {e}");
-            });
+            // While capturing, a synthesized event is our own injection being
+            // read back. Keep the cursor pinned but do not forward it: that
+            // would send the peer its own movement.
+            if !synthesized {
+                get_events(
+                    &event_type,
+                    cg_ev,
+                    &mut res_events,
+                    &mut state.modifier_state,
+                )
+                .unwrap_or_else(|e| {
+                    log::error!("Failed to get events: {e}");
+                });
+            }
 
             // Keep (hidden) cursor at the edge of the screen
             if matches!(
