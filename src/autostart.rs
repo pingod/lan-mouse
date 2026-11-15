@@ -6,18 +6,14 @@
 //! matches the copy the user is actually running.
 
 use std::io;
+#[cfg(unix)]
 use std::path::PathBuf;
 
 /// Name of the entry that starts lan-mouse with the session.
-///
-/// Windows has no such entry yet; the constant still has to exist because the
-/// tests and the error path reference it.
 #[cfg(all(unix, not(target_os = "macos")))]
 const UNIT_NAME: &str = "lan-mouse.service";
 #[cfg(target_os = "macos")]
 const UNIT_NAME: &str = "de.feschber.LanMouse.plist";
-#[cfg(not(unix))]
-const UNIT_NAME: &str = "lan-mouse.lnk";
 
 /// Whether autostart is currently installed.
 pub(crate) fn is_enabled() -> bool {

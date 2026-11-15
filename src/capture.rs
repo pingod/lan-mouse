@@ -103,6 +103,7 @@ impl Capture {
             active: active.clone(),
             remap: Remap::new(remap_rules),
             entered_at: None,
+            last_enter_release: None,
             state: Default::default(),
         };
         let task = spawn_local(capture_task.run());
@@ -201,6 +202,8 @@ struct CaptureTask {
     active: Rc<Cell<bool>>,
     /// when the active client acknowledged the connection
     entered_at: Option<Instant>,
+    /// when the enter-only capture last asked the backend to release
+    last_enter_release: Option<Instant>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
 }
@@ -411,15 +414,28 @@ impl CaptureTask {
                 .expect("channel closed");
         }
 
-        // enter only capture (for incoming connections)
+        // Enter-only capture (used for incoming connections).
+        //
+        // `release()` is asynchronous — the backend re-arms the barrier on its
+        // own task — so the very next `Begin` can arrive before the release
+        // has taken effect. Releasing again on every one of those begins is
+        // what produced the endless "no active client at this position" loop:
+        // the peer then saw a Leave storm and the two sides fought over the
+        // pointer. Debounce it so one release per crossing is enough.
         if self.get_type(handle) == CaptureType::EnterOnly {
-            // if there is no active outgoing connection at the current capture,
-            // we release the capture
             if !self.is_default_capture_at(self.get_pos(handle)) {
-                log::info!("releasing capture: no active client at this position");
-                capture.release().await?;
+                const RELEASE_DEBOUNCE: Duration = Duration::from_millis(750);
+                let due = self
+                    .last_enter_release
+                    .is_none_or(|t| t.elapsed() >= RELEASE_DEBOUNCE);
+                if due {
+                    self.last_enter_release = Some(Instant::now());
+                    log::info!("releasing capture: no active client at this position");
+                    capture.release().await?;
+                } else {
+                    log::trace!("suppressing repeated enter-only release");
+                }
             }
-            // we dont care about events from incoming handles except for releasing the capture
             return Ok(());
         }
 
