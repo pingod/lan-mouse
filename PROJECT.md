@@ -1,5 +1,7 @@
 # lan-mouse 使用与维护文档
 
+当前版本 **0.12.0**。
+
 本仓库是 [feschber/lan-mouse](https://github.com/feschber/lan-mouse) 的维护分支，
 在 0.11.0 基础上修复了一批输入捕获、指针回程、macOS 权限与前端可用性问题，
 并补充了服务控制、连接状态、日志查看等功能。
@@ -148,7 +150,7 @@ id 0: 192.168.1.5:4242 (top)
   kernel: 27.3.0
   arch: aarch64
   hostname: Pavia-MacBookPro-1859.local
-  version: 0.11.0
+  version: 0.12.0
   commit: 38eb1dc1
 ```
 
@@ -288,7 +290,7 @@ scripts/mac-build.sh
 ```
 
 只同步源码，保留 `target/` 与 `.git/`。后者用于 `shadow-rs` 打 commit 戳；
-没有它，版本行会显示 `0.11.0 ()`。
+没有它，版本行只显示版本号、括号里为空。
 
 ### 7.3 图标资源
 
