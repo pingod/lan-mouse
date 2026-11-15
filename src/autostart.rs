@@ -8,11 +8,16 @@
 use std::io;
 use std::path::PathBuf;
 
-/// Linux: `systemd --user` unit, `macOS`: launchd agent.
+/// Name of the entry that starts lan-mouse with the session.
+///
+/// Windows has no such entry yet; the constant still has to exist because the
+/// tests and the error path reference it.
 #[cfg(all(unix, not(target_os = "macos")))]
 const UNIT_NAME: &str = "lan-mouse.service";
 #[cfg(target_os = "macos")]
 const UNIT_NAME: &str = "de.feschber.LanMouse.plist";
+#[cfg(not(unix))]
+const UNIT_NAME: &str = "lan-mouse.lnk";
 
 /// Whether autostart is currently installed.
 pub(crate) fn is_enabled() -> bool {
@@ -155,12 +160,14 @@ fn reload_systemd() {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn entry_path_is_under_a_config_dir() {
         let path = entry_path().expect("path");
         assert!(path.to_string_lossy().contains(UNIT_NAME));
     }
 
+    #[cfg(unix)]
     #[test]
     fn contents_reference_the_current_binary() {
         // The entry must point at the binary that is running, otherwise
