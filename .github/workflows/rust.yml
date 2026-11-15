@@ -3,8 +3,24 @@ name: Rust
 on:
   push:
     branches: [ "main" ]
+    # Editing docs or CI config does not change any artifact, so there is
+    # nothing to build. Without this, a documentation commit spent a full
+    # multi-platform run.
+    paths-ignore:
+      - "**.md"
+      - ".github/**"
+      - "LICENSE"
+      - "screenshots/**"
   pull_request:
     branches: [ "main" ]
+    # Editing docs or CI config does not change any artifact, so there is
+    # nothing to build. Without this, a documentation commit spent a full
+    # multi-platform run.
+    paths-ignore:
+      - "**.md"
+      - ".github/**"
+      - "LICENSE"
+      - "screenshots/**"
   workflow_dispatch:
 
 env:
