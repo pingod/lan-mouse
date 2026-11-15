@@ -148,19 +148,31 @@ impl Log for CaptureLogger {
             if buffer.len() == CAPACITY {
                 buffer.pop_front();
             }
-            buffer.push_back(line.clone());
+            // Move the string in; it is only needed here and in the stderr
+            // mirror below, which formats from the record again.
+            buffer.push_back(line);
             TOTAL.fetch_add(1, Ordering::Relaxed);
         }
 
         // Mirror to stderr so journald still has the record. A GUI process
         // launched from Finder has no stderr; writing anyway is harmless but
         // pointless, so check once and skip it from then on.
+        //
+        // The line is rebuilt rather than cloned: `eprintln!` locks stderr and
+        // this path runs for every record at debug level, so avoiding an
+        // allocation per record is worth the extra format.
         if *STDERR_WRITABLE.get_or_init(|| {
             // fd 2 exists and is not closed. A tty or a pipe both qualify; only
             // a closed descriptor fails `fcntl(F_GETFL)`.
             unsafe { libc::fcntl(2, libc::F_GETFL) != -1 }
         }) {
-            eprintln!("{line}");
+            eprintln!(
+                "[{} {} {}] {}",
+                record.level(),
+                record.target(),
+                timestamp(),
+                record.args()
+            );
         }
     }
 
@@ -171,12 +183,27 @@ impl Log for CaptureLogger {
 ///
 /// A full date is not worth pulling in a dependency for; log records are read
 /// live, and the journal has precise timestamps when history matters.
+/// Seconds since the Unix epoch, read at most once per second.
+///
+/// Formatting a timestamp per record is measurable at debug level, and a log
+/// view does not need sub-second resolution. The cached value is only used for
+/// display; ordering comes from the ring buffer.
+static CACHED_SECS: AtomicUsize = AtomicUsize::new(usize::MAX);
+
 fn timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_secs() as usize)
         .unwrap_or_default();
+
+    // A relaxed load/store pair: worst case two threads compute the same
+    // string, which is harmless.
+    let mut secs = CACHED_SECS.load(Ordering::Relaxed);
+    if secs == usize::MAX || secs != now {
+        CACHED_SECS.store(now, Ordering::Relaxed);
+        secs = now;
+    }
     let day = secs % 86_400;
     format!("{:02}:{:02}:{:02}", day / 3600, (day % 3600) / 60, day % 60)
 }
@@ -224,6 +251,17 @@ mod tests {
         CaptureLogger.log(&record);
         let tail = recent(10);
         assert!(tail.iter().any(|l| l.contains("ring buffer probe")));
+    }
+
+    #[test]
+    fn timestamp_is_second_resolution() {
+        let a = timestamp();
+        let b = timestamp();
+        // Same second, so the cached value is reused and both render equal.
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 8, "expected HH:MM:SS, got {a:?}");
+        assert_eq!(a.as_bytes()[2], b':');
+        assert_eq!(a.as_bytes()[5], b':');
     }
 
     #[test]

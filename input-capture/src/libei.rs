@@ -521,7 +521,18 @@ async fn do_capture_session(
         // switch). The zones the compositor reports then no longer match the
         // barriers we registered, so the pointer can never cross back — the
         // "stuck after changing monitors" symptom of issue #512.
-        let mut zone_check = tokio::time::interval(Duration::from_secs(5));
+        //
+        // Each check is a D-Bus round trip, so the cadence follows how likely a
+        // change is to matter: often while the pointer is on a peer (a stale
+        // barrier strands it there), rarely while it is local. The first tick
+        // is skipped so a fresh session does not re-read zones it just
+        // registered.
+        const ZONE_CHECK_ACTIVE: Duration = Duration::from_secs(5);
+        const ZONE_CHECK_IDLE: Duration = Duration::from_secs(30);
+        let mut zone_check = tokio::time::interval_at(
+            tokio::time::Instant::now() + ZONE_CHECK_IDLE,
+            ZONE_CHECK_IDLE,
+        );
         zone_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -569,6 +580,18 @@ async fn do_capture_session(
 
                 }
                 _ = zone_check.tick() => {
+                    // While the pointer is on a peer, a stale barrier is
+                    // disruptive, so check more often.
+                    let period = if current_pos.get().is_some() {
+                        ZONE_CHECK_ACTIVE
+                    } else {
+                        ZONE_CHECK_IDLE
+                    };
+                    zone_check = tokio::time::interval_at(
+                        tokio::time::Instant::now() + period,
+                        period,
+                    );
+                    zone_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     match refresh_barriers_if_changed(
                         input_capture,
                         session,

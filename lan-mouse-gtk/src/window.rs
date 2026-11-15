@@ -1049,7 +1049,10 @@ mod chord_tests {
 
     #[test]
     fn single_key_without_modifiers() {
-        assert_eq!(chord_from_key(Key::z, ModifierType::empty()), Some("Z".to_owned()));
+        assert_eq!(
+            chord_from_key(Key::z, ModifierType::empty()),
+            Some("Z".to_owned())
+        );
     }
 
     #[test]
