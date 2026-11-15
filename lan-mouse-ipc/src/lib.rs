@@ -264,6 +264,8 @@ pub enum FrontendEvent {
     ConnectionAttempt { fingerprint: String },
     /// current global hotkey rules
     Hotkeys(Vec<(String, String)>),
+    /// keys that pull the pointer back, as human-readable key names
+    ReleaseBind(String),
     /// version information of this build
     Version {
         version: String,
@@ -341,8 +343,12 @@ pub enum FrontendRequest {
     EnumerateHotkeys,
     /// add a global hotkey (from, to) as human-readable key names
     AddHotkey(String, String),
+    /// replace the global hotkey at this index with (from, to) key names
+    UpdateHotkey(usize, String, String),
     /// remove the global hotkey with this index
     RemoveHotkey(usize),
+    /// replace the keys that pull the pointer back while it is on a peer
+    UpdateReleaseBind(String),
     /// request version information
     EnumerateVersion,
     /// enable or disable starting with the session

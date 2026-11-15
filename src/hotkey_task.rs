@@ -4,15 +4,22 @@
 //! crossed, so it cannot serve a hotkey: that has to work while the user is
 //! still typing on their own machine.
 //!
-//! [`Hotkeys`] is deliberately platform-neutral. Only Linux has an evdev
-//! listener; everywhere else the same type exists but never fires, which keeps
-//! the service free of `#[cfg]` around a field that the `select!` loop
-//! references unconditionally.
+//! [`Hotkeys`] is deliberately platform-neutral: the service references the
+//! field from its `select!` unconditionally, so the type has to exist
+//! everywhere. Linux reads evdev devices, macOS a passive Quartz event tap,
+//! and anything else falls back to a listener that never fires.
+
+use crate::connect::{LanMouseConnection, LanMouseConnectionError};
+#[cfg(unix)]
+use crate::hotkey;
 
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) use imp::Hotkeys;
 
-#[cfg(not(all(unix, not(target_os = "macos"))))]
+#[cfg(target_os = "macos")]
+pub(crate) use imp_macos::Hotkeys;
+
+#[cfg(not(unix))]
 pub(crate) use noop::Hotkeys;
 
 /// A global hotkey rule: pressing every key in `from` sends `to` to the peer.
@@ -31,9 +38,10 @@ pub(crate) struct Hotkey {
 
 /// What a hotkey trigger produced.
 ///
-/// Constructed by the evdev matcher, which only exists on unix; Windows and
-/// macOS reach it through the no-op `Hotkeys`, so the variants are unused there.
-#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+/// Constructed by the platform listener (evdev on Linux, the Quartz event tap
+/// on macOS). Windows reaches this type only through the no-op `Hotkeys`, so
+/// the variants are unused there.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum HotkeyFire {
     /// Type these keys on the peer.
@@ -51,6 +59,64 @@ pub(crate) enum HotkeyAction {
     ForceRelease,
 }
 
+/// How long to wait for an on-demand connection before giving up on a hotkey.
+const CONNECT_ATTEMPTS: usize = 20;
+const CONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Type a hotkey's key sequence on the peer.
+///
+/// Shared by the evdev (Linux) and Quartz (macOS) listeners: the trigger comes
+/// from a different source on each platform, but delivering it is identical.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) async fn deliver(conn: &LanMouseConnection, fire: HotkeyFire, capture_active: bool) {
+    let HotkeyFire::Keys(keys) = fire else {
+        // Local actions are handled by the service, which owns the capture and
+        // client state.
+        return;
+    };
+    if capture_active {
+        log::trace!("hotkey suppressed: capture is forwarding input");
+        return;
+    }
+    let Some(handle) = conn.first_active_client() else {
+        log::debug!("hotkey fired but no active client to receive it");
+        return;
+    };
+
+    // A hotkey is usually the first thing to touch the peer when the pointer
+    // never left this machine, so the connection does not exist yet. `send`
+    // starts it in the background and reports `NotConnected`; retry briefly so
+    // the first press is not lost.
+    let events = hotkey::tap_events(&keys);
+    for attempt in 0..CONNECT_ATTEMPTS {
+        let mut retry = false;
+        for event in &events {
+            match conn
+                .send(lan_mouse_proto::ProtoEvent::Input(*event), handle)
+                .await
+            {
+                Ok(()) => {}
+                Err(LanMouseConnectionError::NotConnected) => {
+                    retry = true;
+                    break;
+                }
+                Err(e) => {
+                    log::debug!("hotkey: could not deliver event: {e}");
+                    return;
+                }
+            }
+        }
+        if !retry {
+            log::info!("hotkey fired: sent {keys:?} to client {handle}");
+            return;
+        }
+        if attempt + 1 < CONNECT_ATTEMPTS {
+            tokio::time::sleep(CONNECT_DELAY).await;
+        }
+    }
+    log::warn!("hotkey fired but the connection to client {handle} did not come up");
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 mod imp {
     use std::{path::PathBuf, sync::Arc};
@@ -61,14 +127,9 @@ mod imp {
     use super::{Hotkey, HotkeyFire};
     use crate::{
         config::Config,
-        connect::{LanMouseConnection, LanMouseConnectionError},
+        connect::LanMouseConnection,
         hotkey::{self, HotkeyState, KeySample},
     };
-
-    /// How long to wait for an on-demand connection before giving up on a
-    /// hotkey.
-    const CONNECT_ATTEMPTS: usize = 20;
-    const CONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 
     pub(crate) struct Hotkeys {
         state: HotkeyState,
@@ -157,53 +218,7 @@ mod imp {
         /// by a remote client. While it is, the capture path already forwards
         /// every keystroke, so firing here would send the chord twice.
         pub(crate) async fn send(&self, fire: HotkeyFire, capture_active: bool) {
-            let HotkeyFire::Keys(keys) = fire else {
-                // Local actions are handled by the service, which owns the
-                // capture and client state.
-                return;
-            };
-            if capture_active {
-                log::trace!("hotkey suppressed: capture is forwarding input");
-                return;
-            }
-            let Some(handle) = self.conn.first_active_client() else {
-                log::debug!("hotkey fired but no active client to receive it");
-                return;
-            };
-
-            // A hotkey is usually the first thing to touch the peer when the
-            // pointer never left this machine, so the connection does not exist
-            // yet. `send` starts it in the background and reports
-            // `NotConnected`; retry briefly so the first press is not lost.
-            let events = hotkey::tap_events(&keys);
-            for attempt in 0..CONNECT_ATTEMPTS {
-                let mut retry = false;
-                for event in &events {
-                    match self
-                        .conn
-                        .send(lan_mouse_proto::ProtoEvent::Input(*event), handle)
-                        .await
-                    {
-                        Ok(()) => {}
-                        Err(LanMouseConnectionError::NotConnected) => {
-                            retry = true;
-                            break;
-                        }
-                        Err(e) => {
-                            log::debug!("hotkey: could not deliver event: {e}");
-                            return;
-                        }
-                    }
-                }
-                if !retry {
-                    log::info!("hotkey fired: sent {keys:?} to client {handle}");
-                    return;
-                }
-                if attempt + 1 < CONNECT_ATTEMPTS {
-                    tokio::time::sleep(CONNECT_DELAY).await;
-                }
-            }
-            log::warn!("hotkey fired but the connection to client {handle} did not come up");
+            super::deliver(&self.conn, fire, capture_active).await;
         }
     }
 
@@ -256,7 +271,7 @@ mod imp {
     }
 }
 
-#[cfg(not(all(unix, not(target_os = "macos"))))]
+#[cfg(not(unix))]
 mod noop {
     use crate::{config::Config, connect::LanMouseConnection};
 
@@ -283,5 +298,215 @@ mod noop {
         }
 
         pub(crate) async fn send(&self, _fire: HotkeyFire, _capture_active: bool) {}
+    }
+}
+
+/// Global hotkeys on macOS.
+///
+/// Linux reads raw evdev devices; macOS has no evdev equivalent, so a passive
+/// (`ListenOnly`) Quartz event tap does the same job. It sees every keystroke
+/// system-wide without grabbing anything, so the local machine still receives
+/// the keys while the hotkey additionally types its sequence on the peer. The
+/// tap needs the Accessibility grant the capture backend already holds.
+#[cfg(target_os = "macos")]
+mod imp_macos {
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    use std::sync::{Arc, OnceLock};
+
+    use core_foundation::base::TCFType;
+    use core_foundation::runloop::CFRunLoop;
+    use core_graphics::event::{
+        CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
+        CallbackResult, EventField,
+    };
+    use keycode::{KeyMap, KeyMapping};
+    use tokio::sync::mpsc;
+
+    use super::{Hotkey, HotkeyFire};
+    use crate::config::Config;
+    use crate::connect::LanMouseConnection;
+    use crate::hotkey::{HotkeyState, KeySample};
+
+    /// `CGEventSourceUserData` value `input-emulation` stamps on every
+    /// synthesized event (see `input_emulation::macos::INJECTED_EVENT_TAG`).
+    ///
+    /// Keys the peer typed must not re-trigger a local hotkey: two machines
+    /// forwarding the same chord to each other would replay it forever.
+    const INJECTED_EVENT_TAG: i64 = 0x6c616e6d; // "lanm"
+
+    extern "C" {
+        /// Re-enable a tap the kernel disabled, e.g. after a callback timeout.
+        fn CGEventTapEnable(tap: *mut std::ffi::c_void, enable: bool);
+    }
+
+    pub(crate) struct Hotkeys {
+        key_rx: mpsc::UnboundedReceiver<KeySample>,
+        state: HotkeyState,
+        conn: LanMouseConnection,
+    }
+
+    impl Hotkeys {
+        pub(crate) fn new(config: &Config, conn: LanMouseConnection) -> Self {
+            let (key_tx, key_rx) = mpsc::unbounded_channel();
+            spawn_listener(key_tx);
+            Self {
+                key_rx,
+                state: HotkeyState::new(config.hotkeys()),
+                conn,
+            }
+        }
+
+        pub(crate) fn set_hotkeys(&mut self, hotkeys: Vec<Hotkey>) {
+            self.state.set_hotkeys(hotkeys);
+        }
+
+        pub(crate) fn reload(&mut self, config: &Config) {
+            self.state.set_hotkeys(config.hotkeys());
+        }
+
+        /// Wait for the next hotkey trigger.
+        pub(crate) async fn next(&mut self) -> HotkeyFire {
+            loop {
+                let Some(sample) = self.key_rx.recv().await else {
+                    // The tap thread exited (permission denied at startup?);
+                    // keep the service select loop alive instead of spinning.
+                    log::debug!("hotkeys: the event tap is gone");
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                };
+                if let Some(fire) = self.state.on_key(sample) {
+                    return fire;
+                }
+            }
+        }
+
+        pub(crate) async fn send(&self, fire: HotkeyFire, capture_active: bool) {
+            super::deliver(&self.conn, fire, capture_active).await;
+        }
+    }
+
+    /// Convert a macOS virtual key code into the evdev code the matching logic
+    /// and the wire protocol use.
+    fn evdev_key(keycode: u16) -> Option<u32> {
+        match KeyMap::from_key_mapping(KeyMapping::Mac(keycode)) {
+            Ok(map) => Some(u32::from(map.evdev)),
+            Err(_) => {
+                log::trace!("hotkeys: no evdev mapping for macOS key code {keycode}");
+                None
+            }
+        }
+    }
+
+    fn spawn_listener(key_tx: mpsc::UnboundedSender<KeySample>) {
+        let spawned = std::thread::Builder::new()
+            .name("macos-hotkeys".into())
+            .spawn(move || run_tap(key_tx));
+        if let Err(e) = spawned {
+            log::error!("hotkeys: could not start the event tap thread: {e}");
+        }
+    }
+
+    fn run_tap(key_tx: mpsc::UnboundedSender<KeySample>) {
+        // Modifier keys arrive as `FlagsChanged` without a press/release flag,
+        // so remember which of them we last reported as held.
+        let held: RefCell<HashSet<u16>> = RefCell::new(HashSet::new());
+        // Mach port of the tap, for re-enabling it from inside the callback.
+        let tap_port: Arc<OnceLock<usize>> = Arc::new(OnceLock::new());
+        let tap_port_cb = Arc::clone(&tap_port);
+
+        let events_of_interest = vec![
+            CGEventType::KeyDown,
+            CGEventType::KeyUp,
+            CGEventType::FlagsChanged,
+            CGEventType::TapDisabledByTimeout,
+            CGEventType::TapDisabledByUserInput,
+        ];
+
+        let callback = move |_proxy,
+                             event_type: CGEventType,
+                             event: &core_graphics::event::CGEvent| {
+            // Runs on the tap thread: never block and never panic, or the
+            // kernel disables the tap (and `panic = "abort"` kills the daemon).
+            match event_type {
+                CGEventType::KeyDown | CGEventType::KeyUp => {
+                    if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
+                        == INJECTED_EVENT_TAG
+                    {
+                        return CallbackResult::Keep;
+                    }
+                    let keycode =
+                        event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+                    let Some(key) = evdev_key(keycode) else {
+                        return CallbackResult::Keep;
+                    };
+                    let value = if matches!(event_type, CGEventType::KeyDown) {
+                        // 1 is a press, 2 is autorepeat; only a press fires.
+                        if event.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT) != 0
+                        {
+                            2
+                        } else {
+                            1
+                        }
+                    } else {
+                        0
+                    };
+                    let _ = key_tx.send(KeySample { key, value });
+                }
+                CGEventType::FlagsChanged => {
+                    if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
+                        == INJECTED_EVENT_TAG
+                    {
+                        return CallbackResult::Keep;
+                    }
+                    let keycode =
+                        event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+                    let Some(key) = evdev_key(keycode) else {
+                        return CallbackResult::Keep;
+                    };
+                    let value = match held.try_borrow_mut() {
+                        Ok(mut held) => {
+                            if held.remove(&keycode) {
+                                0
+                            } else {
+                                held.insert(keycode);
+                                1
+                            }
+                        }
+                        Err(_) => return CallbackResult::Keep,
+                    };
+                    let _ = key_tx.send(KeySample { key, value });
+                }
+                CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput => {
+                    let port = tap_port_cb.get().copied().unwrap_or_default();
+                    if port == 0 {
+                        log::warn!("hotkeys: the event tap was disabled");
+                    } else {
+                        log::info!("hotkeys: re-enabling the event tap");
+                        unsafe { CGEventTapEnable(port as *mut std::ffi::c_void, true) };
+                    }
+                }
+                _ => {}
+            }
+            CallbackResult::Keep
+        };
+
+        match CGEventTap::new(
+            CGEventTapLocation::HID,
+            CGEventTapPlacement::HeadInsertEventTap,
+            CGEventTapOptions::ListenOnly,
+            events_of_interest,
+            callback,
+        ) {
+            Ok(tap) => {
+                let _ = tap_port.set(tap.mach_port().as_concrete_TypeRef() as usize);
+                log::info!("hotkeys: listening on the macOS event tap");
+                CFRunLoop::run_current();
+            }
+            Err(()) => log::warn!(
+                "hotkeys: could not create the macOS event tap \
+                 (Accessibility permission missing?), global hotkeys are disabled"
+            ),
+        }
     }
 }

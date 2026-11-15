@@ -1704,10 +1704,13 @@ name = "lan-mouse"
 version = "0.12.0"
 dependencies = [
  "clap",
+ "core-foundation",
+ "core-graphics",
  "futures",
  "input-capture",
  "input-emulation",
  "input-event",
+ "keycode",
  "lan-mouse-cli",
  "lan-mouse-gtk",
  "lan-mouse-ipc",

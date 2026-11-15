@@ -84,6 +84,9 @@ pub struct Service {
     /// the client the pointer is currently handed to, tracked from the
     /// capture event stream rather than inferred from connection state
     active_capture: Option<ClientHandle>,
+    /// the peer currently driving this machine (it crossed into our edge and
+    /// holds our pointer); the mirror image of `active_capture`
+    driving_peer: Option<SocketAddr>,
     /// reports that arrived before their connection was registered
     pending_peer_info: HashMap<SocketAddr, lan_mouse_ipc::IncomingInfo>,
     /// when the service started, for the uptime readout
@@ -183,6 +186,7 @@ impl Service {
             should_exit: false,
             pending_pause: None,
             active_capture: None,
+            driving_peer: None,
             pending_peer_info: Default::default(),
             started: Instant::now(),
             capture_backend_name: capture_backend_name.clone(),
@@ -351,6 +355,15 @@ impl Service {
     /// so is better than a no-op that looks like it worked.
     fn switch_device(&mut self) {
         let Some(current) = self.capturing_client() else {
+            // The pointer may be on *this* machine only because a peer drove it
+            // here. Then the way to switch is to ask that peer to let go; the
+            // button used to report an error instead, which made it look dead
+            // exactly when the other machine had the pointer.
+            if let Some(addr) = self.driving_peer {
+                log::info!("switch: asking {addr} to release the pointer");
+                self.emulation.send_leave_event(addr);
+                return;
+            }
             self.notify_frontend(FrontendEvent::Error(
                 "nothing to switch: the pointer is already on this machine".to_owned(),
             ));
@@ -530,7 +543,9 @@ impl Service {
             FrontendRequest::SaveConfiguration => self.save_config(),
             FrontendRequest::EnumerateHotkeys => self.notify_hotkeys(),
             FrontendRequest::AddHotkey(from, to) => self.add_hotkey(&from, &to),
+            FrontendRequest::UpdateHotkey(idx, from, to) => self.update_hotkey(idx, &from, &to),
             FrontendRequest::RemoveHotkey(idx) => self.remove_hotkey(idx),
+            FrontendRequest::UpdateReleaseBind(spec) => self.update_release_bind(&spec),
             FrontendRequest::EnumerateVersion => self.notify_version(),
             FrontendRequest::SetAutostart(enabled) => self.set_autostart(enabled),
         }
@@ -562,6 +577,54 @@ impl Service {
         self.apply_hotkeys(rules);
     }
 
+    /// Replace one rule, keeping its position in the list.
+    fn update_hotkey(&mut self, idx: usize, from: &str, to: &str) {
+        let from_keys = match parse_keys(from) {
+            Ok(k) if !k.is_empty() => k,
+            Ok(_) => return self.hotkey_error("no keys given"),
+            Err(e) => return self.hotkey_error(&e),
+        };
+        let to_keys = match parse_keys(to) {
+            Ok(k) if !k.is_empty() => k,
+            Ok(_) => return self.hotkey_error("no target keys given"),
+            Err(e) => return self.hotkey_error(&e),
+        };
+
+        let mut rules = self.config.hotkeys();
+        if idx >= rules.len() {
+            return self.hotkey_error("no such hotkey");
+        }
+        // Keep the action and tap count: the dialog only edits the keys.
+        rules[idx].from = from_keys;
+        rules[idx].to = to_keys;
+        self.apply_hotkeys(rules);
+    }
+
+    /// Change the keys that pull the pointer back to this machine.
+    fn update_release_bind(&mut self, spec: &str) {
+        let keys = match parse_keys(spec) {
+            Ok(k) if !k.is_empty() => k,
+            Ok(_) => {
+                self.notify_frontend(FrontendEvent::Error(
+                    "the release shortcut needs at least one key".to_owned(),
+                ));
+                return self.notify_release_bind();
+            }
+            Err(e) => {
+                self.notify_frontend(FrontendEvent::Error(e));
+                return self.notify_release_bind();
+            }
+        };
+        let bind = keys
+            .into_iter()
+            .filter_map(|k| input_event::scancode::Linux::try_from(k).ok())
+            .collect::<Vec<_>>();
+        self.config.set_release_bind(bind.clone());
+        self.capture.set_release_bind(bind);
+        self.save_config();
+        self.notify_release_bind();
+    }
+
     fn remove_hotkey(&mut self, idx: usize) {
         let mut rules = self.config.hotkeys();
         if idx >= rules.len() {
@@ -585,6 +648,17 @@ impl Service {
         self.notify_hotkeys();
     }
 
+    /// Send the current release shortcut to the frontend.
+    fn notify_release_bind(&mut self) {
+        let bind = self
+            .config
+            .release_bind()
+            .into_iter()
+            .map(|k| k as u32)
+            .collect::<Vec<_>>();
+        self.notify_frontend(FrontendEvent::ReleaseBind(format_keys(&bind)));
+    }
+
     /// Send the current hotkey rules to the frontend.
     fn notify_hotkeys(&mut self) {
         let rules = self
@@ -594,6 +668,7 @@ impl Service {
             .map(|h| (format_keys(&h.from), format_keys(&h.to)))
             .collect();
         self.notify_frontend(FrontendEvent::Hotkeys(rules));
+        self.notify_release_bind();
     }
 
     fn notify_version(&mut self) {
@@ -718,6 +793,7 @@ impl Service {
                 fingerprint,
             } => {
                 // A peer entered this machine: it is now driving us.
+                self.driving_peer = Some(addr);
                 if let Some(incoming) = self
                     .incoming_conn_info
                     .values_mut()
@@ -740,6 +816,9 @@ impl Service {
                 self.publish_incoming();
             }
             EmulationEvent::Disconnected { addr } => {
+                if self.driving_peer == Some(addr) {
+                    self.driving_peer = None;
+                }
                 if let Some(addr) = self.remove_incoming(addr) {
                     self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
                 }
@@ -800,6 +879,8 @@ impl Service {
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
                 self.active_capture = Some(handle);
+                // We are driving the pointer now, whoever drove us before.
+                self.driving_peer = None;
                 self.spawn_hook_command(handle, HookKind::Enter);
             }
             ICaptureEvent::PeerInfo(handle) => {

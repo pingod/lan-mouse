@@ -17,11 +17,21 @@ from = ["KeyLeftShift", "KeyLeftAlt", "KeyZ"]
 to = ["KeyZ"]
 ```
 
-旁路读 `/dev/input/event*`，**不拦截**本机按键。GUI 可增删。
+旁路读 `/dev/input/event*`，**不拦截**本机按键。
+
+macOS 走被动的 Quartz 事件 tap（`CGEventTapOptions::ListenOnly`），复用 capture
+后端已有的辅助功能权限，同样不拦截本机按键；对端注入的事件带
+`INJECTED_EVENT_TAG` 标记，会被跳过，避免两台机器来回互发。日志成功时打印
+`hotkeys: listening on the macOS event tap`，没有权限时打印
+`hotkeys: could not create the macOS event tap (Accessibility permission missing?)`。
+
+Windows 目前仍是空实现（`noop`）。
 
 ### GUI
 
-- **Hotkeys** 区块：列表、添加（弹窗输入 `Shift+Alt+Z` / `Z`）、删除
+- **Hotkeys** 区块：列表、添加（弹窗输入 `Shift+Alt+Z` / `Z`）、**编辑**（铅笔按钮改组合键，`UpdateHotkey` 就地替换）、删除
+- **Release shortcut** 行（Settings → Startup and maintenance）：编辑"把指针拉回来"的组合键，等价于配置里的 `release_bind`
+- **Switch** 按钮：指针在对端时向对端要回（`send_leave_event`），不再报 "nothing to switch"
 - **version**：`0.11.0 (commit)` 显示在 General 底部
 - **start with session**：开关，装/卸自启项
 
@@ -46,6 +56,10 @@ to = ["KeyZ"]
 | 并发 `add-client` 出现 `unknown:4242` | `Create` 后的 `Update*` 应答会广播给所有前端，两个前端互相改错 handle → 改为 `CreateClient` 原子创建 |
 | 删掉最后一个客户端又自己复活 | 空列表时提前返回，配置没落盘，watch 回灌旧列表 |
 | 换显示器后 barrier 不重建（#512） | `zones_changed` 触发时整会话重建，`update_barriers` 随之执行 |
+| macOS 上全局热键完全不生效 | `hotkey_task` 只有 Linux evdev 实现，其余平台是 `noop`（`next()` 永远 pending）→ 增加 Quartz 被动事件 tap |
+| 热键组合键改不了 | GUI 只能增删 → 新增 `UpdateHotkey` / 行内编辑按钮 |
+| `release_bind` 没有 UI | 新增 `UpdateReleaseBind` + Settings 里的 Release shortcut 行 |
+| Switch 按钮在对端驱动本机时"点了没反应" | `switch_device()` 只在 `active_capture` 有值时生效，另一方向直接报错 → 记 `driving_peer`，向它发 Leave 要回指针 |
 
 ## 上游 issue 已修
 

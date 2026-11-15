@@ -344,7 +344,6 @@ impl ClientManager {
 
     /// Handle of the first active client, if any. Used by global hotkeys,
     /// which are not tied to a capture barrier.
-    #[cfg(all(unix, not(target_os = "macos")))]
     pub(crate) fn first_active_client(&self) -> Option<ClientHandle> {
         self.clients
             .borrow()

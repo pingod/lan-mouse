@@ -397,6 +397,7 @@ fn build_ui(app: &Application) {
                         window.show_toast(format!("{addr} disconnected").as_str());
                     }
                     FrontendEvent::Hotkeys(rules) => window.set_hotkeys(rules),
+                    FrontendEvent::ReleaseBind(bind) => window.set_release_bind(&bind),
                     FrontendEvent::Version {
                         version,
                         commit,

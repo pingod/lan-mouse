@@ -342,6 +342,18 @@ impl Window {
                 .subtitle(format!("sends {to}"))
                 .build();
 
+            let edit = gtk::Button::builder()
+                .icon_name("document-edit-symbolic")
+                .valign(gtk::Align::Center)
+                .tooltip_text("change the keys of this hotkey")
+                .build();
+            let window = self.clone();
+            let (edit_from, edit_to) = (from.clone(), to.clone());
+            edit.connect_clicked(move |_| {
+                window.open_hotkey_dialog(Some((idx, edit_from.clone(), edit_to.clone())));
+            });
+            row.add_suffix(&edit);
+
             let delete = gtk::Button::builder()
                 .icon_name("user-trash-symbolic")
                 .valign(gtk::Align::Center)
@@ -359,6 +371,19 @@ impl Window {
         self.imp()
             .hotkey_placeholder_row
             .set_visible(rules.is_empty());
+    }
+
+    /// Show the keys that pull the pointer back to this machine.
+    pub(super) fn set_release_bind(&self, bind: &str) {
+        let entry = self.imp().release_bind_entry.get();
+        // Do not fight the user while they are typing a new combination.
+        if !entry.has_focus() {
+            entry.set_text(bind);
+        }
+    }
+
+    pub(super) fn request_release_bind(&self, bind: String) {
+        self.request(FrontendRequest::UpdateReleaseBind(bind));
     }
 
     /// Ask the daemon for the hotkey rules, version and autostart state.
@@ -515,19 +540,35 @@ impl Window {
     /// Hand-typed names are easy to get wrong (`KeyLeftAlt` vs `LeftAlt`), and
     /// a mistyped rule silently never fires. Capturing the actual keystroke
     /// removes that class of mistake.
-    pub(super) fn open_hotkey_dialog(&self) {
+    /// Open the hotkey editor.
+    ///
+    /// `existing` carries the index and the current keys when an existing rule
+    /// is being changed; `None` adds a new one.
+    pub(super) fn open_hotkey_dialog(&self, existing: Option<(usize, String, String)>) {
+        let editing = existing.is_some();
         let dialog = gtk::Dialog::builder()
             .transient_for(self)
             .modal(true)
-            .title("Add hotkey")
+            .title(if editing { "Edit hotkey" } else { "Add hotkey" })
             .build();
 
         let from_entry = gtk::Entry::builder()
             .placeholder_text("press the keys, or type e.g. Shift+Alt+Z")
+            .text(
+                existing
+                    .as_ref()
+                    .map(|(_, from, _)| from.as_str())
+                    .unwrap_or_default(),
+            )
             .build();
         let to_entry = gtk::Entry::builder()
             .placeholder_text("Z")
-            .text("Z")
+            .text(
+                existing
+                    .as_ref()
+                    .map(|(_, _, to)| to.as_str())
+                    .unwrap_or("Z"),
+            )
             .build();
         let recorder = gtk::Label::builder()
             .label("Click Record, then press the combination")
@@ -593,7 +634,10 @@ impl Window {
 
         dialog.content_area().append(&box_);
         dialog.add_button("Cancel", gtk::ResponseType::Cancel);
-        dialog.add_button("Add", gtk::ResponseType::Accept);
+        dialog.add_button(
+            if editing { "Save" } else { "Add" },
+            gtk::ResponseType::Accept,
+        );
         dialog.set_default_response(gtk::ResponseType::Accept);
 
         let window = self.clone();
@@ -602,7 +646,12 @@ impl Window {
                 let from = from_entry.text().to_string();
                 let to = to_entry.text().to_string();
                 if !from.trim().is_empty() {
-                    window.request(FrontendRequest::AddHotkey(from, to));
+                    match existing {
+                        Some((idx, _, _)) => {
+                            window.request(FrontendRequest::UpdateHotkey(idx, from, to))
+                        }
+                        None => window.request(FrontendRequest::AddHotkey(from, to)),
+                    }
                 }
             }
             dialog.close();

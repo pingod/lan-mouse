@@ -15,18 +15,26 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    fs::File,
-    os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
+#[cfg(all(unix, not(target_os = "macos")))]
+use std::{
+    fs::File,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+};
+
 use input_event::{Event, KeyboardEvent};
+#[cfg(all(unix, not(target_os = "macos")))]
 use tokio::io::unix::AsyncFd;
 
+#[cfg(all(unix, not(target_os = "macos")))]
 /// `struct input_event` on 64-bit Linux: timeval (16 bytes) + type, code, value.
 pub(crate) const EVENT_SIZE: usize = 24;
+#[cfg(all(unix, not(target_os = "macos")))]
 const EV_KEY: u16 = 0x01;
+#[cfg(all(unix, not(target_os = "macos")))]
 const EV_SYN: u16 = 0x00;
 
 pub(crate) use crate::hotkey_task::{Hotkey, HotkeyFire};
@@ -39,6 +47,7 @@ pub(crate) struct KeySample {
     pub value: u32,
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 /// Open every keyboard device under `/dev/input`.
 ///
 /// Devices the process cannot read are skipped with a warning rather than
@@ -72,6 +81,7 @@ pub(crate) fn open_keyboards() -> Vec<(PathBuf, AsyncFd<File>)> {
     out
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 fn open_device(path: &Path) -> std::io::Result<AsyncFd<File>> {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -90,6 +100,7 @@ fn open_device(path: &Path) -> std::io::Result<AsyncFd<File>> {
     AsyncFd::new(file)
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 /// Read until the device reports nothing more.
 fn drain(file: &mut File) {
     let mut buf = [0u8; EVENT_SIZE * 64];
@@ -103,6 +114,7 @@ fn drain(file: &mut File) {
     }
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 /// Whether the device reports keys (a keyboard, a mouse with buttons, …).
 ///
 /// Reading `/dev/input/event*` for a mouse is harmless but wasteful, and
@@ -155,6 +167,7 @@ fn is_keyboard(path: &Path) -> bool {
     keys[KEY_A / 8] & (1 << (KEY_A % 8)) != 0
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 /// `EVIOCGBIT(ev, len)` = `_IOC(_IOC_READ, 'E', 0x20 + ev, len)`.
 ///
 /// The `0x20` offset is part of the ioctl number: omitting it yields a request
@@ -171,6 +184,7 @@ fn eviocgbit(ev: usize, len: usize) -> libc::c_ulong {
         | ((len as libc::c_ulong) << IOC_SIZESHIFT)
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 /// Parse the events contained in `buf`, calling `f` for every key event.
 pub(crate) fn parse_events(buf: &[u8], mut f: impl FnMut(KeySample)) {
     for chunk in buf.as_chunks::<EVENT_SIZE>().0 {
@@ -227,6 +241,7 @@ impl HotkeyState {
         }
     }
 
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn is_empty(&self) -> bool {
         self.hotkeys.is_empty()
     }

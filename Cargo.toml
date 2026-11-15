@@ -70,6 +70,14 @@ notify = "8.2.0"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
 
+# Global hotkeys on macOS are read from a passive Quartz event tap: the same
+# mechanism the capture backend uses, so the app needs no extra permission
+# beyond the Accessibility grant it already holds.
+[target.'cfg(target_os="macos")'.dependencies]
+core-foundation = "0.10.0"
+core-graphics = { version = "0.25.0", features = ["highsierra"] }
+keycode = "1.0.0"
+
 [features]
 default = [
     "gtk",

@@ -8,10 +8,11 @@ mod crypto;
 mod dns;
 mod emulation;
 pub mod emulation_test;
-// Global hotkeys read Linux evdev devices directly. The evdev module is
-// Linux-only; `hotkey_task` is compiled everywhere and falls back to a no-op
-// listener elsewhere, so the service can reference it without `#[cfg]`.
-#[cfg(all(unix, not(target_os = "macos")))]
+// The hotkey matcher (key sampling, chord state, tap synthesis) is only needed
+// where a listener feeds it: evdev on Linux, the Quartz event tap on macOS.
+// `hotkey_task` itself is compiled everywhere so the service can reference its
+// field without `#[cfg]`; on other platforms it is a no-op listener.
+#[cfg(unix)]
 mod hotkey;
 mod hotkey_task;
 mod listen;

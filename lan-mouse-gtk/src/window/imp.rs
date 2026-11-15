@@ -50,6 +50,8 @@ pub struct Window {
     #[template_child]
     pub hotkey_placeholder_row: TemplateChild<ActionRow>,
     #[template_child]
+    pub release_bind_entry: TemplateChild<gtk::Entry>,
+    #[template_child]
     pub version_row: TemplateChild<ActionRow>,
     #[template_child]
     pub autostart_switch: TemplateChild<gtk::Switch>,
@@ -121,7 +123,21 @@ impl ObjectSubclass for Window {
 impl Window {
     #[template_callback]
     fn handle_add_hotkey_pressed(&self, _button: &Button) {
-        self.obj().open_hotkey_dialog();
+        self.obj().open_hotkey_dialog(None);
+    }
+
+    #[template_callback]
+    fn handle_release_bind_apply(&self, _button: &Button) {
+        let text = self.release_bind_entry.text().to_string();
+        self.obj().request_release_bind(text);
+    }
+
+    /// Pressing Enter in the field applies it too (the signal carries the
+    /// entry, so it needs its own callback signature).
+    #[template_callback]
+    fn handle_release_bind_activate(&self, _entry: &gtk::Entry) {
+        let text = self.release_bind_entry.text().to_string();
+        self.obj().request_release_bind(text);
     }
 
     /// `notify::active` delivers a `GParamSpec`, not the switch itself.

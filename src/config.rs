@@ -647,6 +647,11 @@ impl Config {
         }
     }
 
+    /// replace the persisted keys that pull the pointer back
+    pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
+        self.toml_mut().release_bind = Some(bind);
+    }
+
     /// set configured clients
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
         // An empty list is meaningful: deleting the last client has to be
