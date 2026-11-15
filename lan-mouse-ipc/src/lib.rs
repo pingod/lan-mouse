@@ -218,6 +218,8 @@ pub enum FrontendEvent {
     LogLevel(String),
     /// buffered log records, oldest first
     Logs(Vec<String>),
+    /// records appended to a live stream
+    LogAppended(Vec<String>),
     /// capture status
     CaptureStatus(Status),
     /// emulation status
@@ -320,6 +322,8 @@ pub enum FrontendRequest {
     SetLogLevel(Option<String>),
     /// request the last N log records
     EnumerateLogs(usize),
+    /// stream new records as they are written; `None` stops the stream
+    SubscribeLogs(Option<usize>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

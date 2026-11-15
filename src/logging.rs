@@ -79,6 +79,38 @@ pub fn recent(n: usize) -> Vec<String> {
     buffer.iter().skip(start).cloned().collect()
 }
 
+/// Monotonic counter of every record ever written.
+///
+/// The ring buffer drops old entries, so a byte offset would go stale; counting
+/// from the start of the process lets a reader ask for "everything after N" and
+/// get a contiguous tail even across evictions.
+static TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+/// How many records have been written so far.
+pub fn total() -> usize {
+    TOTAL.load(Ordering::Relaxed)
+}
+
+/// Records written since `cursor`, plus the new cursor to pass next time.
+///
+/// Returns an empty list when nothing new arrived. If more than `CAPACITY`
+/// records were produced since `cursor`, only the retained window comes back;
+/// the new cursor still advances past the ones that were evicted, so the reader
+/// never asks for them again.
+pub fn since(cursor: usize) -> (Vec<String>, usize) {
+    let total = TOTAL.load(Ordering::Relaxed);
+    if cursor >= total {
+        return (Vec::new(), total);
+    }
+    let buffer = buffer().lock().unwrap_or_else(|e| e.into_inner());
+    let requested = total - cursor;
+    let retained = buffer.len();
+    // Everything requested that is still in the ring.
+    let available = requested.min(retained);
+    let start = retained - available;
+    (buffer.iter().skip(start).cloned().collect(), total)
+}
+
 /// Installs the ring-buffer sink and applies `default_level`.
 ///
 /// Must be called once, before any logging happens. Returns `false` when a
@@ -117,6 +149,7 @@ impl Log for CaptureLogger {
                 buffer.pop_front();
             }
             buffer.push_back(line.clone());
+            TOTAL.fetch_add(1, Ordering::Relaxed);
         }
 
         // Mirror to stderr so journald still has the record. A GUI process

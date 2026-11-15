@@ -63,6 +63,8 @@ pub struct Window {
     pub log_view: TemplateChild<gtk::TextView>,
     #[template_child]
     pub log_level_combo: TemplateChild<adw::ComboRow>,
+    #[template_child]
+    pub main_stack: TemplateChild<adw::ViewStack>,
     pub clients: RefCell<Option<gio::ListStore>>,
     pub authorized: RefCell<Option<gio::ListStore>>,
     pub frontend_request_writer: RefCell<Option<FrontendRequestWriter>>,
@@ -75,6 +77,9 @@ pub struct Window {
     /// set while the pause switch is being updated from the daemon
     pub pause_updating: Cell<bool>,
     pub log_buffer: RefCell<gtk::TextBuffer>,
+    /// set once the daemon started streaming; subscribing twice would reset its
+    /// cursor and lose the records in between
+    pub log_streaming: Cell<bool>,
 }
 
 #[glib::object_subclass]
@@ -128,6 +133,18 @@ impl Window {
     #[template_callback]
     fn handle_log_refresh_pressed(&self, _button: &Button) {
         self.obj().request_logs();
+    }
+
+    #[template_callback]
+    fn handle_log_clear_pressed(&self, _button: &Button) {
+        self.obj().clear_logs();
+    }
+
+    #[template_callback]
+    fn handle_restart_interval_apply(&self, _button: &Button) {
+        let text = self.restart_interval_entry.text();
+        let seconds = text.trim().parse::<u64>().unwrap_or(0);
+        self.obj().request_restart_interval(seconds);
     }
 
     #[template_callback]
@@ -285,6 +302,19 @@ impl ObjectImpl for Window {
         obj.setup_icon();
         obj.setup_clients();
         obj.setup_authorized();
+
+        // Log the page structure once so a broken UI file is visible in the
+        // logs instead of only as a blank window.
+        {
+            let stack = self.main_stack.get();
+            let model = stack.pages();
+            let names: Vec<String> = (0..model.n_items())
+                .filter_map(|i| model.item(i))
+                .filter_map(|o| o.downcast::<adw::ViewStackPage>().ok())
+                .map(|p| p.name().map(|n| n.to_string()).unwrap_or_default())
+                .collect();
+            log::info!("ui pages: {names:?}");
+        }
 
         // The log view owns its buffer; wire it up once and let
         // `set_logs` write into it.

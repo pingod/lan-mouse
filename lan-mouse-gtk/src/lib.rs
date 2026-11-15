@@ -353,6 +353,7 @@ fn build_ui(app: &Application) {
                     FrontendEvent::RestartInterval(secs) => window.set_restart_interval(secs),
                     FrontendEvent::LogLevel(level) => window.set_log_level(&level),
                     FrontendEvent::Logs(lines) => window.set_logs(lines),
+                    FrontendEvent::LogAppended(lines) => window.append_logs(lines),
                 }
             }
         }

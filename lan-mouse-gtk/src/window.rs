@@ -397,9 +397,63 @@ impl Window {
         view.scroll_to_iter(&mut end, 0.0, false, 0.0, 0.0);
     }
 
+    /// Load the backlog once, then keep streaming.
+    ///
+    /// Subscribing again would restart the daemon's cursor and silently drop
+    /// whatever was written between the last flush and the new subscription, so
+    /// only the first call enables the stream.
     pub(super) fn request_logs(&self) {
         self.request(FrontendRequest::EnumerateLogs(500));
         self.request(FrontendRequest::SetLogLevel(None));
+        if !self.imp().log_streaming.replace(true) {
+            // 250 ms keeps the view live without flooding the IPC socket; the
+            // daemon coalesces whatever was written in between.
+            self.request(FrontendRequest::SubscribeLogs(Some(250)));
+        }
+    }
+
+    /// Append streamed records, trimming the view so it cannot grow forever.
+    pub(super) fn append_logs(&self, lines: Vec<String>) {
+        if lines.is_empty() {
+            return;
+        }
+        let imp = self.imp();
+        let buffer = imp.log_buffer.borrow();
+        let mut end = buffer.end_iter();
+        buffer.insert(&mut end, &format!("{}\n", lines.join("\n")));
+
+        // Keep roughly the same window the daemon retains.
+        const MAX_LINES: i32 = 2000;
+        if buffer.line_count() > MAX_LINES {
+            let mut start = buffer.start_iter();
+            let mut cut = buffer
+                .iter_at_line(buffer.line_count() - MAX_LINES)
+                .unwrap_or(start);
+            buffer.delete(&mut start, &mut cut);
+        }
+        drop(buffer);
+
+        // Follow the tail unless the user scrolled up to read something.
+        let view = imp.log_view.get();
+        let at_bottom = view
+            .vadjustment()
+            .map(|adj| adj.value() + adj.page_size() >= adj.upper() - 4.0)
+            .unwrap_or(true);
+        if at_bottom {
+            let mut end = imp.log_buffer.borrow().end_iter();
+            view.scroll_to_iter(&mut end, 0.0, false, 0.0, 0.0);
+        }
+    }
+
+    /// Drop the displayed records and stop the stream while the window is
+    /// hidden, so a background window costs nothing.
+    pub(super) fn clear_logs(&self) {
+        self.imp().log_buffer.borrow().set_text("");
+    }
+
+    pub(super) fn request_restart_interval(&self, seconds: u64) {
+        let interval = if seconds == 0 { None } else { Some(seconds) };
+        self.request(FrontendRequest::SetRestartInterval(interval));
     }
 
     pub(super) fn request_log_level(&self, level: &str) {

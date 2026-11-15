@@ -84,6 +84,8 @@ pub struct Service {
     /// the client the pointer is currently handed to, tracked from the
     /// capture event stream rather than inferred from connection state
     active_capture: Option<ClientHandle>,
+    /// when a frontend is streaming logs: how often to poll and where we are
+    log_stream: Option<(tokio::time::Interval, usize)>,
 }
 
 #[derive(Debug)]
@@ -160,6 +162,7 @@ impl Service {
             should_exit: false,
             pending_pause: None,
             active_capture: None,
+            log_stream: None,
         };
         Ok(service)
     }
@@ -180,6 +183,14 @@ impl Service {
         loop {
             tokio::select! {
                 request = self.frontend_listener.next() => {
+                    if request.is_none() {
+                        // The last frontend went away: stop streaming so the
+                        // pending-event queue cannot grow without a reader.
+                        if self.log_stream.take().is_some() {
+                            log::debug!("frontend closed; stopping log stream");
+                        }
+                        self.pending_frontend_events.clear();
+                    }
                     self.handle_frontend_request(request);
                     if let Some(paused) = self.pending_pause.take() {
                         self.set_paused(paused).await;
@@ -202,6 +213,7 @@ impl Service {
                 },
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 _ = self.config.changed() => self.handle_config_change(),
+                _ = log_tick(&mut self.log_stream) => self.flush_log_stream(),
                 _ = restart_tick(&self.restart_interval, self.last_restart) => {
                     log::info!("scheduled restart");
                     self.last_restart = Instant::now();
@@ -227,6 +239,18 @@ impl Service {
         self.resolver.terminate().await;
 
         Ok(())
+    }
+
+    /// Send any records written since the last flush to the streaming frontend.
+    fn flush_log_stream(&mut self) {
+        let Some((_, cursor)) = self.log_stream.as_mut() else {
+            return;
+        };
+        let (lines, new_cursor) = crate::logging::since(*cursor);
+        *cursor = new_cursor;
+        if !lines.is_empty() {
+            self.notify_frontend(FrontendEvent::LogAppended(lines));
+        }
     }
 
     /// Suspend or resume capture and emulation without exiting.
@@ -304,9 +328,12 @@ impl Service {
     }
 
     fn handle_frontend_request(&mut self, request: Option<Result<FrontendRequest, IpcError>>) {
-        let request = match request.expect("frontend listener closed") {
-            Ok(r) => r,
-            Err(e) => return log::error!("error receiving request: {e}"),
+        let request = match request {
+            Some(Ok(r)) => r,
+            Some(Err(e)) => return log::error!("error receiving request: {e}"),
+            // No frontend connected. The caller has already stopped the log
+            // stream and drained the queue; there is nothing to act on.
+            None => return,
         };
         match request {
             FrontendRequest::Activate(handle, active) => {
@@ -363,6 +390,24 @@ impl Service {
             FrontendRequest::EnumerateLogs(n) => {
                 self.notify_frontend(FrontendEvent::Logs(crate::logging::recent(n)));
             }
+            FrontendRequest::SubscribeLogs(interval_ms) => match interval_ms {
+                // A frontend that reconnects (window reopened) restarts the
+                // stream; the cursor is reset to "now" because it already
+                // fetched the backlog with `EnumerateLogs`.
+                Some(ms) => {
+                    // Start from "now": the frontend already has the backlog
+                    // from `EnumerateLogs`, so replaying it would duplicate.
+                    let mut interval =
+                        tokio::time::interval(Duration::from_millis(ms.max(100) as u64));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    self.log_stream = Some((interval, crate::logging::total()));
+                    log::debug!("log streaming enabled every {ms} ms");
+                }
+                None => {
+                    self.log_stream = None;
+                    log::debug!("log streaming disabled");
+                }
+            },
             FrontendRequest::EnumerateServiceState => {
                 self.notify_frontend(FrontendEvent::Paused(self.paused));
                 let secs = self.restart_interval.map(|d| d.as_secs());
@@ -999,6 +1044,16 @@ fn canonical_key_name(name: &str) -> String {
     match chars.next() {
         Some(first) => format!("Key{}{}", first.to_ascii_uppercase(), chars.as_str()),
         None => String::new(),
+    }
+}
+
+/// Resolve on the next log-stream tick, or never when no frontend is streaming.
+async fn log_tick(stream: &mut Option<(tokio::time::Interval, usize)>) {
+    match stream {
+        Some((interval, _)) => {
+            interval.tick().await;
+        }
+        None => std::future::pending().await,
     }
 }
 
