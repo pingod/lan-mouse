@@ -2,6 +2,29 @@
 
 ## 功能（全部已实现并验证）
 
+### 屏幕边缘区间（一条边挂多台机器）
+
+```toml
+[[clients]]
+position = "right"
+hostname = "cobalt"
+ips = ["192.168.178.190"]
+edge = [0.0, 0.6]        # 本机右边上，指针离开的区间
+peer_edge = [0.0, 1.0]   # cobalt 左边上，指针落下的区间
+```
+
+`edge` / `peer_edge` 都可省略（默认整条边）。没被任何客户端覆盖的区间是**墙**，指针停在
+那里，而不是交给列表里第一个；两台声明重叠时靠前的保留，靠后的被收窄。
+
+`lan-mouse cli screens` 不依赖显示器就能看覆盖情况与墙的位置，是这条链路唯一的自检手段；
+`cli set-edge <id> --edge 0.0,0.6` 改区间，`cli list` 在非整条边时把区间打出来。
+
+配套的两个阈值也生效了：`switch_double_tap`（毫秒内连续两次穿越才切换）、
+`switch_corner_size` + `switch_corners`（角落屏蔽，画布会把被吃掉的边画成墙）。
+
+细节见下面"Screens 页"一节；守护进程侧按落点归属的说明在 `DOC.md` 的
+"Screen Edges and Intervals"。
+
 ### 全局热键（指针留在本机时也能触发）
 
 ```toml
@@ -159,25 +182,85 @@ Leave，所以即使重建失败也不会永久卡死。
 
 ## GUI：Screens 页（可视化编排）
 
-`lan-mouse-gtk/src/arrangement.rs` 是一个自绘的画布（`gtk::DrawingArea` + cairo），
-按 Synergy 3 的屏幕编辑器做的：点阵背景、圆角屏幕卡片（显示器图标 + 主机名 + 边标签
-药丸 + 右上角三点菜单）、相邻屏幕之间用粗连线表示"可达"，本机用强调色描边。
+这一页在第二轮被重写，起因是上一版只画得像 Synergy 3，而守护进程根本撑不住它画的东西。
+先把结论写在前面：**问题不在画布，在数据模型**。当时 `client_at()` 只返回同边的第一个
+客户端，`activate_client()` 还会主动把同边的另一台停用，所以"一条边挂多台机器"不仅没实现，
+还被主动阻止了；画布把多台都画成可达，等于画了个谎。
 
-- 拖动卡片到本机的某条边就发 `FrontendRequest::UpdatePosition`（和 Devices 页下拉框
-  同一条路径），配置立刻落盘；CLI `set-position` / 下拉框改动也会即时重画
-  （`window.rs` 的 `refresh_arrangement` 在 new/delete/update_config 三处调用）。
-- 卡片右上角的三点在**捕获阶段**被 `GestureClick` 认领，弹出 "Move to the left/right/
-  top/bottom" 菜单；按在卡片其它位置则落到 `GestureDrag` 上，拖动时实时高亮将要吸附
-  的那条边。
-- 布局按卡片数量自适应：`State::fit` 计算整体包围盒，用 `scale`/`origin` 把它缩放居中
-  画进画布，所以一条边上挂很多台设备也不会跑出面板。
-- 颜色不查 style context（`gtk_style_context_lookup_color` 已废弃、`WidgetExt::color`
-  需要 gtk4 的 `v4_10` feature，本仓库只开 `v4_2`），改用
-  `adw::StyleManager::default().is_dark()` 选两套固定配色。
-- 文字用 cairo toy API（`select_font_face` + `show_text`）绘制，不引入 pangocairo。
+### 数据模型（先把地基铺好）
 
-模型限制：一台设备只能占一条边；多条边共用的场景下按 `position_map` 的既有顺序
-由"先在列表里出现的那台"接管，页面上就是把多个方块并排画在同一个方向上。
+`input-event/src/edge.rs` 的 `EdgeRange` 是半开区间，**以 permille（0..=1000）存**而不是
+`f64`——`ClientConfig` 派生了 `Eq`，塞 `f64` 会破坏它；配置文件里仍然是 `edge = [0.0, 0.6]`
+这样的分数，两边换算精确。
+
+- `ClientConfig::edge`：本机这条边上指针**离开**的区间
+- `ClientConfig::peer_edge`：对端朝向这条边的边上，指针**落下**的区间
+
+两者独立：`0.0-0.6` 映射到 `0.0-1.0` 是把指针摊到对端整条边，映射到 `0.3-0.9` 则收在中间。
+协议没有改动：`ProtoEvent::Enter(Position, f64)` 本来就带归一化分数，发送端用
+`CaptureEntry::peer_fraction` 把自己的分数重映射到对端区间即可（与 Synergy 的
+`mapToFraction → transform → mapToPixel` 三步同构）。
+
+归属按**落点**判定而不是按边（`src/capture.rs` 的 `route`）：落在谁的区间归谁，落在缝里
+谁都不给并记日志。后端实现差异：libei / layer-shell 造的是**物理屏障**（指针真的撞墙），
+macOS / Windows 在落点处判断（越界表现为"切过去又被弹回"）。
+
+### 画布
+
+`lan-mouse-gtk/src/arrangement/` 拆成四个文件：
+
+- `layout.rs`：纯几何。本地屏幕按上报尺寸、对端按其分辨率（没上报则取"使两段区间对齐"
+  的尺寸）。`place_all` 把沿边重叠的卡片分道——对端按自己分辨率画时**装不进**它配置的
+  区间是常态（`our 0-55% -> its 0-100%` 两台同尺寸屏，卡片就是它挂的那段的两倍长），
+  不分道就会互相埋掉。沿边的位置是路由的一部分，绝不动；离边的距离不是，所以分道只改
+  后者。
+- `draw.rs`：桥与墙同出 `reachable_stretches`——把每个客户端的声明减去被角落阈值吃掉的
+  两端，剩下的画桥，补集画墙，两者不可能自相矛盾。角落把声明吃光时干脆不画桥，这才是
+  "没有任何东西能到这台机器"的诚实画法。
+- `paint.rs`：配色与文字。文字走 pango（`pangocairo`），因为 cairo toy API 没有 fallback，
+  中文主机名会变成方框；装不下时按字符数二分加省略号，不用 `PANGO_ELLIPSIZE_END`
+  （那需要 pango 1.56 才暴露的 `WRAP_NONE`，会把整个程序的运行时要求抬高）。
+- `arrangement.rs`：widget、手势、工具栏。
+
+交互：拖动卡片 → `layout::snap`（摆放的逆运算）由两面边的重叠重新算出两段区间；本机边上
+的把手单独调整一段声明的一端，这是精确设区间的方式。Ctrl+滚轮缩放、中键平移、方向键换边、
+`+`/`-`/`0` 缩放复位。
+
+### 这一轮修掉的两个真 bug
+
+- **画布每次状态广播都重建**：守护进程在 peer 连接、激活、回 ping 时都会广播，等于把用户
+  正按着的控件删掉——拖动中途死掉，缩放复位。现在只建一次，之后只喂数据；拖动/调整期间
+  到达的更新直接丢弃。
+- **卡片圆角弧线多扫了四分之一圈**：每块屏幕都被切出一个缺口。`paint.rs` 里有一条按像素
+  检查四个角的测试，用旧的弧线角度会失败。
+
+### 验证
+
+`cargo test --workspace` 全绿（`edge.rs` 20 条、`capture.rs` 12 条、GTK 57 条），clippy 无
+新告警。GTK 侧有**离屏渲染测试**：把画布画到 cairo surface 上按像素断言——本地屏比笔记本
+高、同边两台上下叠放不重叠、无人可达处确实画了墙、停用的机器不画。设
+`LAN_MOUSE_RENDER_DEMO=<path>` 会导出 PNG，供人眼复核（配色、圆角、分道这类东西没法靠
+断言看）。
+
+dummy 后端双客户端实测（`lan-mouse cli screens`）：
+
+```
+right:
+  id 0: alpha 20-60%  [ok]
+             lands in its 10-90%
+  id 1: beta 60-100%  [narrowed to what is left of 50-100%]
+  0-20% of the right edge is a wall
+```
+
+### 明确的非目标
+
+按显示器拆几何（一台机器仍是一个矩形，与 Synergy 1 / Input Leap 相同）、一台机器挂两条边
+（指针不能绕角）、非对称链路、`switchNeedsShift/Ctrl/Alt`（Wayland 读不到不归自己的指针
+修饰键）、`switchDelay`（屏障报的是穿越不是停留，没有可等的东西；实现了
+`switchDoubleTap`，因为两次穿越可观测）、`switch_corners` 的 GUI 编辑（配置键与守护进程
+逻辑先行）。
+
+行为变化：同边多台客户端各自维持 DTLS 会话与心跳，连接数与开销都比以前多。
 
 ## GUI：Logs 页
 

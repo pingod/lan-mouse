@@ -75,3 +75,71 @@ This ensures that
 - b) As soon as a virtual input enters another client, lan-mouse will stop receiving events,
 which ensures clients can only be controlled directly and not indirectly through other clients.
 
+
+## Screen Edges and Intervals
+
+A layout is described by edges, and an edge can carry more than one machine. Each
+client on an edge owns a **stretch** of it, so the data model needs an interval,
+not just a direction:
+
+| field | meaning |
+|---|---|
+| `ClientConfig::pos` | which edge of this screen the client hangs off |
+| `ClientConfig::edge` | the stretch of that edge the pointer leaves through |
+| `ClientConfig::peer_edge` | the stretch of the client's facing edge it lands in |
+
+`EdgeRange` (`input-event/src/edge.rs`) is the type. It is stored in **permille**
+(`0..=1000`, half-open) rather than as `f64` because `ClientConfig` derives `Eq`
+and an `f64` would break it; the config file still writes plain fractions
+(`edge = [0.0, 0.6]`), and the conversion is exact in both directions.
+
+### Attribution happens at the crossing point
+
+The daemon no longer asks "which client owns the right edge" - the answer is
+ambiguous the moment two clients share one. It asks where the pointer crossed and
+gives it to the client whose stretch contains that point
+(`src/capture.rs`, `route`). A crossing that matches no stretch reaches nobody and
+is logged; that stretch is a wall.
+
+Only the capture task knows the crossing point, so the routing lives there and the
+client manager stays ignorant of geometry (`fd46335` removed `client_at`,
+`client_at_fraction` and `edges_at`).
+
+### The fraction is remapped, not forwarded
+
+`ProtoEvent::Enter(Position, f64)` already carries a normalized fraction of the
+edge, so no protocol change was needed: the sender remaps its own fraction onto
+the receiver's stretch before sending it
+(`CaptureEntry::peer_fraction`). Three steps, the same as Synergy's
+`mapToFraction` → `transform` → `mapToPixel`: pixel + 0.5 into `[0,1]`, interval
+onto interval, back out. It is purely proportional and resolution independent, so
+two screens of different sizes agree without knowing each other's pixels.
+
+### What the backends can enforce
+
+| backend | behaviour on a stretch nobody owns |
+|---|---|
+| libei | a real barrier over the owned stretch only - the pointer hits a physical wall |
+| layer-shell | a 1 px surface clipped to the owned stretch - the compositor stops the pointer |
+| macOS / Windows | the segments are checked when a crossing is reported, so a crossing outside every stretch reads as "switched and bounced back" rather than a wall |
+
+The first two need the stretch at capture-creation time and rebuild the barrier
+when it changes; the latter two read it per event.
+
+### Non-goals
+
+- **Per-monitor geometry.** A machine's monitors are flattened into one rectangle.
+  Synergy 1 and Input Leap do the same; an L-shaped desk cannot be described.
+- **Wrapping.** A machine belongs to one edge, so the pointer cannot wrap around a
+  corner.
+- **Non-reciprocal links.** Both ends describe the same link.
+- **`switchNeedsShift` / `switchNeedsControl` / `switchNeedsAlt`.** A Wayland
+  client cannot read the modifiers of a pointer it does not own.
+- **`switchDelay`.** A barrier reports the crossing, not the dwell, so there is
+  nothing to wait for. `switchDoubleTap` is implemented instead, because two
+  crossings are observable.
+
+The arrangement canvas draws all of this from the same numbers
+(`lan-mouse-gtk/src/arrangement/layout.rs`), so the picture and the routing cannot
+disagree: what is drawn as a bridge is what a crossing goes through, and what is
+drawn as a wall is where the pointer stops.

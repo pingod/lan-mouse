@@ -445,9 +445,58 @@ hostname = "thorium"
 ips = ["192.168.178.189", "192.168.178.172"]
 # optional port
 port = 4242
+
+# Two machines can share one edge: each owns a stretch of it.
+[[clients]]
+position = "right"
+hostname = "cobalt"
+ips = ["192.168.178.190"]
+# the stretch of *this* screen's right edge the pointer leaves through,
+# as [start, end] fractions of the edge
+edge = [0.0, 0.6]
+# the stretch of *cobalt's* left edge the pointer lands in
+peer_edge = [0.0, 1.0]
+
+[[clients]]
+position = "right"
+hostname = "nickel"
+ips = ["192.168.178.191"]
+edge = [0.6, 1.0]
 ```
 
 Where `left` can be either `left`, `right`, `top` or `bottom`.
+
+`edge` and `peer_edge` are optional and default to `[0.0, 1.0]`, the whole edge.
+They exist so that several machines can hang off one edge: `edge` is the stretch
+of this screen's edge that crosses to the client, `peer_edge` the stretch of the
+client's facing edge the cursor lands in. The two are independent - mapping
+`0.0-0.6` onto `0.0-1.0` stretches the pointer across the peer's whole edge,
+mapping it onto `0.3-0.9` keeps it in the middle.
+
+A stretch no client claims is a wall: the pointer stops there instead of jumping
+to whichever client happened to be first. When two clients claim overlapping
+stretches the earlier one in this list keeps what it asked for and the later one
+is narrowed to what is left; the daemon logs that, `lan-mouse cli screens` prints
+it, and the arrangement canvas draws it.
+
+```sh
+lan-mouse cli screens          # what each edge is covered by, and where the walls are
+lan-mouse cli set-edge 0 --edge 0.0,0.6
+```
+
+Edge crossing can be made harder to trigger:
+
+```toml
+# the edge has to be hit twice within this many milliseconds (0 disables it)
+switch_double_tap = 250
+# corners within this many pixels of a blocked corner do not switch (0 disables it)
+switch_corner_size = 50
+# which corners are blocked: top-left, top-right, bottom-left, bottom-right
+switch_corners = ["top-left", "bottom-left"]
+```
+
+Both are also applied by the arrangement canvas, which draws a blocked corner as
+part of the wall it effectively is.
 
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)

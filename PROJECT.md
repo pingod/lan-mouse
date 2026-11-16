@@ -96,6 +96,18 @@ to   = ["KeyLeftCtrl", "KeyInsert"]
 | `capture_backend` / `emulation_backend` | 覆盖后端选择 |
 | `port` | 监听端口，默认 4242 |
 | `cert_path` | 证书路径 |
+| `switch_double_tap` | 边缘需要在这个毫秒数内被连续穿越两次才切换，`0` 关闭 |
+| `switch_corner_size` | 被屏蔽角落的像素半径，`0` 关闭 |
+| `switch_corners` | 被屏蔽的角落，取值 `top-left` / `top-right` / `bottom-left` / `bottom-right` |
+
+`[[clients]]` 里除了 `position`、`hostname`、`ips`、`port`、`activate_on_startup`，还有两个区间：
+
+| 键 | 说明 |
+|---|---|
+| `edge` | 本机这条边上指针离开的区间，`[start, end]` 分数，默认 `[0.0, 1.0]` |
+| `peer_edge` | 对端朝向这条边的边上，指针落下的区间，默认 `[0.0, 1.0]` |
+
+一条边可以挂多台机器，各自占一段：没被任何客户端覆盖的区间就是墙，指针停在那里而不是交给"列表里第一个"；两台声明重叠时，列表里靠前的保留它要的区间，靠后的被收窄到剩余部分。
 
 ---
 
@@ -114,6 +126,22 @@ lan-mouse cli <命令>
 | `remove-client <id>` | 删除客户端 |
 | `activate <id>` / `deactivate <id>` | 启用/停用 |
 | `set-host` / `set-port` / `set-position` / `set-ips` | 修改配置 |
+| `add-client … --position P --edge S,E --peer-edge S,E` | 添加时直接指定边与区间 |
+| `set-edge <id> --edge S,E [--peer-edge S,E]` | 改区间而不改边 |
+| `screens` | 打印本机可达区域尺寸、每条边由谁覆盖、哪里是墙、谁被收窄了 |
+
+`screens` 是这条链路唯一不依赖显示器的自检手段：
+
+```
+$ lan-mouse cli screens
+this screen: 1920x1080
+
+right:
+  id 0: alpha 20-60%  [ok]
+             lands in its 10-90%
+  id 1: beta 60-100%  [narrowed to what is left of 50-100%]
+  0-20% of the right edge is a wall
+```
 
 ### 服务控制
 
