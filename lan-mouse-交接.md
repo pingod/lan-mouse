@@ -103,13 +103,27 @@ keychain `~/Library/Keychains/signing.keychain-db`）重签：
 只重签已有 app：`scripts/macos-sign.sh "/Applications/Lan Mouse.app"`。
 签名的 keychain 口令是 `lmsign`，证书丢了就得重做一次身份（脚本头部有步骤）。
 
+### 本地编译（不走 CI，约 1 分钟一轮）
+
+Mac 上其实装了 Homebrew（`/opt/homebrew/bin`，只是不在默认 PATH），有 `gtk4`、
+`libadwaita`、`pkg-config`，所以可以直接在 Mac 上编译，不用等 CI 的 macOS 包：
+
+```bash
+scripts/mac-install.sh          # 同步源码 → Mac 上 release 编译 → 装进 .app → 重签 → 重启
+```
+
+它会 rsync 源码和 `.git`（后者让 shadow-rs 打上 `commit_hash`），编译完只替换
+`/Applications/Lan Mouse.app/Contents/MacOS/lan-mouse`，然后用 `macos-sign.sh`
+重签——证书签名让授权保持不变，不用重新勾辅助功能。
+
 ## 重要：macOS 授权
 
-替换 Mac 二进制后**必须重新授权**（辅助功能 + 输入监控）：
-```bash
-tccutil reset Accessibility de.feschber.LanMouse
-```
-因为 ad-hoc 签名下 macOS 按二进制哈希判定。GUI 会自动弹窗。
+授权（辅助功能 + 输入监控）锚在**签名身份**上：只要每次更新都用
+`macos-sign.sh` / `mac-deploy.sh` / `mac-install.sh` 重签，就永远不用重新勾。
+之前“每次更新都要重新授权”的原因是 CI 的包是 ad-hoc 签名（按二进制哈希判定）。
+
+万一手滑装了没重签的包导致掉权限，GUI 会自动弹窗，勾一次后按上面的流程更新即可；
+也可以 `tccutil reset Accessibility de.feschber.LanMouse` 强制重置。
 
 ## 配置陷阱
 
