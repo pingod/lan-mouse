@@ -1019,6 +1019,25 @@ impl Service {
         match event {
             EmulationEvent::PeerInfo { addr, info } => {
                 log::debug!("inbound {}: {}", addr, crate::sysinfo::describe(&info));
+                /* Also into the client row, not only into the incoming-connection
+                 * record. The canvas and `cli list` read the client rows, and this is the
+                 * direction a peer that connected *to* this machine reports through - so
+                 * its picture was reaching `incoming_conn_info` and nowhere else, which is
+                 * why the window never adopted one. */
+                if let Some(handle) = self.client_manager.handle_for_addr(addr) {
+                    self.client_manager.set_peer_info(handle, *info);
+                    self.notify_frontend(FrontendEvent::State(
+                        handle,
+                        self.client_manager
+                            .get_state(handle)
+                            .map(|(config, _)| config)
+                            .unwrap_or_default(),
+                        self.client_manager
+                            .get_state(handle)
+                            .map(|(_, state)| state)
+                            .unwrap_or_default(),
+                    ));
+                }
                 let flat = crate::sysinfo::flatten(&info);
                 // The report usually arrives before `Entered` has registered the
                 // connection, so hold it until there is a row to attach it to.

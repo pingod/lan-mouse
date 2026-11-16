@@ -413,6 +413,8 @@ impl ClientManager {
             .map(|(i, _)| i as ClientHandle)
     }
 
+    /// The client a peer address belongs to.
+    ///
     pub(crate) fn active_addr(&self, handle: ClientHandle) -> Option<SocketAddr> {
         self.clients
             .borrow()
@@ -443,11 +445,20 @@ impl ClientManager {
     }
 
     /// Find the client currently associated with `addr`.
+    ///
+    /// Matched on the address first and on the IP second: a peer that connected *to* this
+    /// machine reports from a different port than the one this side sends to, and a
+    /// report that cannot be attributed to a row is a report the canvas never sees.
     pub(crate) fn handle_for_addr(&self, addr: SocketAddr) -> Option<ClientHandle> {
-        self.clients
-            .borrow()
+        let clients = self.clients.borrow();
+        clients
             .iter()
             .find(|(_, (_, s))| s.active_addr == Some(addr))
+            .or_else(|| {
+                clients
+                    .iter()
+                    .find(|(_, (_, s))| s.active_addr.is_some_and(|a| a.ip() == addr.ip()))
+            })
             .map(|(i, _)| i as ClientHandle)
     }
 
