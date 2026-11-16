@@ -236,7 +236,9 @@ impl ListenTask {
                                 data,
                             } => {
                                 let entry = self.reassemblers.entry(addr).or_default();
+                                log::debug!("peer report chunk {}/{} from {addr}", index as u32 + 1, total);
                                 if let Some(info) = entry.push(index, total, &data) {
+                                    log::debug!("peer report complete from {addr}: world={:?}", info.world());
                                     send_event(
                                         &self.event_tx,
                                         EmulationEvent::PeerInfo {
