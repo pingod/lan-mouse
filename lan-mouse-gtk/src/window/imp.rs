@@ -62,8 +62,6 @@ pub struct Window {
     #[template_child]
     pub restart_interval_entry: TemplateChild<gtk::Entry>,
     #[template_child]
-    pub log_level_label: TemplateChild<gtk::Label>,
-    #[template_child]
     pub log_view: TemplateChild<gtk::TextView>,
     #[template_child]
     pub log_level_combo: TemplateChild<adw::ComboRow>,
@@ -100,6 +98,13 @@ pub struct Window {
     /// set once the daemon started streaming; subscribing twice would reset its
     /// cursor and lose the records in between
     pub log_streaming: Cell<bool>,
+    /// Whether the log view follows new records. Derived from the scroll
+    /// position: at the bottom means follow, anywhere else means the user is
+    /// reading history and the view must stay put.
+    pub log_follow: std::rc::Rc<Cell<bool>>,
+    /// Guards the combo's own notify handler while the daemon's answer is being
+    /// mirrored back into the widget.
+    pub log_level_syncing: Cell<bool>,
 }
 
 #[glib::object_subclass]
@@ -359,12 +364,28 @@ impl ObjectImpl for Window {
         // The log view owns its buffer; wire it up once and let
         // `set_logs` write into it.
         self.log_view.set_buffer(Some(&*self.log_buffer.borrow()));
+
+        // Follow the tail until the user scrolls away from it, and resume as
+        // soon as the view is back at the bottom. Deriving the flag from the
+        // scroll position keeps the two in sync without tracking every gesture.
+        if let Some(adjustment) = self.log_view.vadjustment() {
+            let follow = self.log_follow.clone();
+            adjustment.connect_value_changed(move |adjustment| {
+                let at_bottom =
+                    adjustment.value() + adjustment.page_size() >= adjustment.upper() - 2.0;
+                follow.set(at_bottom);
+            });
+        }
+
         let combo = self.log_level_combo.clone();
         let weak = obj.downgrade();
         combo.connect_selected_notify(move |row| {
             let Some(window) = weak.upgrade() else {
                 return;
             };
+            if window.imp().log_level_syncing.get() {
+                return;
+            }
             let Some(level) = row
                 .selected_item()
                 .and_then(|item| item.downcast::<gtk::StringObject>().ok())

@@ -166,3 +166,18 @@ Leave，所以即使重建失败也不会永久卡死。
 
 模型限制：一台设备只能占一条边；多条边共用的场景下按 `position_map` 的既有顺序
 由"先在列表里出现的那台"接管，页面上就是把多个方块并排画在同一个方向上。
+
+## GUI：Logs 页
+
+- 级别菜单只有一个入口：`window.ui` 里原来的 `Level` 下拉框和 `Active level` 行已合并，
+  下拉框的副标题显示服务端回报的 `Active: <level>`；`set_log_level` 用
+  `combo.set_selected(position)` 把选中项同步过去（`refresh_log_level_row` 的注释与
+  `set_selected` 的返回值都按"用户选择 ≠ 服务端确认"处理，避免回环）。
+- 自动滚屏：`window/imp.rs` 的 `log_follow: Rc<Cell<bool>>` 由 `log_view` 的纵向
+  adjustment `value-changed` 派生——停在底部就是跟随，往上拖就停止跟随，拖回底部自动
+  恢复。`append_logs` 在插入前读一次 `follow`（插入后 `upper` 已经变大，再判断就会
+  永远为假），`set_logs`（刷新/清空）把视图钉到底部并重新开启跟随。
+- 载入历史记录时 `set_logs` 末尾补一个换行，否则流式追加的第一条会粘在最后一行后面。
+- 滚到精确底部由 `scroll_logs_to_end` 负责：先 `scroll_to_iter`，再在 idle 里把
+  adjustment 顶到 `upper - page_size`（`scroll_to_iter` 只保证可见，长行换行后最后一行
+  可能被切掉半行）。

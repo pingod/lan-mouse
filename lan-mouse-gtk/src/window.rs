@@ -470,16 +470,37 @@ impl Window {
     }
 
     pub(super) fn set_log_level(&self, level: &str) {
-        self.imp().log_level_label.set_text(level);
+        let imp = self.imp();
+        imp.log_level_combo.set_subtitle(&level_label(level));
+
+        // Mirror the daemon's answer into the menu without echoing it back: the
+        // requested level can be clamped (for example by the build's max level),
+        // so the widget has to show what is actually in effect.
+        let combo = imp.log_level_combo.get();
+        let Some(position) = level_position(level) else {
+            return;
+        };
+        if combo.selected() == position {
+            return;
+        }
+        imp.log_level_syncing.set(true);
+        combo.set_selected(position);
+        imp.log_level_syncing.set(false);
     }
 
     pub(super) fn set_logs(&self, lines: Vec<String>) {
         let imp = self.imp();
-        imp.log_buffer.borrow().set_text(&lines.join("\n"));
-        // Keep the newest record visible.
-        let view = imp.log_view.get();
-        let mut end = view.buffer().end_iter();
-        view.scroll_to_iter(&mut end, 0.0, false, 0.0, 0.0);
+        // Trailing newline: the stream appends whole lines, and without it the
+        // first streamed record would be glued onto the last backlog line.
+        let text = if lines.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", lines.join("\n"))
+        };
+        imp.log_buffer.borrow().set_text(&text);
+        // A refresh replaces the whole view, so it always lands on the tail.
+        imp.log_follow.set(true);
+        scroll_logs_to_end(&imp.log_view.get());
     }
 
     /// Load the backlog once, then keep streaming.
@@ -503,6 +524,9 @@ impl Window {
             return;
         }
         let imp = self.imp();
+        // Decided before the insert: appending grows the buffer, which would
+        // make every append look like the view had been scrolled away.
+        let follow = imp.log_follow.get();
         let buffer = imp.log_buffer.borrow();
         let mut end = buffer.end_iter();
         buffer.insert(&mut end, &format!("{}\n", lines.join("\n")));
@@ -518,22 +542,17 @@ impl Window {
         }
         drop(buffer);
 
-        // Follow the tail unless the user scrolled up to read something.
-        let view = imp.log_view.get();
-        let at_bottom = view
-            .vadjustment()
-            .map(|adj| adj.value() + adj.page_size() >= adj.upper() - 4.0)
-            .unwrap_or(true);
-        if at_bottom {
-            let mut end = imp.log_buffer.borrow().end_iter();
-            view.scroll_to_iter(&mut end, 0.0, false, 0.0, 0.0);
+        if follow {
+            scroll_logs_to_end(&imp.log_view.get());
         }
     }
 
     /// Drop the displayed records and stop the stream while the window is
     /// hidden, so a background window costs nothing.
     pub(super) fn clear_logs(&self) {
-        self.imp().log_buffer.borrow().set_text("");
+        let imp = self.imp();
+        imp.log_buffer.borrow().set_text("");
+        imp.log_follow.set(true);
     }
 
     pub(super) fn request_restart_interval(&self, seconds: u64) {
@@ -1343,6 +1362,39 @@ fn format_duration(secs: u64) -> String {
     } else {
         format!("{}s", secs)
     }
+}
+
+/// Put the newest record at the bottom of the viewport.
+///
+/// `scroll_to_iter` only guarantees the mark becomes visible, which leaves the
+/// last line half cut off after a word-wrapped record; pinning the adjustment
+/// on the next idle makes the bottom edge line up exactly.
+fn scroll_logs_to_end(view: &gtk::TextView) {
+    let mut end = view.buffer().end_iter();
+    view.scroll_to_iter(&mut end, 0.0, false, 0.0, 0.0);
+    let view = view.clone();
+    glib::idle_add_local_once(move || {
+        if let Some(adjustment) = view.vadjustment() {
+            adjustment
+                .set_value((adjustment.upper() - adjustment.page_size()).max(adjustment.lower()));
+        }
+    });
+}
+
+/// The menu entries, in the order the `.ui` file lists them.
+const LOG_LEVELS: [&str; 6] = ["off", "error", "warn", "info", "debug", "trace"];
+
+/// Subtitle text for a level name reported by the daemon.
+fn level_label(level: &str) -> String {
+    format!("Active: {level}")
+}
+
+/// Index of `level` in the menu, so the widget can show the effective level.
+fn level_position(level: &str) -> Option<u32> {
+    LOG_LEVELS
+        .iter()
+        .position(|candidate| *candidate == level)
+        .map(|index| index as u32)
 }
 
 #[cfg(test)]

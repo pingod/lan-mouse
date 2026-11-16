@@ -600,7 +600,7 @@
                         <child>
                           <object class="AdwPreferencesGroup">
                             <property name="title" translatable="yes">Live output</property>
-                            <property name="description" translatable="yes">Records stream in as the service writes them. Raise the level to debug when something misbehaves.</property>
+                            <property name="description" translatable="yes">Records stream in as the service writes them, newest at the bottom. Raise the level to debug when something misbehaves; scrolling up stops the view from following, scrolling back to the bottom resumes it.</property>
                             <property name="header-suffix">
                               <object class="GtkBox">
                                 <property name="spacing">6</property>
@@ -634,7 +634,7 @@
                             <child>
                               <object class="AdwComboRow" id="log_level_combo">
                                 <property name="title" translatable="yes">Level</property>
-                                <property name="subtitle">-</property>
+                                <property name="subtitle" translatable="yes">Active: info</property>
                                 <property name="model">
                                   <object class="GtkStringList">
                                     <items>
@@ -647,18 +647,6 @@
                                     </items>
                                   </object>
                                 </property>
-                              </object>
-                            </child>
-                            <child>
-                              <object class="AdwActionRow" id="log_level_row">
-                                <property name="title" translatable="yes">Active level</property>
-                                <child>
-                                  <object class="GtkLabel" id="log_level_label">
-                                    <property name="label">-</property>
-                                    <property name="valign">center</property>
-                                    <style><class name="dim-label"/></style>
-                                  </object>
-                                </child>
                               </object>
                             </child>
                             <child>

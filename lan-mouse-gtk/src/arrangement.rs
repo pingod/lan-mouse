@@ -498,13 +498,10 @@ pub(super) fn rebuild(
         }
         popover.set_child(Some(&list));
     }
-    {
-        /* The popover is parented to the drawing area, so it has to be detached
-         * again before the area is rebuilt, otherwise GTK refuses to finalise
-         * the widget (and warns on every refresh). */
-        let popover = popover.clone();
-        area.connect_unrealize(move |_area| popover.unparent());
-    }
+    /* GTK refuses to finalise a widget that still has children, and this
+     * popover belongs to this page, so detach it as soon as it is hidden and
+     * re-parent it on demand. */
+    popover.connect_hide(|popover| popover.unparent());
 
     /* Capture phase: the dots are claimed before the drag gesture sees the
      * press, a press anywhere else on a card falls through to the drag. */
@@ -515,6 +512,7 @@ pub(super) fn rebuild(
         let state = Rc::clone(&state);
         let menu_handle = Rc::clone(&menu_handle);
         let popover = popover.clone();
+        let area = area.clone();
         click.connect_pressed(move |click, _n, x, y| {
             /* Only the dots in the card corner open the menu, a press anywhere
              * else on a card is part of a drag. The borrow is released before the
@@ -552,6 +550,9 @@ pub(super) fn rebuild(
             };
             click.set_state(gtk::EventSequenceState::Claimed);
             *menu_handle.borrow_mut() = Some(handle);
+            if popover.parent().is_none() {
+                popover.set_parent(&area);
+            }
             popover.set_pointing_to(Some(&bounds));
             popover.popup();
         });
