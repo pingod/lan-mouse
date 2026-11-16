@@ -1003,6 +1003,10 @@ impl MacOSInputCapture {
             .map_err(|_| MacosCaptureCreationError::EventTapCreation)??;
 
         let task_error_tx = task_event_tx.clone();
+        /* the task owns a handle of its own: `state` itself is kept for the struct,
+         * because `screen_size()` and `create`/`update` read the same state from
+         * outside the task */
+        let task_state = Arc::clone(&state);
         let _tap_task: tokio::task::JoinHandle<()> = tokio::task::spawn_local(async move {
             loop {
                 tokio::select! {
@@ -1010,7 +1014,7 @@ impl MacOSInputCapture {
                         let Some(producer_event) = producer_event else {
                             break;
                         };
-                        let mut state = state.lock().await;
+                        let mut state = task_state.lock().await;
                         if let Err(e) = state.handle_producer_event(producer_event).await {
                             // swallow-and-continue would leave the capture active
                             // forever (e.g. a dead event tap: no events arrive, but
@@ -1032,7 +1036,7 @@ impl MacOSInputCapture {
             event_tx: task_event_tx,
             notify_tx,
             run_loop,
-            state: Arc::clone(&state),
+            state,
         })
     }
 }
