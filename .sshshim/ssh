@@ -1,0 +1,2 @@
+#!/bin/bash
+exec /usr/bin/ssh -F /dev/null -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$@"

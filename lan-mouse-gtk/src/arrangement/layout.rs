@@ -300,8 +300,19 @@ pub fn snap(local: Screen, monitors: &[Monitor], candidate: Screen) -> Placement
         if total <= 0.0 {
             return EdgeRange::FULL;
         }
-        let start = (lo - origin) / total;
-        let end = (hi - origin) / total;
+        /* Snap to the ends of the edge. A card dragged to cover a whole screen lands
+         * a pixel short as often as not, and a permille of it left over is a sliver
+         * where the pointer hits a wall - the canvas would show a gap that nobody
+         * asked for and the user cannot close. */
+        const SNAP: f64 = 0.002;
+        let mut start = (lo - origin) / total;
+        let mut end = (hi - origin) / total;
+        if start.abs() < SNAP {
+            start = 0.0;
+        }
+        if (1.0 - end).abs() < SNAP {
+            end = 1.0;
+        }
         EdgeRange::from_fractions(start, end)
             // two positions a few pixels apart can round to the same permille;
             // widen by one step rather than dropping the peer's range entirely
@@ -1009,6 +1020,28 @@ mod tests {
         let over_gap = placement(Position::Top, (0.9, 1.0), (0.0, 1.0), (10.0, 10.0));
         assert_eq!(anchor_monitor(bounds, &only_left, &over_gap), bounds);
         let _ = spare;
+    }
+
+    #[test]
+    fn a_card_dragged_almost_to_the_edge_covers_the_whole_edge() {
+        /* A pixel short of the top of a 1440 px edge is 0.07% - well under the
+         * permille the range stores, so `from_fractions` would round it to 0 (or to
+         * 999 at the far end) and leave a sliver the pointer cannot cross. */
+        let (bounds, monitors) = two_monitor_desk();
+        let candidate = Screen::new(0.0, 1120.0 - GAP - 1440.0 + 1.0, 2560.0, 1440.0);
+        let placement = snap(bounds, &monitors, candidate);
+        assert_eq!(placement.position, Position::Top);
+        assert_eq!(placement.edge, EdgeRange::FULL, "{placement:?}");
+
+        /* and a deliberate half still stays a half */
+        let candidate = Screen::new(0.0, 1120.0 - GAP - 1440.0, 1280.0, 1440.0);
+        let placement = snap(bounds, &monitors, candidate);
+        assert_eq!(
+            placement.edge.fractions(),
+            [0.0, 0.5],
+            "{:?}",
+            placement.edge
+        );
     }
 
     #[test]
