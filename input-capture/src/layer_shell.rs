@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use futures_core::Stream;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     env,
     fmt::{self, Display},
     io::{self, ErrorKind},
@@ -129,8 +129,23 @@ struct State {
     qh: QueueHandle<Self>,
     pending_events: VecDeque<(Position, CaptureEvent)>,
     outputs: Vec<Output>,
-    scroll_discrete_pending: HashSet<u8>,
+    /// when a discrete (notch) scroll last arrived on each axis
+    ///
+    /// A wheel sends `axis_value120` *and* `axis` for the same physical notch, and
+    /// the compositor is free to send them in either order - so suppressing one of
+    /// the pair by arrival order forwarded both whenever the order flipped, which
+    /// scrolls twice as far. A device that reports notches is preferred for that
+    /// axis for a short window instead, whichever came first.
+    scroll_notch_at: [Option<std::time::Instant>; 2],
 }
+
+/// How long after a notch a continuous axis event on the same axis is taken to be
+/// the same physical movement.
+///
+/// Mouse wheels send both event shapes per detent, and a touchpad sends only the
+/// continuous one - so this only has to be longer than the gap between the two
+/// events of one notch and shorter than the gap between two notches.
+const SCROLL_NOTCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
 
 struct Inner {
     state: State,
@@ -485,7 +500,7 @@ impl LayerShellInputCapture {
             read_guard: None,
             pending_events: VecDeque::new(),
             outputs: vec![],
-            scroll_discrete_pending: Default::default(),
+            scroll_notch_at: [None; 2],
         };
 
         for global in state.global_list.contents().clone_list() {
@@ -1065,14 +1080,14 @@ impl Dispatch<WlPointer, ()> for State {
                 let Some(pos) = app.focused.as_ref().map(|w| w.pos) else {
                     return;
                 };
-                if app
-                    .scroll_discrete_pending
-                    .contains(&(u32::from(axis) as u8))
-                {
-                    // each axisvalue120 event is coupled with
-                    // a corresponding axis event, which needs to
-                    // be ignored to not duplicate the scrolling
-                    app.scroll_discrete_pending.remove(&(u32::from(axis) as u8));
+                let slot = u32::from(axis) as usize;
+                let notch_recently = app
+                    .scroll_notch_at
+                    .get(slot)
+                    .and_then(|at| *at)
+                    .is_some_and(|at| at.elapsed() < SCROLL_NOTCH_WINDOW);
+                if notch_recently {
+                    /* the same notch, already delivered as a discrete event */
                 } else {
                     app.pending_events.push_back((
                         pos,
@@ -1088,7 +1103,9 @@ impl Dispatch<WlPointer, ()> for State {
                 let Some(pos) = app.focused.as_ref().map(|w| w.pos) else {
                     return;
                 };
-                app.scroll_discrete_pending.insert(u32::from(axis) as u8);
+                if let Some(slot) = app.scroll_notch_at.get_mut(u32::from(axis) as usize) {
+                    *slot = Some(std::time::Instant::now());
+                }
                 app.pending_events.push_back((
                     pos,
                     CaptureEvent::Input(Event::Pointer(PointerEvent::AxisDiscrete120 {
@@ -1098,10 +1115,8 @@ impl Dispatch<WlPointer, ()> for State {
                 ));
             }
             wl_pointer::Event::Frame => {
-                // A frame is complete: any pending discrete scroll event that
-                // was not paired with a continuous axis event in this frame
-                // must not swallow the next, unrelated one.
-                app.scroll_discrete_pending.clear();
+                /* nothing to reconcile: the notch window is time based, so an
+                 * unpaired discrete event simply expires */
             }
             _ => {}
         }

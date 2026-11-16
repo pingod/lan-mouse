@@ -69,7 +69,7 @@ pub(super) fn draw(cr: &cairo::Context, width: f64, height: f64, state: &State, 
      * where one machine's screens are separated by another's still reads as two
      * machines rather than three.
      */
-    let monitors = state.local_monitors();
+    let monitors = state.drawn_monitors();
     let local_colour = paint::machine_color(0, palette);
     for monitor in &monitors {
         let canvas = state.to_canvas(monitor.rect);

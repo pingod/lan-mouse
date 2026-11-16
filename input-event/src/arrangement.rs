@@ -18,8 +18,18 @@ use crate::display::ScreenRect;
 /// One machine and the rectangles of its screens.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArrangedMachine {
-    /// the machine's hostname, which is how both sides know each other
+    /// the machine's hostname, for a log or a label
+    ///
+    /// Not an identity: each side names the other however its own configuration
+    /// says, so the same machine arrives as `192.168.1.5` on one end and as
+    /// `pavia-macbook-pro.local` on the other. Matching on it made adoption fail
+    /// silently - the receiving side looked for itself and found nothing.
     pub hostname: String,
+    /// whether these screens are the author's own
+    ///
+    /// The only identity that matters: a picture has the author's machine and the
+    /// machines it can see, and the receiver is one of the latter.
+    pub authored: bool,
     /// its screens, in the shared coordinate space
     pub screens: Vec<ScreenRect>,
 }
@@ -75,7 +85,28 @@ impl Arrangement {
         }))
     }
 
-    /// The screens of one machine.
+    /// The author's own screens.
+    pub fn authored_screens(&self) -> &[ScreenRect] {
+        self.machines
+            .iter()
+            .find(|machine| machine.authored)
+            .map(|machine| machine.screens.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The screens of the machine that is not the author.
+    ///
+    /// That is the receiver: a picture is produced by one machine about the desk it
+    /// can see, so exactly one entry is the author and the rest are peers.
+    pub fn peer_screens(&self) -> Vec<(&str, &[ScreenRect])> {
+        self.machines
+            .iter()
+            .filter(|machine| !machine.authored)
+            .map(|machine| (machine.hostname.as_str(), machine.screens.as_slice()))
+            .collect()
+    }
+
+    /// The screens of one machine, by hostname.
     pub fn screens_of(&self, hostname: &str) -> &[ScreenRect] {
         self.machines
             .iter()
@@ -93,6 +124,8 @@ impl Arrangement {
         let mut out = format!("{}|{}", self.revision, clean(&self.author));
         for machine in &self.machines {
             out.push('|');
+            out.push(if machine.authored { '1' } else { '0' });
+            out.push(':');
             out.push_str(&clean(&machine.hostname));
             out.push('|');
             let screens = machine
@@ -117,7 +150,11 @@ impl Arrangement {
         let revision = parts.next()?.parse().ok()?;
         let author = parts.next()?.to_owned();
         let mut machines = Vec::new();
-        while let Some(hostname) = parts.next() {
+        while let Some(header) = parts.next() {
+            let (authored, hostname) = header
+                .split_once(':')
+                .map(|(flag, host)| (flag == "1", host.to_owned()))
+                .unwrap_or((false, header.to_owned()));
             let screens = parts.next().unwrap_or_default();
             let screens = screens
                 .split(';')
@@ -128,7 +165,8 @@ impl Arrangement {
                 continue;
             }
             machines.push(ArrangedMachine {
-                hostname: hostname.to_owned(),
+                hostname,
+                authored,
                 screens,
             });
         }
@@ -183,10 +221,14 @@ mod tests {
         let mut arrangement = Arrangement::new(7, "cachyos-x8664");
         arrangement.machines.push(ArrangedMachine {
             hostname: "cachyos-x8664".to_owned(),
+            authored: true,
             screens: vec![rect(0, 1120, 2560, 1440), rect(2560, 0, 1440, 2560)],
         });
         arrangement.machines.push(ArrangedMachine {
-            hostname: "pavia-macbook-pro.local".to_owned(),
+            /* the author names this machine however its configuration says, which
+             * is not what the machine calls itself */
+            hostname: "192.168.1.5".to_owned(),
+            authored: false,
             screens: vec![rect(0, -1500, 2560, 1440)],
         });
         arrangement
@@ -210,10 +252,15 @@ mod tests {
     }
 
     #[test]
-    fn a_machines_screens_can_be_looked_up_by_hostname() {
+    fn the_author_and_the_peer_are_told_apart_without_matching_names() {
         let arrangement = desk();
-        assert_eq!(arrangement.screens_of("cachyos-x8664").len(), 2);
-        assert_eq!(arrangement.screens_of("nope").len(), 0);
+        /* the receiver is not in the picture under the name it uses for itself,
+         * which is exactly why the flag exists */
+        assert_eq!(arrangement.authored_screens().len(), 2);
+        let peers = arrangement.peer_screens();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].0, "192.168.1.5");
+        assert_eq!(peers[0].1.len(), 1);
     }
 
     #[test]
@@ -250,11 +297,13 @@ mod tests {
         let mut arrangement = Arrangement::new(1, "a|b;c");
         arrangement.machines.push(ArrangedMachine {
             hostname: "x|y".to_owned(),
+            authored: true,
             screens: vec![rect(0, 0, 10, 10)],
         });
         let decoded = Arrangement::decode(&arrangement.encode()).expect("decodes");
         assert_eq!(decoded.author, "a_b_c");
         assert_eq!(decoded.machines[0].hostname, "x_y");
+        assert!(decoded.machines[0].authored);
         assert_eq!(decoded.machines[0].screens, vec![rect(0, 0, 10, 10)]);
     }
 }

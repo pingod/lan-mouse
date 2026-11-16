@@ -50,8 +50,15 @@ pub(crate) struct MacOSEmulation {
     modifier_state: Arc<Mutex<XMods>>,
     /// notify to cancel key repeats
     notify_repeat_task: Arc<Notify>,
-    /// cached key for `natural_scroll_enabled`
-    natural_scroll_key: CFString,
+    /// whether "Natural Scrolling" is on, read once
+    ///
+    /// Read once on purpose: it was read per event, so a preference read that
+    /// failed for a single event (`natural_scroll_enabled` falls back to "on" when
+    /// the key is unset *or invalid*) flipped the direction of that one notch.
+    natural_scroll: bool,
+    /// the sub-step remainder of each axis, so a touchpad's fractions are not
+    /// dropped by the integer macOS event
+    scroll_residual: [f64; 2],
 }
 
 /* `CGEventSource` and `CFString` are plain reference-counted Core Foundation
@@ -101,8 +108,49 @@ impl MacOSEmulation {
             repeat_task: None,
             notify_repeat_task: Arc::new(Notify::new()),
             modifier_state: Arc::new(Mutex::new(XMods::empty())),
-            natural_scroll_key: CFString::new("com.apple.swipescrolldirection"),
+            natural_scroll: natural_scroll_enabled(&CFString::new(
+                "com.apple.swipescrolldirection",
+            )),
+            scroll_residual: [0.0; 2],
         })
+    }
+
+    /// A scroll delta in the sign macOS expects.
+    ///
+    /// Both event shapes go through this. They used to apply the natural-scrolling
+    /// preference with *opposite* signs, so the same physical notch arrived as "up"
+    /// through the continuous event and "down" through the discrete one - and the
+    /// capture sends both, which is the up/down oscillation that was reported.
+    fn signed_scroll(&self, value: f64) -> f64 {
+        if self.natural_scroll { -value } else { value }
+    }
+
+    /// Post one scroll event on `axis` (`0` vertical, `1` horizontal).
+    fn scroll(&self, unit: ScrollEventUnit, axis: u8, steps: i32) {
+        if steps == 0 {
+            /* Nothing to say, and an event with a zero delta still occupies the
+             * scroll accumulator inside the receiving app. */
+            return;
+        }
+        let (count, wheel1, wheel2, wheel3) = match axis {
+            0 => (1, steps, 0, 0),
+            1 => (2, 0, steps, 0),
+            _ => {
+                log::warn!("invalid scroll axis: {axis}");
+                return;
+            }
+        };
+        match CGEvent::new_scroll_event(
+            self.event_source.clone(),
+            unit,
+            count,
+            wheel1,
+            wheel2,
+            wheel3,
+        ) {
+            Ok(event) => post_synthesized(&event),
+            Err(()) => log::warn!("scroll event creation failed"),
+        }
     }
 
     fn get_mouse_location(&self) -> Option<CGPoint> {
@@ -693,68 +741,26 @@ impl Emulation for MacOSEmulation {
                         axis,
                         value,
                     } => {
-                        let value = if natural_scroll_enabled(&self.natural_scroll_key) {
-                            -value as i32
-                        } else {
-                            value as i32
-                        };
-                        let (count, wheel1, wheel2, wheel3) = match axis {
-                            0 => (1, value, 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
-                            1 => (2, 0, value, 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
-                            _ => {
-                                log::warn!("invalid scroll event: {axis}, {value}");
-                                return Ok(());
-                            }
-                        };
-                        let event = match CGEvent::new_scroll_event(
-                            self.event_source.clone(),
-                            ScrollEventUnit::PIXEL,
-                            count,
-                            wheel1,
-                            wheel2,
-                            wheel3,
-                        ) {
-                            Ok(e) => e,
-                            Err(()) => {
-                                log::warn!("scroll event creation failed!");
-                                return Ok(());
-                            }
-                        };
-                        post_synthesized(&event);
+                        /* One sign rule for both paths, and the fraction is carried
+                         * rather than truncated: a touchpad delivers fractions of a
+                         * pixel, and `value as i32` drops every one of them. */
+                        let signed = self.signed_scroll(value);
+                        let slot = axis as usize;
+                        if slot < self.scroll_residual.len() {
+                            let total = self.scroll_residual[slot] + signed;
+                            let whole = total.trunc();
+                            self.scroll_residual[slot] = total - whole;
+                            self.scroll(ScrollEventUnit::PIXEL, axis, whole as i32);
+                        }
                     }
                     /* macOS/windows inject discrete wheel events only: a stopped or
                      * cancelled gesture needs no follow up event. */
                     PointerEvent::AxisStop { .. } | PointerEvent::AxisCancel { .. } => {}
                     PointerEvent::AxisDiscrete120 { axis, value } => {
-                        let value = if natural_scroll_enabled(&self.natural_scroll_key) {
-                            value
-                        } else {
-                            -value
-                        };
                         const LINES_PER_STEP: i32 = 3;
-                        let (count, wheel1, wheel2, wheel3) = match axis {
-                            0 => (1, value / (120 / LINES_PER_STEP), 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
-                            1 => (2, 0, value / (120 / LINES_PER_STEP), 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
-                            _ => {
-                                log::warn!("invalid scroll event: {axis}, {value}");
-                                return Ok(());
-                            }
-                        };
-                        let event = match CGEvent::new_scroll_event(
-                            self.event_source.clone(),
-                            ScrollEventUnit::LINE,
-                            count,
-                            wheel1,
-                            wheel2,
-                            wheel3,
-                        ) {
-                            Ok(e) => e,
-                            Err(()) => {
-                                log::warn!("scroll event creation failed!");
-                                return Ok(());
-                            }
-                        };
-                        post_synthesized(&event);
+                        let notches = self.signed_scroll(f64::from(value)) / f64::from(120)
+                            * f64::from(LINES_PER_STEP);
+                        self.scroll(ScrollEventUnit::LINE, axis, notches as i32);
                     }
                 }
 

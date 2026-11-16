@@ -330,8 +330,18 @@ struct State {
     resize: Option<Resize>,
     /// the card the pointer is over, which is also the keyboard-selected one
     hover: Option<ClientHandle>,
-    /// the view's pan when a pan began, while the local screen is being dragged
+    /// the view's pan when a pan began, while the view is being dragged
     panning: Option<(f64, f64)>,
+    /// where a drag of this machine's own screens began, in canvas units
+    moving_local: Option<(f64, f64)>,
+    /// how far this machine's screens have been moved from where the compositor put
+    /// them, in layout units - a drag of the local screens, not a pan
+    ///
+    /// Only the drawing and the hit test see this. Peers are placed against the
+    /// monitors where the compositor has them, so dragging this machine does not
+    /// drag the peers along with it - the point is to change where this machine sits
+    /// relative to them.
+    local_offset: (f64, f64),
     /// when this side last changed the layout, in milliseconds
     ///
     /// It is the tie-breaker in the shared picture and it must only move on an
@@ -408,6 +418,7 @@ impl State {
             .collect::<Vec<_>>();
         picture.machines.push(input_event::ArrangedMachine {
             hostname: self.local_hostname.clone(),
+            authored: true,
             screens: mine,
         });
         for machine in &self.machines {
@@ -429,6 +440,7 @@ impl State {
             }
             picture.machines.push(input_event::ArrangedMachine {
                 hostname: machine.hostname.clone(),
+                authored: false,
                 screens,
             });
         }
@@ -458,17 +470,35 @@ impl State {
     /// with it - including the handles, which have to stay on the edge the picture
     /// says the link is on.
     fn adopt(&mut self, picture: &input_event::Arrangement) {
-        let mine = picture.screens_of(&self.local_hostname).to_vec();
+        /* This machine is whichever entry is not the author's. Matching on the
+         * hostname cannot work: the picture was produced by the peer, which names
+         * this machine however *its* configuration says - `192.168.1.5` for a
+         * machine that calls itself `pavia-macbook-pro.local`. That mismatch made
+         * adoption return early and the two windows never agreed. */
+        let peers = picture.peer_screens();
+        let mine = match peers.len() {
+            1 => peers[0].1.to_vec(),
+            /* more than one peer in the picture: fall back to the name, which is
+             * right at least when both sides happen to agree on it */
+            _ => peers
+                .iter()
+                .find(|(hostname, _)| *hostname == self.local_hostname)
+                .map(|(_, screens)| screens.to_vec())
+                .unwrap_or_default(),
+        };
         if mine.is_empty() {
-            /* the peer's picture does not describe this machine - drawing nothing
-             * would be worse than drawing this side's own derivation */
+            /* the picture does not describe this machine - drawing nothing would be
+             * worse than drawing this side's own derivation */
             return;
         }
         self.local_displays = mine.iter().map(display_of).collect();
         let local = self.local_screen();
         let monitors = self.local_monitors();
+        let authored = picture.authored_screens().to_vec();
         for machine in &mut self.machines {
-            let theirs = picture.screens_of(&machine.hostname).to_vec();
+            /* every peer in the picture is the author, because this side is the only
+             * receiver there is */
+            let theirs = authored.clone();
             if theirs.is_empty() {
                 continue;
             }
@@ -493,6 +523,62 @@ impl State {
             machine.peer_monitors = normalise_monitors(&theirs);
             machine.peer_size = Some((candidate.w, candidate.h));
         }
+    }
+
+    /// Re-derive every peer's link from where this machine has been dragged to.
+    ///
+    /// The link is a statement about which monitor the peer is beside and how much
+    /// of that edge it covers, so moving this machine is a way of editing all of
+    /// them at once. Whatever a link already says is kept if the geometry still
+    /// implies it, so a drag that only moves the machine does not rewrite links that
+    /// did not need to change.
+    fn reanchor_after_moving_local(
+        &self,
+    ) -> Vec<(ClientHandle, Position, Option<String>, EdgeRange, EdgeRange)> {
+        let local = self.local_screen();
+        let monitors = self.drawn_monitors();
+        let mut out = Vec::new();
+        for machine in self.machines.iter().filter(|machine| machine.active) {
+            let Some(rect) = self.rect_of(machine.handle) else {
+                continue;
+            };
+            let placement = layout::snap(local, &monitors, rect);
+            if placement.position == machine.position
+                && placement.display == machine.display
+                && placement.edge == machine.edge
+                && placement.peer_edge == machine.peer_edge
+            {
+                continue;
+            }
+            out.push((
+                machine.handle,
+                placement.position,
+                placement.display,
+                placement.edge,
+                placement.peer_edge,
+            ));
+        }
+        out
+    }
+
+    /// This machine's monitors where they are *drawn*, which is where the compositor
+    /// put them unless a drag has moved them.
+    fn drawn_monitors(&self) -> Vec<layout::Monitor> {
+        let (dx, dy) = self.local_offset;
+        self.local_monitors()
+            .into_iter()
+            .map(|monitor| {
+                layout::Monitor::new(
+                    monitor.name,
+                    Screen::new(
+                        monitor.rect.x + dx,
+                        monitor.rect.y + dy,
+                        monitor.rect.w,
+                        monitor.rect.h,
+                    ),
+                )
+            })
+            .collect()
     }
 
     /// The individual monitors, in layout units, with their names.
@@ -882,6 +968,8 @@ impl Canvas {
             resize: None,
             hover: None,
             panning: None,
+            moving_local: None,
+            local_offset: (0.0, 0.0),
             local_revision: 0,
             published: String::new(),
             last_signature: Vec::new(),
@@ -1267,18 +1355,20 @@ fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
             if state.resize.is_some() || state.handle_at(x, y).is_some() {
                 return;
             }
-            /* A press on the local screen is a pan, not a drag: this machine's
-             * monitors are the origin of the coordinate space, so moving them
-             * would have to move every peer with them - which is what panning the
-             * view does. The local screen becomes grabbable instead of inert. */
+            /* A press on this machine's own screens moves them, which is how the
+             * user changes where this machine sits relative to the peers. The
+             * monitors are drawn from an offset so the peers stay where they are;
+             * on release the links are re-derived from the new geometry. */
             let (lx, ly) = state.to_layout(x, y);
             if state
-                .local_monitors()
+                .drawn_monitors()
                 .iter()
                 .any(|monitor| monitor.rect.contains(lx, ly))
             {
-                state.panning = Some(state.pan);
+                state.moving_local = Some((x, y));
+                state.local_offset = (0.0, 0.0);
                 area.set_cursor_from_name(Some("grabbing"));
+                area.queue_draw();
                 return;
             }
             let Some(handle) = state.hit(x, y) else {
@@ -1311,6 +1401,12 @@ fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
         let area = area.clone();
         drag.connect_drag_update(move |_gesture, dx, dy| {
             let mut state = state.borrow_mut();
+            if state.moving_local.is_some() {
+                let scale = state.geometry.scale.max(f64::EPSILON);
+                state.local_offset = (dx / scale, dy / scale);
+                area.queue_draw();
+                return;
+            }
             if let Some(from) = state.panning {
                 /* `dx` is the offset from where the drag began, not the step since
                  * the last update: adding it to the current pan accumulates
@@ -1346,6 +1442,24 @@ fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
         let area = area.clone();
         drag.connect_drag_end(move |_gesture, _dx, _dy| {
             let mut state = state.borrow_mut();
+            if state.moving_local.take().is_some() {
+                area.set_cursor_from_name(Some("default"));
+                let requests = state.reanchor_after_moving_local();
+                for (handle, position, display, edge, peer_edge) in requests {
+                    (state.on_request)(MachineRequest::Move {
+                        handle,
+                        position,
+                        display,
+                        edge,
+                        peer_edge,
+                    });
+                }
+                /* the links now describe the arrangement, so the offset has done
+                 * its job and the monitors go back to where the compositor has them */
+                state.local_offset = (0.0, 0.0);
+                area.queue_draw();
+                return;
+            }
             if state.panning.take().is_some() {
                 area.set_cursor_from_name(Some("default"));
                 area.queue_draw();
@@ -1510,6 +1624,8 @@ mod tests {
             resize: None,
             hover: None,
             panning: None,
+            moving_local: None,
+            local_offset: (0.0, 0.0),
             local_revision: 0,
             published: String::new(),
             last_signature: Vec::new(),
@@ -1785,6 +1901,8 @@ mod render {
             resize: None,
             hover: None,
             panning: None,
+            moving_local: None,
+            local_offset: (0.0, 0.0),
             local_revision: 0,
             published: String::new(),
             last_signature: Vec::new(),
@@ -2120,8 +2238,9 @@ mod render {
 
         let published = a.local_picture();
         assert_eq!(published.author, "desk");
-        assert_eq!(published.screens_of("desk").len(), 2);
-        assert_eq!(published.screens_of("laptop").len(), 1);
+        assert_eq!(published.authored_screens().len(), 2);
+        assert_eq!(published.peer_screens().len(), 1);
+        assert_eq!(published.peer_screens()[0].1.len(), 1);
 
         /* the laptop's own view: one screen, the desk below it, no monitor names */
         let mut b = state(vec![]);
@@ -2179,6 +2298,52 @@ mod render {
                 "the two machines disagree: {theirs:?} vs {mine:?}"
             );
         }
+    }
+
+    /// Dragging this machine's own screens moves the peers' links, not the peers.
+    ///
+    /// The link is a statement about which monitor a peer is beside, so moving this
+    /// machine is a way of editing all of them at once - which is why the local
+    /// screens have to be draggable at all.
+    #[test]
+    fn moving_this_machine_rewrites_the_links_that_it_changed() {
+        let mut state = state(vec![]);
+        state.local_displays = vec![
+            input_event::DisplayInfo {
+                name: "DP-2".to_owned(),
+                x: 2560,
+                y: 0,
+                width: 1440,
+                height: 2560,
+                rotation: input_event::Rotation::Normal,
+                enabled: true,
+            },
+            input_event::DisplayInfo {
+                name: "DP-3".to_owned(),
+                x: 0,
+                y: 1120,
+                width: 2560,
+                height: 1440,
+                rotation: input_event::Rotation::Normal,
+                enabled: true,
+            },
+        ];
+        let mut peer = machine(7, Position::Top, (0.0, 1.0), true);
+        peer.display = Some("DP-3".to_owned());
+        peer.peer_size = Some((2560.0, 1440.0));
+        state.machines = vec![peer];
+        state.relayout(1000.0, 620.0);
+
+        /* nothing was moved, so nothing needs rewriting */
+        assert!(state.reanchor_after_moving_local().is_empty());
+
+        /* drag this machine far to the left: the peer is now to its right */
+        state.local_offset = (-6000.0, 0.0);
+        let requests = state.reanchor_after_moving_local();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        let (handle, position, _, _, _) = requests[0];
+        assert_eq!(handle, 7);
+        assert_eq!(position, Position::Right);
     }
 
     /// The local monitors are drawn where the compositor put them.
