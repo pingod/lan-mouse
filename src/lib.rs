@@ -12,7 +12,7 @@ pub mod emulation_test;
 // where a listener feeds it: evdev on Linux, the Quartz event tap on macOS.
 // `hotkey_task` itself is compiled everywhere so the service can reference its
 // field without `#[cfg]`; on other platforms it is a no-op listener.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod hotkey;
 mod hotkey_task;
 mod listen;

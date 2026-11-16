@@ -76,7 +76,13 @@ libc = "0.2.148"
 # Local time for the log timestamps: `std` only exposes UTC, so the Windows
 # implementation asks the system for the local reading.
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Time"] }
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Time",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [target.'cfg(target_os="macos")'.dependencies]
 core-foundation = "0.10.0"

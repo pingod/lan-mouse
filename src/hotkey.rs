@@ -241,7 +241,7 @@ impl HotkeyState {
         }
     }
 
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    #[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
     pub(crate) fn is_empty(&self) -> bool {
         self.hotkeys.is_empty()
     }

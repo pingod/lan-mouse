@@ -9,9 +9,9 @@
 //! everywhere. Linux reads evdev devices, macOS a passive Quartz event tap,
 //! and anything else falls back to a listener that never fires.
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::connect::{LanMouseConnection, LanMouseConnectionError};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::hotkey;
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -20,7 +20,10 @@ pub(crate) use imp::Hotkeys;
 #[cfg(target_os = "macos")]
 pub(crate) use imp_macos::Hotkeys;
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) use imp_windows::Hotkeys;
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) use noop::Hotkeys;
 
 /// A global hotkey rule: pressing every key in `from` sends `to` to the peer.
@@ -40,9 +43,8 @@ pub(crate) struct Hotkey {
 /// What a hotkey trigger produced.
 ///
 /// Constructed by the platform listener (evdev on Linux, the Quartz event tap
-/// on macOS). Windows reaches this type only through the no-op `Hotkeys`, so
-/// the variants are unused there.
-#[cfg_attr(not(unix), allow(dead_code))]
+/// on macOS, the low level keyboard hook on Windows).
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum HotkeyFire {
     /// Type these keys on the peer.
@@ -61,17 +63,17 @@ pub(crate) enum HotkeyAction {
 }
 
 /// How long to wait for an on-demand connection before giving up on a hotkey.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const CONNECT_ATTEMPTS: usize = 20;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const CONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// Type a hotkey's key sequence on the peer.
 ///
-/// Shared by the evdev (Linux) and Quartz (macOS) listeners: the trigger comes
-/// from a different source on each platform, but delivering it is identical.
-/// Windows has no listener yet, so it does not compile this.
-#[cfg(unix)]
+/// Shared by the evdev (Linux), Quartz (macOS) and low level hook (Windows)
+/// listeners: the trigger comes from a different source on each platform, but
+/// delivering it is identical.
+#[cfg(any(unix, windows))]
 pub(crate) async fn deliver(conn: &LanMouseConnection, fire: HotkeyFire, capture_active: bool) {
     let HotkeyFire::Keys(keys) = fire else {
         // Local actions are handled by the service, which owns the capture and
@@ -275,13 +277,163 @@ mod imp {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+mod imp_windows {
+    use std::sync::Mutex;
+
+    use tokio::sync::mpsc;
+    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, DispatchMessageW, GetMessageW, KBDLLHOOKSTRUCT, LLKHF_EXTENDED,
+        LLKHF_INJECTED, MSG, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx,
+        WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    };
+
+    use input_event::scancode;
+
+    use super::{Hotkey, HotkeyFire};
+    use crate::config::Config;
+    use crate::connect::LanMouseConnection;
+    use crate::hotkey::{HotkeyState, KeySample};
+
+    /// Where the hook callback hands its key samples to.
+    ///
+    /// A `WH_KEYBOARD_LL` callback runs on the thread that installed the hook and
+    /// cannot capture environment, so the sender lives in a static.
+    static KEY_TX: Mutex<Option<mpsc::UnboundedSender<KeySample>>> = Mutex::new(None);
+
+    pub(crate) struct Hotkeys {
+        key_rx: mpsc::UnboundedReceiver<KeySample>,
+        state: HotkeyState,
+        conn: LanMouseConnection,
+    }
+
+    impl Hotkeys {
+        pub(crate) fn new(config: &Config, conn: LanMouseConnection) -> Self {
+            let (key_tx, key_rx) = mpsc::unbounded_channel();
+            spawn_listener(key_tx);
+            Self {
+                key_rx,
+                state: HotkeyState::new(config.hotkeys()),
+                conn,
+            }
+        }
+
+        pub(crate) fn set_hotkeys(&mut self, hotkeys: Vec<Hotkey>) {
+            log::debug!("hotkeys: {} rule(s) armed", hotkeys.len());
+            self.state.set_hotkeys(hotkeys);
+        }
+
+        pub(crate) fn reload(&mut self, config: &Config) {
+            self.state.set_hotkeys(config.hotkeys());
+        }
+
+        /// Wait for the next hotkey trigger.
+        pub(crate) async fn next(&mut self) -> HotkeyFire {
+            loop {
+                let Some(sample) = self.key_rx.recv().await else {
+                    // The hook thread exited; keep the service select loop alive
+                    // instead of spinning on a closed channel.
+                    log::debug!("hotkeys: the keyboard hook is gone");
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                };
+                if let Some(fire) = self.state.on_key(sample) {
+                    return fire;
+                }
+            }
+        }
+
+        pub(crate) async fn send(&self, fire: HotkeyFire, capture_active: bool) {
+            super::deliver(&self.conn, fire, capture_active).await;
+        }
+    }
+
+    /// Install the passive low level keyboard hook in its own thread.
+    ///
+    /// The hook only observes: it always chains to the next hook and never
+    /// reports the key as handled, so the local application still receives the
+    /// keystroke (that is what makes `[[hotkey]]` different from `[[remap]]`).
+    fn spawn_listener(key_tx: mpsc::UnboundedSender<KeySample>) {
+        if let Ok(mut slot) = KEY_TX.lock() {
+            *slot = Some(key_tx);
+        }
+        let spawned = std::thread::Builder::new()
+            .name("windows-hotkeys".to_owned())
+            .spawn(move || {
+                let hook =
+                    match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) }
+                    {
+                        Ok(hook) => hook,
+                        Err(e) => {
+                            log::warn!(
+                                "hotkeys: could not install the keyboard hook ({e}), global                                  hotkeys are disabled"
+                            );
+                            return;
+                        }
+                    };
+                log::info!("hotkeys: listening on the low level keyboard hook");
+                /* Low level hooks only fire on a thread that pumps messages. */
+                let mut msg = MSG::default();
+                while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
+                    let _ = unsafe { TranslateMessage(&msg) };
+                    unsafe { DispatchMessageW(&msg) };
+                }
+                let _ = unsafe { UnhookWindowsHookEx(hook) };
+            });
+        if let Err(e) = spawned {
+            log::warn!("hotkeys: could not spawn the hook thread: {e}");
+        }
+    }
+
+    unsafe extern "system" fn keyboard_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if ncode >= 0 {
+            /* SAFETY: for `HC_ACTION` the system passes a `KBDLLHOOKSTRUCT`. */
+            let info = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
+            /* Keys we injected ourselves (the emulation backend forwards what the
+             * peer typed) must not re-trigger a local hotkey. */
+            if !info.flags.contains(LLKHF_INJECTED) {
+                if let Some(sample) = sample_of(wparam, &info) {
+                    if let Ok(slot) = KEY_TX.lock() {
+                        if let Some(tx) = slot.as_ref() {
+                            let _ = tx.send(sample);
+                        }
+                    }
+                }
+            }
+        }
+        unsafe { CallNextHookEx(None, ncode, wparam, lparam) }
+    }
+
+    fn sample_of(wparam: WPARAM, info: &KBDLLHOOKSTRUCT) -> Option<KeySample> {
+        let value = match wparam.0 as u32 {
+            WM_KEYDOWN | WM_SYSKEYDOWN => 1,
+            WM_KEYUP | WM_SYSKEYUP => 0,
+            _ => return None,
+        };
+        let mut scan_code = info.scanCode;
+        if info.flags.contains(LLKHF_EXTENDED) {
+            scan_code |= 0xE000;
+        }
+        let win_scan_code = scancode::Windows::try_from(scan_code).ok()?;
+        let Ok(key): Result<scancode::Linux, ()> = win_scan_code.try_into() else {
+            log::trace!("hotkeys: no linux key code for {win_scan_code:?}");
+            return None;
+        };
+        Some(KeySample {
+            key: key as u32,
+            value,
+        })
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 mod noop {
     use crate::{config::Config, connect::LanMouseConnection};
 
     use super::HotkeyFire;
 
-    /// Placeholder for platforms without an evdev listener.
+    /// Placeholder for platforms without a keyboard listener.
     ///
     /// The service references this field from its `select!` unconditionally, so
     /// the type has to exist everywhere; here it simply never resolves.
