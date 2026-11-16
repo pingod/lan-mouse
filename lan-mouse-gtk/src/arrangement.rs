@@ -53,6 +53,13 @@ pub(super) struct Machine {
     /// configs cannot guarantee that. The peer publishes the picture it is drawing;
     /// the higher `(revision, author)` wins, and the loser adopts it.
     pub peer_picture: Option<input_event::Arrangement>,
+    /// where the peer's group sits, exactly as the adopted picture said.
+    ///
+    /// Set only by `adopt`. Drawing from the placement instead would round-trip the
+    /// picture through "which edge and which range", which cannot reproduce an
+    /// arbitrary rectangle: a peer placed by hand ended up somewhere else than the
+    /// picture said, on both machines.
+    pub peer_rect: Option<Screen>,
     /// the peer's monitors, normalised so the group's origin is (0,0)
     ///
     /// Drawn as individual screens rather than one box, for the same reason the
@@ -518,6 +525,7 @@ impl State {
             machine.edge = placement.edge;
             machine.peer_edge = placement.peer_edge;
             machine.peer_monitors = normalise_monitors(&theirs);
+            machine.peer_rect = Some(candidate);
             machine.peer_size = Some((candidate.w, candidate.h));
         }
     }
@@ -678,7 +686,11 @@ impl State {
     /// A peer that reported its screens is as many rectangles as it has; one that
     /// reported nothing is the single box it was placed as.
     fn screens_of(&self, handle: ClientHandle) -> Vec<Screen> {
-        let Some(group) = self.rect_of(handle) else {
+        let Some(group) = self
+            .machine(handle)
+            .and_then(|machine| machine.peer_rect)
+            .or_else(|| self.rect_of(handle))
+        else {
             return Vec::new();
         };
         let monitors = self
@@ -1492,7 +1504,16 @@ fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
             let mut state = state.borrow_mut();
             if state.moving_local.take().is_some() {
                 area.set_cursor_from_name(Some("default"));
+                let moved = state.local_offset;
                 let requests = state.reanchor_after_moving_local();
+                if moved != (0.0, 0.0) {
+                    /* The drag *is* the edit: this machine's screens are now where the
+                     * user put them, so the picture has to say so and win the comparison.
+                     * Without this the offset was reset to zero below and the whole drag
+                     * left no trace anywhere. */
+                    state.mark_edited();
+                    state.local_offset = moved;
+                }
                 for (handle, position, display, edge, peer_edge) in requests {
                     (state.on_request)(MachineRequest::Move {
                         handle,
@@ -1502,9 +1523,6 @@ fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
                         peer_edge,
                     });
                 }
-                /* the links now describe the arrangement, so the offset has done
-                 * its job and the monitors go back to where the compositor has them */
-                state.local_offset = (0.0, 0.0);
                 area.queue_draw();
                 return;
             }
@@ -1642,6 +1660,7 @@ mod tests {
     fn machine(handle: ClientHandle, position: Position, edge: (f64, f64)) -> Machine {
         Machine {
             handle,
+            peer_rect: None,
             peer_picture: None,
             peer_monitors: Vec::new(),
             display: None,
@@ -1918,6 +1937,7 @@ mod render {
     ) -> Machine {
         Machine {
             handle,
+            peer_rect: None,
             peer_picture: None,
             peer_monitors: Vec::new(),
             display: None,
@@ -2432,6 +2452,63 @@ mod render {
         let requests = state.reanchor_after_moving_local();
         assert_eq!(requests.len(), 1, "{requests:?}");
         assert_eq!(requests[0].1, Position::Top);
+    }
+
+    /// A picture survives a round trip through adoption on the other side.
+    ///
+    /// The peer turns the rectangles into a placement and back. That is lossy for an
+    /// arbitrary rectangle - the placement stores an edge and two ranges - so the adopted
+    /// rectangles are kept as they arrived and drawing uses them. Without this the two
+    /// windows showed a picture neither had published: "还是不行" with every layer
+    /// reporting success.
+    #[test]
+    fn an_adopted_picture_is_drawn_where_it_said() {
+        let mut state = state(vec![]);
+        state.local_hostname = "laptop".to_owned();
+        state.local_displays = vec![input_event::DisplayInfo {
+            name: "eDP-1".to_owned(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            rotation: input_event::Rotation::Normal,
+            enabled: true,
+        }];
+        let mut desk = machine(4, Position::Bottom, (0.0, 1.0), true);
+        desk.hostname = "desk".to_owned();
+        state.machines = vec![desk];
+
+        /* a desk that is *not* centred under this machine - the placement cannot
+         * reproduce this offset, which is the point */
+        let mut picture = input_event::Arrangement::new(9, "desk");
+        picture.machines.push(input_event::ArrangedMachine {
+            hostname: "desk".to_owned(),
+            authored: true,
+            screens: vec![input_event::ScreenRect {
+                x: 3000,
+                y: 500,
+                width: 2560,
+                height: 1440,
+            }],
+        });
+        picture.machines.push(input_event::ArrangedMachine {
+            hostname: "laptop".to_owned(),
+            authored: false,
+            screens: vec![input_event::ScreenRect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }],
+        });
+        state.adopt(&picture);
+        state.relayout(900.0, 600.0);
+
+        let drawn = state.screens_of(4);
+        assert_eq!(drawn.len(), 1, "{drawn:?}");
+        /* the rectangle the picture carried, not a re-derived one */
+        assert_eq!((drawn[0].w, drawn[0].h), (2560.0, 1440.0));
+        assert_eq!(state.machines[0].peer_rect, Some(drawn[0]));
     }
 
     /// A window that has not edited anything adopts any picture it is offered.

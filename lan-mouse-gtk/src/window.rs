@@ -315,6 +315,9 @@ impl Window {
                     (data.edge(), data.peer_edge(), data.peer_size());
                 Machine {
                     handle: client.handle(),
+                    /* filled in by the canvas when it adopts a picture; until then the
+                     * placement decides, which is all this side knows */
+                    peer_rect: None,
                     peer_picture: input_event::Arrangement::decode(&data.peer_arrangement),
                     peer_monitors: arrangement::peer_monitors(&data.peer_displays),
                     display: (!data.display.is_empty()).then(|| data.display.clone()),
