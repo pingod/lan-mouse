@@ -126,7 +126,7 @@ impl MacOSEmulation {
     }
 
     /// Post one scroll event on `axis` (`0` vertical, `1` horizontal).
-    fn scroll(&self, unit: ScrollEventUnit, axis: u8, steps: i32) {
+    fn scroll(&self, unit: u32, axis: u8, steps: i32) {
         if steps == 0 {
             /* Nothing to say, and an event with a zero delta still occupies the
              * scroll accumulator inside the receiving app. */
