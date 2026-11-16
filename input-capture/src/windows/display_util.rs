@@ -24,7 +24,7 @@ fn is_within_dp_boundary(point: (i32, i32), display: &RECT, pos: Position) -> bo
 }
 
 /// the display that contains the given point, if any
-fn display_at(point: (i32, i32), displays: &[RECT]) -> Option<&RECT> {
+pub(crate) fn display_at(point: (i32, i32), displays: &[RECT]) -> Option<&RECT> {
     displays.iter().find(|&d| is_within_dp_region(point, d))
 }
 
