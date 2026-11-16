@@ -106,8 +106,44 @@ fn to_input_events(ei_event: EiEvent) -> Events {
                 Events::None
             }
         }
-        EiEvent::ScrollStop(_) => Events::None,   /* TODO */
-        EiEvent::ScrollCancel(_) => Events::None, /* TODO */
+        EiEvent::ScrollStop(stop) => {
+            let dy = Event::Pointer(PointerEvent::AxisStop {
+                time: stop.time as u32,
+                axis: 0,
+            });
+            let dx = Event::Pointer(PointerEvent::AxisStop {
+                time: stop.time as u32,
+                axis: 1,
+            });
+            if stop.y && stop.x {
+                Events::Two(dy, dx)
+            } else if stop.y {
+                Events::One(dy)
+            } else if stop.x {
+                Events::One(dx)
+            } else {
+                Events::None
+            }
+        }
+        EiEvent::ScrollCancel(cancel) => {
+            let dy = Event::Pointer(PointerEvent::AxisCancel {
+                time: cancel.time as u32,
+                axis: 0,
+            });
+            let dx = Event::Pointer(PointerEvent::AxisCancel {
+                time: cancel.time as u32,
+                axis: 1,
+            });
+            if cancel.y && cancel.x {
+                Events::Two(dy, dx)
+            } else if cancel.y {
+                Events::One(dy)
+            } else if cancel.x {
+                Events::One(dx)
+            } else {
+                Events::None
+            }
+        }
         EiEvent::ScrollDiscrete(scroll) => {
             let dy = Event::Pointer(PointerEvent::AxisDiscrete120 {
                 axis: 0,

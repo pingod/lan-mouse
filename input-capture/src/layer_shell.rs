@@ -129,23 +129,106 @@ struct State {
     qh: QueueHandle<Self>,
     pending_events: VecDeque<(Position, CaptureEvent)>,
     outputs: Vec<Output>,
-    /// when a discrete (notch) scroll last arrived on each axis
-    ///
-    /// A wheel sends `axis_value120` *and* `axis` for the same physical notch, and
-    /// the compositor is free to send them in either order - so suppressing one of
-    /// the pair by arrival order forwarded both whenever the order flipped, which
-    /// scrolls twice as far. A device that reports notches is preferred for that
-    /// axis for a short window instead, whichever came first.
-    scroll_notch_at: [Option<std::time::Instant>; 2],
+    /// scroll events of the pointer frame currently being assembled
+    scroll_frame: ScrollFrame,
 }
 
-/// How long after a notch a continuous axis event on the same axis is taken to be
-/// the same physical movement.
+/// The scroll events of one `wl_pointer` frame, indexed by axis.
 ///
-/// Mouse wheels send both event shapes per detent, and a touchpad sends only the
-/// continuous one - so this only has to be longer than the gap between the two
-/// events of one notch and shorter than the gap between two notches.
-const SCROLL_NOTCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
+/// A wheel reports one detent twice: `axis` carries the movement in surface
+/// units and `axis_value120` the same detent in 120ths. The order is not fixed
+/// (Hyprland sends the continuous event first, wlroots sends the discrete one
+/// first), so filtering as the events arrive cannot tell which pair belongs
+/// together. The frame is held until `Frame` instead, and one shape per axis is
+/// released: a whole notch as the discrete event, a partial one as the
+/// continuous delta because the receivers' notch conversion drops the fraction.
+#[derive(Default)]
+struct ScrollFrame {
+    continuous: [Option<(Position, u32, f64)>; 2],
+    discrete: [Option<(Position, i32)>; 2],
+    stop: [Option<(Position, u32)>; 2],
+}
+
+impl ScrollFrame {
+    fn set_continuous(&mut self, pos: Position, axis: u32, time: u32, value: f64) {
+        if let Some(slot) = self.continuous.get_mut(axis as usize) {
+            /* axis values are deltas: two events for one axis in a frame add up */
+            match slot {
+                Some((_, _, total)) => *total += value,
+                None => *slot = Some((pos, time, value)),
+            }
+        }
+    }
+
+    fn set_discrete(&mut self, pos: Position, axis: u32, value: i32) {
+        if let Some(slot) = self.discrete.get_mut(axis as usize) {
+            match slot {
+                Some((_, total)) => *total += value,
+                None => *slot = Some((pos, value)),
+            }
+        }
+    }
+
+    fn set_stop(&mut self, pos: Position, axis: u32, time: u32) {
+        if let Some(slot) = self.stop.get_mut(axis as usize) {
+            *slot = Some((pos, time));
+        }
+    }
+
+    /// Release the frame. Each axis contributes at most one scroll event, then
+    /// its stop notification if one was buffered.
+    fn release(&mut self, out: &mut VecDeque<(Position, CaptureEvent)>) {
+        for axis in 0..2 {
+            let discrete = self.discrete[axis].take();
+            let continuous = self.continuous[axis].take();
+            let scalar = axis as u8;
+
+            /* A whole notch is unambiguous, and the receivers turn it into one
+             * notch of their own instead of guessing the surface-unit scale. */
+            let whole_notch = discrete.is_some_and(|(_, value)| value != 0 && value % 120 == 0);
+            if whole_notch {
+                if let Some((pos, value)) = discrete {
+                    out.push_back((
+                        pos,
+                        CaptureEvent::Input(Event::Pointer(PointerEvent::AxisDiscrete120 {
+                            axis: scalar,
+                            value,
+                        })),
+                    ));
+                }
+            } else if let Some((pos, time, value)) =
+                continuous.filter(|(_, _, value)| *value != 0.0)
+            {
+                out.push_back((
+                    pos,
+                    CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
+                        time,
+                        axis: scalar,
+                        value,
+                    })),
+                ));
+            } else if let Some((pos, value)) = discrete.filter(|(_, value)| *value != 0) {
+                out.push_back((
+                    pos,
+                    CaptureEvent::Input(Event::Pointer(PointerEvent::AxisDiscrete120 {
+                        axis: scalar,
+                        value,
+                    })),
+                ));
+            }
+
+            if let Some((pos, time)) = self.stop[axis].take() {
+                out.push_back((
+                    pos,
+                    CaptureEvent::Input(Event::Pointer(PointerEvent::AxisStop {
+                        time,
+                        axis: scalar,
+                    })),
+                ));
+            }
+        }
+    }
+}
 
 struct Inner {
     state: State,
@@ -500,7 +583,7 @@ impl LayerShellInputCapture {
             read_guard: None,
             pending_events: VecDeque::new(),
             outputs: vec![],
-            scroll_notch_at: [None; 2],
+            scroll_frame: ScrollFrame::default(),
         };
 
         for global in state.global_list.contents().clone_list() {
@@ -1081,43 +1164,30 @@ impl Dispatch<WlPointer, ()> for State {
                 let Some(pos) = app.focused.as_ref().map(|w| w.pos) else {
                     return;
                 };
-                let slot = u32::from(axis) as usize;
-                let notch_recently = app
-                    .scroll_notch_at
-                    .get(slot)
-                    .and_then(|at| *at)
-                    .is_some_and(|at| at.elapsed() < SCROLL_NOTCH_WINDOW);
-                if notch_recently {
-                    /* the same notch, already delivered as a discrete event */
-                } else {
-                    app.pending_events.push_back((
-                        pos,
-                        CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
-                            time,
-                            axis: u32::from(axis) as u8,
-                            value,
-                        })),
-                    ));
-                }
+                app.scroll_frame
+                    .set_continuous(pos, u32::from(axis), time, value);
             }
             wl_pointer::Event::AxisValue120 { axis, value120 } => {
                 let Some(pos) = app.focused.as_ref().map(|w| w.pos) else {
                     return;
                 };
-                if let Some(slot) = app.scroll_notch_at.get_mut(u32::from(axis) as usize) {
-                    *slot = Some(std::time::Instant::now());
-                }
-                app.pending_events.push_back((
-                    pos,
-                    CaptureEvent::Input(Event::Pointer(PointerEvent::AxisDiscrete120 {
-                        axis: u32::from(axis) as u8,
-                        value: value120,
-                    })),
-                ));
+                app.scroll_frame
+                    .set_discrete(pos, u32::from(axis), value120);
+            }
+            wl_pointer::Event::AxisStop { time, axis } => {
+                let Some(pos) = app.focused.as_ref().map(|w| w.pos) else {
+                    return;
+                };
+                app.scroll_frame.set_stop(pos, u32::from(axis), time);
             }
             wl_pointer::Event::Frame => {
-                /* nothing to reconcile: the notch window is time based, so an
-                 * unpaired discrete event simply expires */
+                /* the frame is complete: the scroll pair can be told apart */
+                let State {
+                    scroll_frame,
+                    pending_events,
+                    ..
+                } = app;
+                scroll_frame.release(pending_events);
             }
             _ => {}
         }
@@ -1339,6 +1409,115 @@ delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore WlSurface);
 delegate_noop!(State: ignore ZwpKeyboardShortcutsInhibitorV1);
 delegate_noop!(State: ignore ZwpLockedPointerV1);
+
+#[cfg(test)]
+mod scroll_frame_tests {
+    use super::*;
+
+    fn released(frame: &mut ScrollFrame) -> Vec<PointerEvent> {
+        let mut out = VecDeque::new();
+        frame.release(&mut out);
+        out.into_iter()
+            .map(|(_, event)| match event {
+                CaptureEvent::Input(Event::Pointer(event)) => event,
+                other => panic!("unexpected capture event: {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_notch_is_forwarded_once_even_when_the_shapes_arrive_in_the_other_order() {
+        // Hyprland sends `axis` first, wlroots sends `axis_value120` first.
+        for wheel_first in [false, true] {
+            let mut frame = ScrollFrame::default();
+            if wheel_first {
+                frame.set_discrete(Position::Top, 0, 120);
+                frame.set_continuous(Position::Top, 0, 1, 15.0);
+            } else {
+                frame.set_continuous(Position::Top, 0, 1, 15.0);
+                frame.set_discrete(Position::Top, 0, 120);
+            }
+            assert_eq!(
+                released(&mut frame),
+                vec![PointerEvent::AxisDiscrete120 {
+                    axis: 0,
+                    value: 120
+                }],
+                "wheel_first={wheel_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_touchpad_frame_keeps_the_continuous_delta() {
+        let mut frame = ScrollFrame::default();
+        frame.set_continuous(Position::Top, 0, 7, 2.5);
+        assert_eq!(
+            released(&mut frame),
+            vec![PointerEvent::Axis {
+                time: 7,
+                axis: 0,
+                value: 2.5
+            }]
+        );
+    }
+
+    #[test]
+    fn a_partial_notch_is_not_rounded_away() {
+        // High-resolution wheels report fractions of a notch; a receiver that
+        // converts 120ths to whole notches would drop them.
+        let mut frame = ScrollFrame::default();
+        frame.set_continuous(Position::Top, 0, 1, 7.5);
+        frame.set_discrete(Position::Top, 0, 60);
+        assert_eq!(
+            released(&mut frame),
+            vec![PointerEvent::Axis {
+                time: 1,
+                axis: 0,
+                value: 7.5
+            }]
+        );
+    }
+
+    #[test]
+    fn horizontal_scroll_keeps_its_axis() {
+        let mut frame = ScrollFrame::default();
+        frame.set_continuous(Position::Bottom, 1, 1, -4.0);
+        assert_eq!(
+            released(&mut frame),
+            vec![PointerEvent::Axis {
+                time: 1,
+                axis: 1,
+                value: -4.0
+            }]
+        );
+    }
+
+    #[test]
+    fn a_stop_is_released_after_the_scroll_it_ends() {
+        let mut frame = ScrollFrame::default();
+        frame.set_continuous(Position::Top, 0, 3, 0.0);
+        frame.set_stop(Position::Top, 0, 3);
+        assert_eq!(
+            released(&mut frame),
+            vec![PointerEvent::AxisStop { time: 3, axis: 0 }]
+        );
+    }
+
+    #[test]
+    fn a_released_frame_is_empty() {
+        let mut frame = ScrollFrame::default();
+        frame.set_discrete(Position::Top, 0, -240);
+        assert_eq!(
+            released(&mut frame),
+            vec![PointerEvent::AxisDiscrete120 {
+                axis: 0,
+                value: -240
+            }]
+        );
+        assert!(released(&mut frame).is_empty());
+    }
+}
 
 #[cfg(test)]
 mod segment_tests {

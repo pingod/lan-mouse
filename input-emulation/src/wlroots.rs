@@ -525,12 +525,21 @@ impl VirtualInput {
                             log::warn!("invalid axis: {axis}");
                             return Ok(());
                         };
-                        // `axis_discrete` takes the scroll amount in units of
-                        // 120 (one wheel notch) and `axis` the same amount in
-                        // surface units (10 per notch)
+                        /* One request carries both the delta and the notch
+                         * count. A second `axis` request duplicated the scroll
+                         * on compositors that notify once per request, and on
+                         * compositors that keep one axis event per frame
+                         * (Hyprland) it overwrote the notch count with zero.
+                         * One wheel notch is 15 surface units, matching
+                         * libinput's 15 degrees. */
+                        const SURFACE_UNITS_PER_NOTCH: f64 = 15.;
                         let notches = value as f64 / 120.;
-                        self.pointer.axis_discrete(now, axis, notches, value / 120);
-                        self.pointer.axis(now, axis, notches * 10.);
+                        self.pointer.axis_discrete(
+                            now,
+                            axis,
+                            notches * SURFACE_UNITS_PER_NOTCH,
+                            value / 120,
+                        );
                         self.pointer.axis_source(AxisSource::Wheel);
                     }
                 }
