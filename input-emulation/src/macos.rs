@@ -317,34 +317,38 @@ fn post_synthesized(event: &CGEvent) {
 
 /// Tell the system a person is here, which is what wakes a sleeping display.
 ///
-/// A posted `CGEvent` does *not* count as user activity: the window server delivers it
-/// to the focused application while the display stays asleep, so a machine whose screen
-/// went dark could be driven by the pointer without anything becoming visible. This is
-/// the documented way to say "a human is present", and it is what a real mouse does
-/// implicitly through the HID stack.
+/// A posted `CGEvent` does *not* count as user activity: the window server delivers it to
+/// the focused application while the display stays asleep, so a machine whose screen went
+/// dark could be driven by the pointer with nothing becoming visible.
 ///
-/// `kIOPMAssertionLevelOn` with a zero timeout only *declares* the activity; it does not
-/// keep the display awake, which is what a user wants - the screen still sleeps when the
-/// desk is empty.
+/// The id from the previous call is passed back in, as the API documents: without it every
+/// call creates another assertion, and the display would be held awake by a growing pile of
+/// them rather than being woken once and allowed to sleep again.
+///
+/// The assertion is not released. `IOPMAssertionDeclareUserActivity` is not a prevent-sleep
+/// assertion - it reports activity, and the display sleeps on its normal timer afterwards.
+/// Releasing it would be wrong in the other direction: the id must stay valid to be reused.
 fn declare_user_activity() {
     use core_foundation_sys::string::CFStringRef;
-    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     #[link(name = "IOKit", kind = "framework")]
     unsafe extern "C" {
         fn IOPMAssertionDeclareUserActivity(
             assertion_name: CFStringRef,
-            user_id: u32,
+            user_type: u32,
             assertion_id: *mut u32,
         ) -> i32;
     }
 
-    /* kIOPMUserActiveLocal: the activity is local, not a remote session - which is
-     * exactly what an injected event from a peer is. */
+    /// `kIOPMUserActiveLocal`: local activity, not a remote session - which is what an
+    /// injected event from a peer is.
     const K_IOPM_USER_ACTIVE_LOCAL: u32 = 0;
-    const K_IO_PM_ASSERTION_LEVEL_ON: i32 = 255;
 
-    let mut id: u32 = 0;
+    /* The id of the assertion this process is reporting activity on, reused across calls. */
+    static ASSERTION: AtomicU32 = AtomicU32::new(0);
+
+    let mut id = ASSERTION.load(Ordering::Relaxed);
     let name = core_foundation::string::CFString::new("Lan Mouse input");
     let result = unsafe {
         IOPMAssertionDeclareUserActivity(
@@ -354,20 +358,12 @@ fn declare_user_activity() {
         )
     };
     if result != 0 {
+        /* At most once a second, so `debug` keeps it out of a normal log while still being
+         * there when the wake does not work. */
         log::debug!("could not declare user activity: 0x{result:x}");
+        return;
     }
-    /* Release the assertion immediately: it was only meant to wake the display, and
-     * holding it would keep the screen on for as long as the process lives. */
-    if id != 0 {
-        #[link(name = "IOKit", kind = "framework")]
-        unsafe extern "C" {
-            fn IOPMAssertionRelease(assertion_id: u32) -> i32;
-        }
-        let _ = K_IO_PM_ASSERTION_LEVEL_ON;
-        unsafe {
-            IOPMAssertionRelease(id);
-        }
-    }
+    ASSERTION.store(id, Ordering::Relaxed);
 }
 
 /// `NX_KEYTYPE_*` identifiers of the "system defined" events macOS uses for the
