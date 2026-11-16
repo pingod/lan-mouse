@@ -206,6 +206,15 @@ impl InputEmulation {
         self.emulation.enter(handle, edge, fraction).await;
     }
 
+    /// Put the cursor in the middle of this machine's screen.
+    ///
+    /// Used when a peer hands the pointer over on request instead of crossing
+    /// an edge: there is no crossing point to line up with. See
+    /// [`Emulation::enter_center`].
+    pub async fn enter_center(&mut self, handle: EmulationHandle) {
+        self.emulation.enter_center(handle).await;
+    }
+
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
         if self.handles.insert(handle) {
             self.pressed_keys.insert(handle, HashSet::new());
@@ -341,5 +350,9 @@ trait Emulation: Send {
     /// Backends without absolute pointer positioning keep the default, which
     /// leaves the cursor alone.
     async fn enter(&mut self, _handle: EmulationHandle, _edge: ScreenEdge, _fraction: f64) {}
+    /// Put the cursor in the middle of the screen, for a handover that has no
+    /// crossing point (a "switch device" request instead of a barrier).
+    /// Backends without absolute pointer positioning keep the default.
+    async fn enter_center(&mut self, _handle: EmulationHandle) {}
     async fn terminate(&mut self);
 }

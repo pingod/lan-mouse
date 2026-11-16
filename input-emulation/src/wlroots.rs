@@ -325,10 +325,10 @@ impl Emulation for WlrootsEmulation {
     }
 
     async fn enter(&mut self, handle: EmulationHandle, edge: ScreenEdge, fraction: f64) {
-        let Some(input) = self.state.input_for_client.get(&handle) else {
+        if !self.state.input_for_client.contains_key(&handle) {
             log::debug!("no virtual pointer for handle {handle}, not placing the cursor");
             return;
-        };
+        }
         /*
          * The pointer continues from wherever it was on this machine, which
          * looks like the cursor teleported when the user left the peer at the
@@ -361,38 +361,35 @@ impl Emulation for WlrootsEmulation {
             (target.y + target.height - 1) as f64,
             INSET,
         );
-        static START: OnceLock<Instant> = OnceLock::new();
-        let now: u32 = START
-            .get_or_init(Instant::now)
-            .elapsed()
-            .as_millis()
-            .try_into()
-            .unwrap_or(u32::MAX);
-        /* `motion_absolute` is in per-mille of the layout. Strict wlroots
-         * compositors place the cursor exactly there; Hyprland is known to
-         * apply its pointer acceleration to these events instead, so the
-         * placement can be off there.
-         */
-        const EXTENT: u32 = 1000;
-        let rel_x = (x - layout.x as f64) / (layout.width.max(1) as f64);
-        let rel_y = (y - layout.y as f64) / (layout.height.max(1) as f64);
-        let target_x = (rel_x.clamp(0.0, 1.0) * EXTENT as f64) as u32;
-        let target_y = (rel_y.clamp(0.0, 1.0) * EXTENT as f64) as u32;
         log::debug!(
-            "placing the cursor at {target_x}/{EXTENT} x {target_y}/{EXTENT} (edge {edge:?}, \
-             fraction {fraction:.2}, output {}x{}+{}+{})",
+            "placing the cursor at {x}/{y} (edge {edge:?}, fraction {fraction:.2}, \
+             output {}x{}+{}+{})",
             target.width,
             target.height,
             target.x,
             target.y
         );
-        input
-            .pointer
-            .motion_absolute(now, target_x, target_y, EXTENT, EXTENT);
-        input.pointer.frame();
-        if let Err(e) = self.queue.flush() {
-            log::error!("failed to position the cursor: {e}");
-        }
+        self.absolute(handle, layout, x, y);
+    }
+
+    async fn enter_center(&mut self, handle: EmulationHandle) {
+        let Some(layout) = self.state.layout() else {
+            log::debug!("no output is known, not placing the cursor");
+            return;
+        };
+        /* No crossing point to line up with: the middle of the layout is what
+         * the person pressing "switch" expects to land on.
+         */
+        let x = layout.x as f64 + layout.width as f64 / 2.0;
+        let y = layout.y as f64 + layout.height as f64 / 2.0;
+        log::debug!(
+            "placing the cursor at the centre ({x}, {y}) of the {}x{}+{}+{} layout",
+            layout.width,
+            layout.height,
+            layout.x,
+            layout.y
+        );
+        self.absolute(handle, layout, x, y);
     }
 
     async fn create(&mut self, handle: EmulationHandle) {
@@ -409,6 +406,41 @@ impl Emulation for WlrootsEmulation {
     }
     async fn terminate(&mut self) {
         /* nothing to do */
+    }
+}
+
+impl WlrootsEmulation {
+    /// Move the virtual pointer to `(x, y)` of the layout, in one absolute
+    /// motion event.
+    ///
+    /// `motion_absolute` is in per-mille of the whole layout. Strict wlroots
+    /// compositors place the cursor exactly there; Hyprland is known to apply
+    /// its pointer acceleration to these events instead, so the placement can
+    /// be off there.
+    fn absolute(&self, handle: EmulationHandle, layout: OutputInfo, x: f64, y: f64) {
+        let Some(input) = self.state.input_for_client.get(&handle) else {
+            log::debug!("no virtual pointer for handle {handle}, not placing the cursor");
+            return;
+        };
+        static START: OnceLock<Instant> = OnceLock::new();
+        let now: u32 = START
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u32::MAX);
+        const EXTENT: u32 = 1000;
+        let rel_x = (x - layout.x as f64) / (layout.width.max(1) as f64);
+        let rel_y = (y - layout.y as f64) / (layout.height.max(1) as f64);
+        let target_x = (rel_x.clamp(0.0, 1.0) * EXTENT as f64) as u32;
+        let target_y = (rel_y.clamp(0.0, 1.0) * EXTENT as f64) as u32;
+        input
+            .pointer
+            .motion_absolute(now, target_x, target_y, EXTENT, EXTENT);
+        input.pointer.frame();
+        if let Err(e) = self.queue.flush() {
+            log::error!("failed to position the cursor: {e}");
+        }
     }
 }
 

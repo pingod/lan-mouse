@@ -636,6 +636,12 @@ impl Capture for LayerShellInputCapture {
         Ok(inner.flush_events()?)
     }
 
+    async fn begin(&mut self, _pos: Position) -> Result<(), CaptureError> {
+        /* The compositor decides who owns the pointer: it cannot be taken
+         * without the pointer actually crossing a barrier. */
+        Err(CaptureError::BeginUnsupported)
+    }
+
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
         self.delete_client(pos);
         let inner = self.0.get_mut();

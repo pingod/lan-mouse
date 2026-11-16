@@ -50,6 +50,10 @@ pub(crate) enum ICaptureEvent {
     /// either the remote client leaving its device region,
     /// a new device entering the screen or the release bind.
     ClientEntered(u64),
+    /// A request could not be carried out (the backend cannot take the
+    /// pointer, the handle is unknown, ...). The service turns this into a
+    /// visible error instead of failing silently.
+    Error(String),
     /// The previously active client was left, i.e. capture
     /// was released for the given handle. Mirrors
     /// [`ICaptureEvent::ClientEntered`] for the leave side
@@ -75,6 +79,8 @@ enum CaptureRequest {
     Release,
     /// add a capture client
     Create(CaptureHandle, Position, CaptureType),
+    /// take the pointer on this capture right now, without a crossing
+    Begin(CaptureHandle),
     /// destory a capture client
     Destroy(CaptureHandle),
     /// start the connection to this client before the pointer reaches it
@@ -118,6 +124,7 @@ impl Capture {
             last_enter_release: None,
             state: Default::default(),
             pending_input: Vec::new(),
+            center_cursor: false,
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -180,6 +187,15 @@ impl Capture {
 
     pub(crate) fn release(&self) {
         send_request(&self.request_tx, CaptureRequest::Release);
+    }
+
+    /// Take the pointer on this capture right now, without a crossing.
+    ///
+    /// Used by "switch device": the pointer is handed to a client while the
+    /// user is not crossing an edge. Backends that do not own the local
+    /// pointer report an error and the log says why.
+    pub(crate) fn begin(&self, handle: CaptureHandle) {
+        send_request(&self.request_tx, CaptureRequest::Begin(handle));
     }
 
     /// Wait for the next event; `None` means the capture task has exited.
@@ -245,6 +261,9 @@ struct CaptureTask {
     /// moving by then. Dropping those events is what makes the first moments
     /// on the peer feel sticky, so they are replayed once the Ack lands.
     pending_input: Vec<ProtoEvent>,
+    /// The next `Begin` comes from a "switch device" request rather than from
+    /// the pointer crossing an edge, so the peer has to centre its cursor.
+    center_cursor: bool,
 }
 
 impl CaptureTask {
@@ -300,6 +319,7 @@ impl CaptureTask {
                                 self.release_bind.borrow_mut().clone_from(&bind);
                             }
                             CaptureRequest::SetRemapRules(rules) => self.remap.set_rules(rules),
+                            CaptureRequest::Begin(_) => { /* no capture yet */ }
                         }
                     },
                     _ = self.cancellation_token.cancelled() => return,
@@ -492,6 +512,25 @@ impl CaptureTask {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
                     Some(CaptureRequest::SetRemapRules(rules)) => self.remap.set_rules(rules),
+                    Some(CaptureRequest::Begin(handle)) => {
+                        match capture.begin(handle).await {
+                            Ok(()) => {
+                                /* The backend reports `Begin` like for a
+                                 * crossing; remember that this one was asked
+                                 * for so the peer centres its cursor instead
+                                 * of lining up with an edge point. */
+                                self.center_cursor = true;
+                            }
+                            Err(e) => {
+                                log::warn!("cannot hand the pointer to client {handle}: {e}");
+                                let message =
+                                    format!("cannot hand the pointer to client {handle}: {e}");
+                                if self.event_tx.send(ICaptureEvent::Error(message)).is_err() {
+                                    log::debug!("capture event channel is closed");
+                                }
+                            }
+                        }
+                    }
                     None => break,
                 },
                 _ = self.cancellation_token.cancelled() => break,
@@ -629,7 +668,13 @@ impl CaptureTask {
         let events: Vec<ProtoEvent> = match event {
             // already handled above (released the capture)
             CaptureEvent::Interrupted => return Ok(()),
-            CaptureEvent::Begin(fraction) => vec![ProtoEvent::Enter(opposite_pos, fraction)],
+            CaptureEvent::Begin(fraction) => {
+                let mut events = vec![ProtoEvent::Enter(opposite_pos, fraction)];
+                if std::mem::take(&mut self.center_cursor) {
+                    events.push(ProtoEvent::CenterCursor);
+                }
+                events
+            }
             CaptureEvent::Input(e) => match self.state {
                 // The handshake is still in flight. Keep the event so it can
                 // be replayed right after the Ack instead of being lost — the

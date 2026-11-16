@@ -182,6 +182,13 @@ impl ListenTask {
                                     send_event(&self.event_tx, EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint});
                                 }
                             }
+                            ProtoEvent::CenterCursor => {
+                                log::info!(
+                                    "{addr} handed the pointer over, placing the cursor in the middle"
+                                );
+                                self.emulation_proxy.center_cursor(addr);
+                                self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                            }
                             ProtoEvent::Leave(_) => {
                                 self.emulation_proxy.remove(addr);
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
@@ -310,6 +317,9 @@ enum ProxyRequest {
     /// The peer entered this device through `ScreenEdge`, at that fraction
     /// (0..=1) along the edge. Also clears any prior `Leave` latch.
     Enter(SocketAddr, ScreenEdge, f64),
+    /// The peer handed the pointer over on request: put the cursor in the
+    /// middle of this screen.
+    CenterCursor(SocketAddr),
     Remove(SocketAddr),
     Terminate,
     Reenable,
@@ -362,6 +372,10 @@ impl EmulationProxy {
 
     fn enter(&self, addr: SocketAddr, edge: ScreenEdge, fraction: f64) {
         send_event(&self.request_tx, ProxyRequest::Enter(addr, edge, fraction));
+    }
+
+    fn center_cursor(&self, addr: SocketAddr) {
+        send_event(&self.request_tx, ProxyRequest::CenterCursor(addr));
     }
 
     fn remove(&self, addr: SocketAddr) {
@@ -420,6 +434,7 @@ impl EmulationTask {
                     None | Some(ProxyRequest::Terminate) => return,
                     Some(ProxyRequest::Input(..)) => { /* emulation inactive => ignore */ }
                     Some(ProxyRequest::Enter(..)) => { /* emulation inactive => ignore */ }
+                    Some(ProxyRequest::CenterCursor(..)) => { /* inactive => ignore */ }
                     Some(ProxyRequest::Remove(..)) => { /* emulation inactive => ignore */ }
                     Some(ProxyRequest::Disable) => { /* already inactive */ }
                 }
@@ -517,6 +532,20 @@ impl EmulationTask {
                         };
                         emulation.enter(handle, edge, fraction).await;
                     }
+                    Some(ProxyRequest::CenterCursor(addr)) => {
+                        self.left.remove(&addr);
+                        let handle = match self.handles.get(&addr) {
+                            Some(&handle) => handle,
+                            None => {
+                                let handle = self.next_id;
+                                self.next_id += 1;
+                                emulation.create(handle).await;
+                                self.handles.insert(addr, handle);
+                                handle
+                            }
+                        };
+                        emulation.enter_center(handle).await;
+                    }
                     Some(ProxyRequest::Remove(addr)) => {
                         self.left.insert(addr, Instant::now());
                         if let Some(handle) = self.handles.remove(&addr) {
@@ -564,6 +593,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             None | Some(ProxyRequest::Terminate) => return,
             Some(ProxyRequest::Input(_, _)) => continue,
             Some(ProxyRequest::Enter(..)) => continue,
+            Some(ProxyRequest::CenterCursor(_)) => continue,
             Some(ProxyRequest::Remove(_)) => continue,
             Some(ProxyRequest::Reenable) => continue,
             Some(ProxyRequest::Disable) => continue,

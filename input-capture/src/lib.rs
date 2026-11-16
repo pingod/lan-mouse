@@ -192,6 +192,21 @@ impl InputCapture {
         Ok(())
     }
 
+    /// Take the pointer on this handle without waiting for a crossing.
+    ///
+    /// Only a backend that owns the local pointer can do this: macOS can, the
+    /// compositor driven ones cannot (there the compositor decides who gets
+    /// the pointer). The backend reports [`CaptureEvent::Begin`] like it does
+    /// for a real crossing, so callers keep a single code path.
+    pub async fn begin(&mut self, id: CaptureHandle) -> Result<(), CaptureError> {
+        let Some(&pos) = self.id_map.get(&id) else {
+            log::debug!("capture handle {id} does not exist, not taking the pointer");
+            return Err(CaptureError::BeginUnsupported);
+        };
+        log::debug!("taking the pointer at {pos} on request");
+        self.capture.begin(pos).await
+    }
+
     /// release mouse
     pub async fn release(&mut self) -> Result<(), CaptureError> {
         self.pressed_keys.clear();
@@ -314,6 +329,13 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
 
     /// release mouse
     async fn release(&mut self) -> Result<(), CaptureError>;
+
+    /// Take the pointer at `pos` without a barrier crossing.
+    ///
+    /// Backends where the compositor owns the pointer report
+    /// [`CaptureError::BeginUnsupported`]; only the ones that own the local
+    /// pointer (macOS) can do it.
+    async fn begin(&mut self, pos: Position) -> Result<(), CaptureError>;
 
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;

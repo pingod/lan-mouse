@@ -86,6 +86,15 @@ pub enum ProtoEvent {
     /// counted from its left or top end, so the receiving device can put its
     /// cursor at the matching point instead of wherever it happened to be.
     Enter(Position, f64),
+    /// Put the cursor in the middle of the screen.
+    ///
+    /// Sent instead of a plain [`ProtoEvent::Enter`] when the pointer is handed
+    /// over on request (a "switch device" click) rather than by crossing an
+    /// edge: there is no crossing point to line up with, and parking the peer's
+    /// cursor in the middle is what the person pressing the button expects.
+    /// The receiver warps its cached cursor but does not take over input, so
+    /// this must be followed by an [`ProtoEvent::Enter`].
+    CenterCursor,
     /// notify a client that the cursor left its region
     /// [`ProtoEvent::Ack`] with the same serial is used for synchronization between devices
     Leave(u32),
@@ -209,6 +218,7 @@ impl Display for ProtoEvent {
             ProtoEvent::Enter(s, fraction) => {
                 write!(f, "Enter({s}, {:.0}% of the edge)", fraction * 100.0)
             }
+            ProtoEvent::CenterCursor => write!(f, "CenterCursor"),
             ProtoEvent::Leave(s) => write!(f, "Leave({s})"),
             ProtoEvent::Ack(s) => write!(f, "Ack({s})"),
             ProtoEvent::Input(e) => write!(f, "{e}"),
@@ -245,6 +255,7 @@ pub enum EventType {
     Ping,
     Pong,
     Enter,
+    CenterCursor,
     Leave,
     Ack,
     Hello,
@@ -271,6 +282,7 @@ impl ProtoEvent {
             ProtoEvent::Ping => EventType::Ping,
             ProtoEvent::Pong(_) => EventType::Pong,
             ProtoEvent::Enter(..) => EventType::Enter,
+            ProtoEvent::CenterCursor => EventType::CenterCursor,
             ProtoEvent::Leave(_) => EventType::Leave,
             ProtoEvent::Ack(_) => EventType::Ack,
             ProtoEvent::Hello { .. } => EventType::Hello,
@@ -340,6 +352,7 @@ impl TryFrom<&[u8]> for ProtoEvent {
                 };
                 Ok(Self::Enter(position, fraction))
             }
+            EventType::CenterCursor => Ok(Self::CenterCursor),
             EventType::Leave => Ok(Self::Leave(decode_u32(&mut buf)?)),
             EventType::Ack => Ok(Self::Ack(decode_u32(&mut buf)?)),
             EventType::PeerInfoRequest => Ok(Self::PeerInfoRequest),
@@ -452,6 +465,7 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                     encode_u8(buf, len, pos as u8);
                     encode_f64(buf, len, fraction);
                 }
+                ProtoEvent::CenterCursor => {}
                 ProtoEvent::Leave(serial) => encode_u32(buf, len, serial),
                 ProtoEvent::Ack(serial) => encode_u32(buf, len, serial),
                 ProtoEvent::Hello { commit } => {
@@ -526,3 +540,36 @@ encode_impl!(u8);
 encode_impl!(u32);
 encode_impl!(i32);
 encode_impl!(f64);
+
+#[cfg(test)]
+mod center_cursor_tests {
+    use super::*;
+
+    #[test]
+    fn center_cursor_round_trips() {
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::CenterCursor.into();
+        /* a single tag byte, no payload: the receiver must not need more */
+        assert_eq!(len, 1);
+        let decoded = ProtoEvent::decode(&buf[..len]).unwrap();
+        assert!(matches!(decoded, ProtoEvent::CenterCursor));
+    }
+
+    #[test]
+    fn enter_and_center_cursor_stay_distinguishable() {
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) =
+            ProtoEvent::Enter(Position::Bottom, 0.25).into();
+        match ProtoEvent::decode(&buf[..len]).unwrap() {
+            ProtoEvent::Enter(pos, fraction) => {
+                assert!(matches!(pos, Position::Bottom));
+                assert!((fraction - 0.25).abs() < f64::EPSILON);
+            }
+            other => panic!("expected Enter, got {other:?}"),
+        }
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::CenterCursor.into();
+        let decoded = ProtoEvent::decode(&buf[..len]).unwrap();
+        assert!(
+            !matches!(decoded, ProtoEvent::Enter(..)),
+            "CenterCursor must not decode as Enter"
+        );
+    }
+}

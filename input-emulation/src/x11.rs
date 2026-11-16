@@ -107,8 +107,44 @@ impl Drop for X11Emulation {
     }
 }
 
+impl X11Emulation {
+    /// Move the real cursor (not a synthetic event).
+    fn warp(&self, x: i32, y: i32) {
+        unsafe {
+            xlib::XWarpPointer(
+                self.display,
+                // `None` (0) as the source window: warp the real cursor
+                0,
+                xlib::XDefaultRootWindow(self.display),
+                0,
+                0,
+                0,
+                0,
+                x,
+                y,
+            );
+            xlib::XFlush(self.display);
+        }
+    }
+}
+
 #[async_trait]
 impl Emulation for X11Emulation {
+    async fn enter_center(&mut self, _handle: EmulationHandle) {
+        let (width, height) = unsafe {
+            let screen = xlib::XDefaultScreen(self.display);
+            (
+                xlib::XDisplayWidth(self.display, screen),
+                xlib::XDisplayHeight(self.display, screen),
+            )
+        };
+        if width <= 0 || height <= 0 {
+            log::debug!("cannot position the cursor on a {width}x{height} screen");
+            return;
+        }
+        self.warp(width / 2, height / 2);
+    }
+
     async fn enter(&mut self, _handle: EmulationHandle, edge: ScreenEdge, fraction: f64) {
         /*
          * Place the cursor at the point the peer crossed its edge instead of
@@ -126,23 +162,7 @@ impl Emulation for X11Emulation {
             return;
         }
         let (x, y) = edge.point_on(fraction, 0.0, 0.0, (width - 1) as f64, (height - 1) as f64);
-        let x = x as i32;
-        let y = y as i32;
-        unsafe {
-            xlib::XWarpPointer(
-                self.display,
-                // `None` (0) as the source window: warp the real cursor
-                0,
-                xlib::XDefaultRootWindow(self.display),
-                0,
-                0,
-                0,
-                0,
-                x,
-                y,
-            );
-            xlib::XFlush(self.display);
-        }
+        self.warp(x as i32, y as i32);
     }
 
     async fn consume(&mut self, event: Event, _: EmulationHandle) -> Result<(), EmulationError> {

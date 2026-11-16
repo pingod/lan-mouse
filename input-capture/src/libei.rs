@@ -821,6 +821,12 @@ async fn handle_ei_event(
 
 #[async_trait]
 impl LanMouseInputCapture for LibeiInputCapture {
+    async fn begin(&mut self, _pos: Position) -> Result<(), CaptureError> {
+        /* The compositor owns the pointer: it can only be handed out by
+         * crossing a barrier. */
+        Err(CaptureError::BeginUnsupported)
+    }
+
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         let _ = self
             .notify_capture

@@ -27,6 +27,8 @@ use core_graphics::base::CGError;
 pub enum CaptureError {
     #[error("activation stream closed unexpectedly")]
     ActivationClosed,
+    #[error("this capture backend cannot take the pointer on request")]
+    BeginUnsupported,
     #[error("libei stream was closed")]
     EndOfStream,
     #[error("io error: `{0}`")]

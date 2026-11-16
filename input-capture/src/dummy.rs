@@ -38,6 +38,12 @@ impl Capture for DummyInputCapture {
         Ok(())
     }
 
+    async fn begin(&mut self, _pos: Position) -> Result<(), CaptureError> {
+        /* The dummy backend owns no real pointer, but pretending to take it
+         * keeps the "switch device" path testable without a display. */
+        Ok(())
+    }
+
     async fn destroy(&mut self, _pos: Position) -> Result<(), CaptureError> {
         Ok(())
     }

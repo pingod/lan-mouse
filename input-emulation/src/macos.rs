@@ -509,6 +509,21 @@ fn clamp_to_screen_space(
 
 #[async_trait]
 impl Emulation for MacOSEmulation {
+    async fn enter_center(&mut self, _handle: EmulationHandle) {
+        /*
+         * Same reason as `enter`: synthesized motion is relative, so a
+         * handover without a crossing point must place the cursor explicitly.
+         */
+        let bounds = CGDisplay::main().bounds();
+        let point = CGPoint::new(
+            bounds.origin.x + bounds.size.width / 2.0,
+            bounds.origin.y + bounds.size.height / 2.0,
+        );
+        if let Err(e) = CGDisplay::warp_mouse_cursor_position(point) {
+            log::warn!("failed to position the cursor: {e}");
+        }
+    }
+
     async fn enter(&mut self, _handle: EmulationHandle, edge: ScreenEdge, fraction: f64) {
         /*
          * Synthesized motion is relative, so without this the pointer would

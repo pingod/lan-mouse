@@ -364,9 +364,20 @@ impl Service {
                 self.emulation.send_leave_event(addr);
                 return;
             }
-            self.notify_frontend(FrontendEvent::Error(
-                "nothing to switch: the pointer is already on this machine".to_owned(),
-            ));
+            /* Nothing captures and no peer drives us: the pointer is on this
+             * machine and the person pressing "switch" wants it on the peer.
+             * Take it here so input starts flowing there, and let the peer
+             * centre its cursor — there is no crossing point to line up with.
+             */
+            let target = self.switch_target();
+            let Some(handle) = target else {
+                self.notify_frontend(FrontendEvent::Error(
+                    "nothing to switch: no peer is connected".to_owned(),
+                ));
+                return;
+            };
+            log::info!("switch: handing the pointer to client {handle}");
+            self.capture.begin(handle);
             return;
         };
 
@@ -379,6 +390,27 @@ impl Service {
             self.capture.preconnect(next);
         }
         self.sync_frontend();
+    }
+
+    /// The client "switch device" hands the pointer to when nothing holds it.
+    ///
+    /// Prefers a client that is active and connected (the pointer can go there
+    /// right away), then any connected client, then an inbound peer.
+    fn switch_target(&self) -> Option<ClientHandle> {
+        let mut connected = None;
+        for (handle, _, state) in self.client_manager.get_client_states() {
+            if !state.connected {
+                continue;
+            }
+            if state.active {
+                return Some(handle);
+            }
+            connected.get_or_insert(handle);
+        }
+        if connected.is_some() {
+            return connected;
+        }
+        self.incoming_conn_info.keys().next().copied()
     }
 
     /// The client the pointer is currently handed to, if any.
@@ -861,6 +893,10 @@ impl Service {
 
     fn handle_capture_event(&mut self, event: ICaptureEvent) {
         match event {
+            ICaptureEvent::Error(message) => {
+                log::warn!("{message}");
+                self.notify_frontend(FrontendEvent::Error(message));
+            }
             ICaptureEvent::CaptureBegin(handle) => {
                 // we entered the capture zone for an incoming connection
                 // => notify it that its capture should be released

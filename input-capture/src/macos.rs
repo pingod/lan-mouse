@@ -157,6 +157,9 @@ enum ProducerEvent {
     Create(Position),
     Destroy(Position),
     Grab(Position),
+    /// Take the pointer on request (a "switch device" click): grab and pin the
+    /// hidden cursor to the edge, without a crossing event.
+    Take(Position),
     EventTapDisabled,
     DisplayReconfigured,
 }
@@ -286,6 +289,22 @@ impl InputCaptureState {
         Ok(fraction)
     }
 
+    /// The middle of one of the screen edges, in display coordinates.
+    fn edge_middle(&self, pos: Position) -> (f64, f64) {
+        let cx = (self.bounds.xmin + self.bounds.xmax) / 2.0;
+        let cy = (self.bounds.ymin + self.bounds.ymax) / 2.0;
+        if !self.bounds.is_valid() {
+            return (cx, cy);
+        }
+        const INSET: f64 = 1.0;
+        match pos {
+            Position::Left => (self.bounds.xmin + INSET, cy),
+            Position::Right => (self.bounds.xmax - INSET, cy),
+            Position::Top => (cx, self.bounds.ymin + INSET),
+            Position::Bottom => (cx, self.bounds.ymax - INSET),
+        }
+    }
+
     /// resets the cursor to the position, where the capture started
     fn reset_cursor(&mut self) -> Result<(), CaptureError> {
         // this runs inside the event tap callback: a missing position must not
@@ -324,6 +343,20 @@ impl InputCaptureState {
                     self.hide_cursor()?;
                     self.current_pos = Some(pos);
                 }
+            }
+            ProducerEvent::Take(pos) => {
+                /* Same state as a crossing, but the pointer was never at the
+                 * edge. Pin the hidden cursor to the middle of that edge so the
+                 * physical pointer keeps producing motion instead of running
+                 * out of screen space, which would stall the peer's cursor.
+                 */
+                self.hide_cursor()?;
+                self.current_pos = Some(pos);
+                self.latched_barrier = None;
+                let (x, y) = self.edge_middle(pos);
+                log::debug!("taking the pointer at {pos}, pinning the cursor to {x}, {y}");
+                self.enter_position = Some(CGPoint::new(x, y));
+                self.reset_cursor()?;
             }
             ProducerEvent::Create(p) => {
                 self.active_clients.insert(p);
@@ -888,6 +921,10 @@ extern "C" fn display_reconfiguration_callback(_display: u32, flags: u32, user_i
 
 pub struct MacOSInputCapture {
     event_rx: UnboundedReceiver<Result<(Position, CaptureEvent), CaptureError>>,
+    /// Sender of the same channel `event_rx` reads from: a capture that is
+    /// taken on request has to report its own `Begin` (the tap only does that
+    /// for a real barrier crossing).
+    event_tx: UnboundedSender<Result<(Position, CaptureEvent), CaptureError>>,
     notify_tx: Sender<ProducerEvent>,
     run_loop: CFRunLoop,
 }
@@ -928,6 +965,7 @@ impl MacOSInputCapture {
             .recv()
             .map_err(|_| MacosCaptureCreationError::EventTapCreation)??;
 
+        let task_error_tx = task_event_tx.clone();
         let _tap_task: tokio::task::JoinHandle<()> = tokio::task::spawn_local(async move {
             loop {
                 tokio::select! {
@@ -941,7 +979,7 @@ impl MacOSInputCapture {
                             // forever (e.g. a dead event tap: no events arrive, but
                             // pressed keys are never released). Report it upstream.
                             log::error!("Failed to handle producer event: {e}");
-                            let _ = task_event_tx.send(Err(e));
+                            let _ = task_error_tx.send(Err(e));
                             break;
                         }
                     }
@@ -954,6 +992,7 @@ impl MacOSInputCapture {
 
         Ok(Self {
             event_rx,
+            event_tx: task_event_tx,
             notify_tx,
             run_loop,
         })
@@ -1010,6 +1049,26 @@ impl Capture for MacOSInputCapture {
             .await
             .map_err(|_| CaptureError::EndOfStream)?;
         log::debug!("done !");
+        Ok(())
+    }
+
+    async fn begin(&mut self, pos: Position) -> Result<(), CaptureError> {
+        /*
+         * The tap only forwards input while `current_pos` is set, and
+         * `ProducerEvent::Grab` is what sets it (it also hides the cursor, so
+         * the pointer does not sit visibly on the edge while it is remote).
+         * A real crossing lets the tap emit `Begin`; a requested start has to
+         * emit it here, with an unknown fraction because nothing was crossed.
+         */
+        log::debug!("taking the pointer at {pos} on request");
+        self.notify_tx
+            .send(ProducerEvent::Take(pos))
+            .await
+            .map_err(|_| CaptureError::EndOfStream)?;
+        if let Err(e) = self.event_tx.send(Ok((pos, CaptureEvent::Begin(0.5)))) {
+            log::warn!("failed to forward the capture event: {e}");
+            return Err(CaptureError::EndOfStream);
+        }
         Ok(())
     }
 

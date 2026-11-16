@@ -19,6 +19,12 @@ impl Capture for X11InputCapture {
         Ok(())
     }
 
+    async fn begin(&mut self, _pos: Position) -> Result<(), CaptureError> {
+        /* The compositor decides who owns the pointer: it cannot be taken
+         * without the pointer actually crossing a barrier. */
+        Err(CaptureError::BeginUnsupported)
+    }
+
     async fn destroy(&mut self, _pos: Position) -> Result<(), CaptureError> {
         Ok(())
     }

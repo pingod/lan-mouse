@@ -31,7 +31,19 @@ Windows 目前仍是空实现（`noop`）。
 
 - **Hotkeys** 区块：列表、添加（弹窗输入 `Shift+Alt+Z` / `Z`）、**编辑**（铅笔按钮改组合键，`UpdateHotkey` 就地替换）、删除
 - **Release shortcut** 行（Settings → Startup and maintenance）：编辑"把指针拉回来"的组合键，等价于配置里的 `release_bind`
-- **Switch** 按钮：指针在对端时向对端要回（`send_leave_event`），不再报 "nothing to switch"
+- **Switch** 按钮（三种情况都覆盖）
+  - 本机正在把指针送给对端 → 收回（`capture.release()` + 预热下一个客户端）
+  - 对端正在驱动本机 → 让对端放手（`send_leave_event`）
+  - 两边都没在用指针（界面显示 `Controlling: this machine`）→ **本机主动接管**：
+    `CaptureRequest::Begin(handle)` → `InputCapture::begin()` → 平台后端的
+    `Capture::begin(pos)`。macOS 通过 `ProducerEvent::Take(pos)` 隐藏并钉住物理光标，
+    然后照常发 `CaptureEvent::Begin(0.5)`；同时置 `center_cursor` 标记，让发送的第一个
+    `ProtoEvent::Enter(opposite, 0.5)` 后面追加 `ProtoEvent::CenterCursor`，对端收到后把
+    自己的光标**移到屏幕正中**（`Emulation::enter_center`：wlroots 取输出并集中心、
+    X11 取 root 窗口中心、macOS 取主屏中心）。
+  - 局限：合成器驱动的后端（layer-shell / libei / windows / x11）无法被要求接管指针，
+    `begin` 返回 `CaptureError::BeginUnsupported`，此时 GUI 会弹出错误提示（"cannot hand
+    the pointer to client N: this capture backend cannot take the pointer on request"）。
 - **version**：`0.11.0 (commit)` 显示在 General 底部
 - **start with session**：开关，装/卸自启项
 
