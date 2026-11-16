@@ -3,7 +3,9 @@ use std::task::Poll;
 use async_trait::async_trait;
 use futures_core::Stream;
 
-use super::{Capture, CaptureError, CaptureEvent, Position, error::X11InputCaptureCreationError};
+use super::{
+    Capture, CaptureError, CaptureEvent, EdgeRange, Position, error::X11InputCaptureCreationError,
+};
 
 pub struct X11InputCapture {}
 
@@ -15,8 +17,24 @@ impl X11InputCapture {
 
 #[async_trait]
 impl Capture for X11InputCapture {
-    async fn create(&mut self, _pos: Position) -> Result<(), CaptureError> {
+    async fn create(
+        &mut self,
+        _pos: Position,
+        _segments: Vec<EdgeRange>,
+    ) -> Result<(), CaptureError> {
         Ok(())
+    }
+
+    async fn update(
+        &mut self,
+        _pos: Position,
+        _segments: Vec<EdgeRange>,
+    ) -> Result<(), CaptureError> {
+        Ok(())
+    }
+
+    async fn screen_size(&mut self) -> Option<(u32, u32)> {
+        None
     }
 
     async fn begin(&mut self, _pos: Position) -> Result<(), CaptureError> {

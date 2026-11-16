@@ -10,6 +10,10 @@ use futures_core::Stream;
 
 use input_event::{Event, KeyboardEvent, scancode};
 
+// The edge a client is reached through is part of every backend's barrier
+// geometry, so the type is part of this crate's API rather than an import.
+pub use input_event::EdgeRange;
+
 pub use error::{CaptureCreationError, CaptureError, InputCaptureError};
 
 pub mod error;
@@ -139,12 +143,14 @@ pub struct InputCapture {
     position_map: HashMap<Position, Vec<CaptureHandle>>,
     /// map from id to position
     id_map: HashMap<CaptureHandle, Position>,
+    /// segments of each edge that a crossing can be routed to
+    segments: HashMap<Position, Vec<EdgeRange>>,
     /// pending events
     pending: VecDeque<(CaptureHandle, CaptureEvent)>,
 }
 
 impl InputCapture {
-    /// create a new client with the given id
+    /// create a new client with the given id on the given edge
     pub async fn create(&mut self, id: CaptureHandle, pos: Position) -> Result<(), CaptureError> {
         /* The service only creates a handle once, but a duplicate must not
          * abort the process (this crate is built with `panic = "abort"`):
@@ -159,11 +165,60 @@ impl InputCapture {
 
         if let Some(v) = self.position_map.get_mut(&pos) {
             v.push(id);
-            Ok(())
         } else {
             self.position_map.insert(pos, vec![id]);
-            self.capture.create(pos).await
+            let segments = self
+                .segments
+                .get(&pos)
+                .cloned()
+                .unwrap_or_else(|| vec![EdgeRange::FULL]);
+            self.capture.create(pos, segments).await?;
         }
+        Ok(())
+    }
+
+    /// Replace the segments of `pos` that a crossing can be routed to.
+    ///
+    /// The caller owns the resolution: it knows which client asked for what and
+    /// which of those requests overlap, and it is the one that routes the
+    /// crossing, so the barriers have to be exactly what it will route to. An
+    /// empty list removes every barrier of the edge, which is what makes the
+    /// pointer hit a wall there.
+    pub async fn set_segments(
+        &mut self,
+        pos: Position,
+        segments: Vec<EdgeRange>,
+    ) -> Result<(), CaptureError> {
+        if !self.position_map.contains_key(&pos) {
+            /* nothing is registered for this edge: remember the segments so the
+             * barriers are created with the right geometry when the first client
+             * of the edge arrives */
+            self.segments.insert(pos, segments);
+            return Ok(());
+        }
+        let previous = self.segments.get(&pos).cloned().unwrap_or_default();
+        if previous == segments {
+            return Ok(());
+        }
+        log::debug!(
+            "capture @ {pos} now covers [{}]",
+            segments
+                .iter()
+                .map(EdgeRange::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        self.segments.insert(pos, segments);
+        self.capture.update(pos, self.segments[&pos].clone()).await
+    }
+
+    /// Size of the area the pointer can reach, in pixels.
+    ///
+    /// The arrangement canvas draws the local screen to scale with it, which is
+    /// what turns an edge range from a decoration into something the user can
+    /// see the length of.
+    pub async fn screen_size(&mut self) -> Option<(u32, u32)> {
+        self.capture.screen_size().await
     }
 
     /// destroy the client with the given id, if it exists
@@ -237,6 +292,7 @@ impl InputCapture {
         Ok(Self {
             capture,
             id_map: Default::default(),
+            segments: Default::default(),
             pending: Default::default(),
             position_map: Default::default(),
             pressed_keys: HashSet::new(),
@@ -321,11 +377,28 @@ impl Stream for InputCapture {
 
 #[async_trait]
 trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + Unpin {
-    /// create a new client with the given id
-    async fn create(&mut self, pos: Position) -> Result<(), CaptureError>;
+    /// create a client on `pos`, reachable through `segments`
+    ///
+    /// The segments are disjoint and given in the order a crossing is routed
+    /// in. Where the edge is not covered there is no barrier, so the pointer
+    /// hits a wall instead of switching to a machine that does not own that
+    /// part of the edge.
+    async fn create(&mut self, pos: Position, segments: Vec<EdgeRange>)
+    -> Result<(), CaptureError>;
+
+    /// replace the segments of `pos` that clients can be reached through
+    async fn update(&mut self, pos: Position, segments: Vec<EdgeRange>)
+    -> Result<(), CaptureError>;
 
     /// destroy the client with the given id, if it exists
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError>;
+
+    /// Size of the area the pointer can reach, in pixels.
+    ///
+    /// `None` when the backend has no display geometry. The frontend draws the
+    /// local screen to scale with it, which is what makes an edge range mean
+    /// something visually instead of being a decoration.
+    async fn screen_size(&mut self) -> Option<(u32, u32)>;
 
     /// release mouse
     async fn release(&mut self) -> Result<(), CaptureError>;

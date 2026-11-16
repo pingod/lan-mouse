@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use futures_core::Stream;
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     fmt::{self, Display},
     io::{self, ErrorKind},
@@ -61,7 +61,7 @@ use wayland_client::{
     },
 };
 
-use input_event::{Event, KeyboardEvent, PointerEvent};
+use input_event::{EdgeRange, Event, KeyboardEvent, PointerEvent};
 
 use crate::{CaptureError, CaptureEvent};
 
@@ -113,7 +113,8 @@ struct OutputInfo {
 }
 
 struct State {
-    active_positions: HashSet<Position>,
+    /// the segments of each edge that clients can be reached through
+    active_positions: HashMap<Position, Vec<EdgeRange>>,
     pointer: Option<WlPointer>,
     keyboard: Option<WlKeyboard>,
     pointer_lock: Option<ZwpLockedPointerV1>,
@@ -143,28 +144,82 @@ impl AsRawFd for Inner {
 
 pub struct LayerShellInputCapture(AsyncFd<Inner>);
 
+/// Where a barrier surface goes: one segment of one edge of one output.
+///
+/// Grouped because the geometry is a single decision - the position of the edge,
+/// the extent of the output it sits on, the segment that edge is measured over
+/// and the whole layout the segment is a fraction of - and passing them apart
+/// invites mixing up which axis a number belongs to.
+#[derive(Clone, Copy, Debug)]
+struct Placement {
+    pos: Position,
+    /// size of the output this surface is placed on
+    size: (i32, i32),
+    /// position of that output in layout coordinates
+    origin: (i32, i32),
+    /// inclusive pixel span along the crossing axis, in layout coordinates,
+    /// already intersected with this output
+    segment: (i32, i32),
+    /// the span of the whole capture area along the crossing axis
+    axis: (i32, i32),
+}
+
 struct Window {
     buffer: wl_buffer::WlBuffer,
     surface: WlSurface,
     layer_surface: ZwlrLayerSurfaceV1,
     pos: Position,
+    /// where along the crossing axis the surface starts, in layout coordinates
+    ///
+    /// `wl_pointer::Enter` reports the position inside the surface, which is all
+    /// this backend ever gets: adding the offset turns it into the point of the
+    /// edge the pointer crossed.
+    offset: i32,
+    /// the span of the whole capture area along the crossing axis, `(lo, hi)`
+    /// inclusive
+    axis: (i32, i32),
 }
 
 impl Window {
+    /// Create the barrier surface for one segment of one edge of one output.
     fn new(
         state: &State,
         qh: &QueueHandle<State>,
         output: &WlOutput,
-        pos: Position,
-        size: (i32, i32),
+        place: Placement,
     ) -> Option<Window> {
-        log::debug!("creating window output: {output:?}, size: {size:?}");
+        let Placement {
+            pos,
+            size,
+            origin,
+            segment,
+            axis,
+        } = place;
+        log::debug!("creating window output: {output:?}, size: {size:?}, segment: {segment:?}");
         let g = &state.globals;
 
+        /* the surface spans the segment along the crossing axis and is one pixel
+         * wide (or tall) perpendicular to it */
+        let along = segment.1 - segment.0 + 1;
+        if along <= 0 {
+            return None;
+        }
         let (width, height) = match pos {
-            Position::Left | Position::Right => (1, size.1 as u32),
-            Position::Top | Position::Bottom => (size.0 as u32, 1),
+            Position::Left | Position::Right => (1u32, along as u32),
+            Position::Top | Position::Bottom => (along as u32, 1u32),
         };
+        /* Margins are measured from the anchored edges of the output. The last
+         * pixel of the output is at `origin + extent - 1`, so the trailing
+         * margin is that minus the last pixel of the segment. */
+        let (start, end) = match pos {
+            Position::Left | Position::Right => {
+                (segment.0 - origin.1, origin.1 + size.1 - 1 - segment.1)
+            }
+            Position::Top | Position::Bottom => {
+                (segment.0 - origin.0, origin.0 + size.0 - 1 - segment.1)
+            }
+        };
+        let (start, end) = (start.max(0), end.max(0));
         let mut file = match tempfile::tempfile() {
             Ok(f) => f,
             Err(e) => {
@@ -198,21 +253,33 @@ impl Window {
             qh,
             (),
         );
+        /* The edge plus both perpendicular edges: the surface is then stretched
+         * between the two margins along the crossing axis, which is what places
+         * it over exactly the segment a client owns. */
         let anchor = match pos {
-            Position::Left => Anchor::Left,
-            Position::Right => Anchor::Right,
-            Position::Top => Anchor::Top,
-            Position::Bottom => Anchor::Bottom,
+            Position::Left => Anchor::Left | Anchor::Top | Anchor::Bottom,
+            Position::Right => Anchor::Right | Anchor::Top | Anchor::Bottom,
+            Position::Top => Anchor::Top | Anchor::Left | Anchor::Right,
+            Position::Bottom => Anchor::Bottom | Anchor::Left | Anchor::Right,
         };
 
         layer_surface.set_anchor(anchor);
         layer_surface.set_size(width, height);
         layer_surface.set_exclusive_zone(-1);
-        layer_surface.set_margin(0, 0, 0, 0);
+        match pos {
+            Position::Left | Position::Right => {
+                layer_surface.set_margin(start, 0, end, 0);
+            }
+            Position::Top | Position::Bottom => {
+                layer_surface.set_margin(0, end, 0, start);
+            }
+        }
         surface.set_input_region(None);
         surface.commit();
         Some(Window {
             pos,
+            offset: segment.0,
+            axis,
             buffer,
             surface,
             layer_surface,
@@ -227,6 +294,91 @@ impl Drop for Window {
         self.surface.destroy();
         self.buffer.destroy();
     }
+}
+
+/// The span of the whole capture area along the axis an edge is measured on.
+///
+/// Edge ranges are fractions of *this* span, not of the output that happens to
+/// touch them: it is the span the pointer crosses along and the span the
+/// frontend draws, so both agree on what `0-60%` of an edge means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Layout {
+    /// inclusive minimum x of every output
+    x0: i32,
+    /// inclusive maximum x of every output
+    x1: i32,
+    /// inclusive minimum y of every output
+    y0: i32,
+    /// inclusive maximum y of every output
+    y1: i32,
+}
+
+impl Layout {
+    /// The span an edge is measured on.
+    fn axis(&self, pos: Position) -> (i32, i32) {
+        match pos {
+            Position::Left | Position::Right => (self.y0, self.y1),
+            Position::Top | Position::Bottom => (self.x0, self.x1),
+        }
+    }
+
+    /// Width and height of the whole capture area.
+    ///
+    /// The bounds are inclusive, so the extent is one more than their
+    /// difference: two 1920 px outputs side by side span `0..=3839`.
+    fn size(&self) -> (u32, u32) {
+        (
+            self.x1.saturating_sub(self.x0).saturating_add(1) as u32,
+            self.y1.saturating_sub(self.y0).saturating_add(1) as u32,
+        )
+    }
+}
+
+/// Bounding box of every output whose geometry is known.
+fn layout_geometry(outputs: &[Output]) -> Option<Layout> {
+    let infos = outputs
+        .iter()
+        .filter_map(|output| output.info.as_ref())
+        .collect::<Vec<_>>();
+    let first = infos.first()?;
+    let mut layout = Layout {
+        x0: first.position.0,
+        y0: first.position.1,
+        x1: first.position.0 + first.size.0 - 1,
+        y1: first.position.1 + first.size.1 - 1,
+    };
+    for info in infos {
+        layout.x0 = layout.x0.min(info.position.0);
+        layout.y0 = layout.y0.min(info.position.1);
+        layout.x1 = layout.x1.max(info.position.0 + info.size.0 - 1);
+        layout.y1 = layout.y1.max(info.position.1 + info.size.1 - 1);
+    }
+    Some(layout)
+}
+
+/// Where along the whole edge a crossing at `along` happened, as a fraction.
+///
+/// `offset` is where the barrier surface starts in layout coordinates and
+/// `axis` is the span of the whole capture area along the crossing axis.
+fn crossing_fraction(offset: i32, axis: (i32, i32), along: f64) -> f64 {
+    let span = (axis.1 - axis.0 + 1) as f64;
+    if span <= 0.0 {
+        return 0.5;
+    }
+    ((offset as f64 + along - axis.0 as f64) / span).clamp(0.0, 1.0)
+}
+
+/// The inclusive pixel span of an edge range, or `None` if it is empty.
+fn segment_spans(axis: (i32, i32), edge: EdgeRange) -> Option<(i32, i32)> {
+    let span = axis.1 - axis.0 + 1;
+    if span <= 0 {
+        return None;
+    }
+    let scale = |permille: u16| axis.0 + (permille as i64 * span as i64 / 1000) as i32;
+    let lo = scale(edge.start());
+    // `end` is exclusive, so the last pixel of the range is one before it
+    let hi = scale(edge.end()) - 1;
+    (lo <= hi).then_some((lo, hi))
 }
 
 fn get_edges(outputs: &[Output], pos: Position) -> Vec<(Output, i32)> {
@@ -369,8 +521,8 @@ impl LayerShellInputCapture {
         Ok(LayerShellInputCapture(inner))
     }
 
-    fn add_client(&mut self, pos: Position) {
-        self.0.get_mut().state.add_client(pos);
+    fn add_client(&mut self, pos: Position, segments: Vec<EdgeRange>) {
+        self.0.get_mut().state.add_client(pos, segments);
     }
 
     fn delete_client(&mut self, pos: Position) {
@@ -522,12 +674,29 @@ impl State {
         }
     }
 
-    fn add_client(&mut self, pos: Position) {
-        self.active_positions.insert(pos);
+    fn add_client(&mut self, pos: Position, segments: Vec<EdgeRange>) {
+        self.active_positions.insert(pos, segments);
+        self.create_windows(pos);
+    }
+
+    /// Create the barrier surfaces for one position.
+    ///
+    /// The surfaces of that position are dropped first: the segments change as
+    /// clients arrive and leave, and a surface cannot be resized in place
+    /// without a configure round trip.
+    fn create_windows(&mut self, pos: Position) {
+        let Some(segments) = self.active_positions.get(&pos).cloned() else {
+            return;
+        };
+        if self.focused.as_ref().is_some_and(|w| w.pos == pos) {
+            self.ungrab();
+            self.focused = None;
+        }
+        self.active_windows.retain(|w| w.pos != pos);
         let outputs = get_output_configuration(self, pos);
 
         log::info!(
-            "adding capture for position {pos} - using outputs: {:?}",
+            "adding capture for position {pos} - using outputs: {:?}, segments: {}",
             outputs
                 .iter()
                 .map(|o| o
@@ -535,15 +704,52 @@ impl State {
                     .as_ref()
                     .map(|i| i.name.to_owned())
                     .unwrap_or("unknown output".to_owned()))
+                .collect::<Vec<_>>(),
+            segments
+                .iter()
+                .map(EdgeRange::to_string)
                 .collect::<Vec<_>>()
+                .join(" ")
         );
-        outputs.iter().for_each(|o| {
-            if let Some(info) = o.info.as_ref() {
-                if let Some(window) = Window::new(self, &self.qh, &o.wl_output, pos, info.size) {
+        let Some(layout) = layout_geometry(&outputs) else {
+            log::warn!("no output geometry is known, not creating a barrier for {pos}");
+            return;
+        };
+        for segment in &segments {
+            let Some(spans) = segment_spans(layout.axis(pos), *segment) else {
+                continue;
+            };
+            for output in &outputs {
+                let Some(info) = output.info.as_ref() else {
+                    continue;
+                };
+                /* the segment is in layout coordinates; the surface lives on one
+                 * output, so only the part of it that overlaps this output can be
+                 * covered here */
+                let (lo, hi) = match pos {
+                    Position::Left | Position::Right => {
+                        (info.position.1, info.position.1 + info.size.1 - 1)
+                    }
+                    Position::Top | Position::Bottom => {
+                        (info.position.0, info.position.0 + info.size.0 - 1)
+                    }
+                };
+                let segment = (spans.0.max(lo), spans.1.min(hi));
+                if segment.0 > segment.1 {
+                    continue;
+                }
+                let place = Placement {
+                    pos,
+                    size: info.size,
+                    origin: info.position,
+                    segment,
+                    axis: layout.axis(pos),
+                };
+                if let Some(window) = Window::new(self, &self.qh, &output.wl_output, place) {
                     self.active_windows.push(Arc::new(window));
                 }
             }
-        });
+        }
     }
 
     fn update_windows(&mut self) {
@@ -559,9 +765,13 @@ impl State {
         self.focused = None;
         self.active_windows.clear();
 
-        let active_positions = self.active_positions.iter().cloned().collect::<Vec<_>>();
-        for pos in active_positions {
-            self.add_client(pos);
+        let active = self
+            .active_positions
+            .iter()
+            .map(|(pos, segments)| (*pos, segments.clone()))
+            .collect::<Vec<_>>();
+        for (pos, segments) in active {
+            self.add_client(pos, segments);
         }
     }
 }
@@ -630,10 +840,35 @@ impl Inner {
 
 #[async_trait]
 impl Capture for LayerShellInputCapture {
-    async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
-        self.add_client(pos);
+    async fn create(
+        &mut self,
+        pos: Position,
+        segments: Vec<EdgeRange>,
+    ) -> Result<(), CaptureError> {
+        self.add_client(pos, segments);
         let inner = self.0.get_mut();
         Ok(inner.flush_events()?)
+    }
+
+    async fn update(
+        &mut self,
+        pos: Position,
+        segments: Vec<EdgeRange>,
+    ) -> Result<(), CaptureError> {
+        /* replacing the surfaces is the same work as creating them: the
+         * compositor gives no way to move a layer surface's margins without a
+         * configure round trip, and the pointer may be sitting in the segment
+         * that just changed */
+        self.add_client(pos, segments);
+        let inner = self.0.get_mut();
+        Ok(inner.flush_events()?)
+    }
+
+    async fn screen_size(&mut self) -> Option<(u32, u32)> {
+        /* the output list is filled by the event loop, which runs on this task's
+         * polls, so whatever it has seen so far is what is available here */
+        let inner = self.0.get_mut();
+        layout_geometry(&inner.state.outputs).map(|layout| layout.size())
     }
 
     async fn begin(&mut self, _pos: Position) -> Result<(), CaptureError> {
@@ -746,29 +981,34 @@ impl Dispatch<WlPointer, ()> for State {
             wl_pointer::Event::Enter {
                 serial,
                 surface,
-                surface_x: _,
-                surface_y: _,
+                surface_x,
+                surface_y,
             } => {
                 // get client corresponding to the focused surface
-                {
-                    if let Some(window) = app.active_windows.iter().find(|w| w.surface == surface) {
-                        app.focused = Some(window.clone());
-                        app.grab(&surface, pointer, serial, qh);
-                    } else {
-                        return;
-                    }
-                }
-                let pos = app
+                let Some(window) = app
                     .active_windows
                     .iter()
                     .find(|w| w.surface == surface)
-                    .map(|w| w.pos)
-                    .unwrap();
-                // The layer shell backend does not report where on the edge the
-                // pointer left (the protocol only gives the barrier), so the
-                // peer places its cursor in the middle of the edge.
+                    .cloned()
+                else {
+                    return;
+                };
+                app.focused = Some(window.clone());
+                app.grab(&surface, pointer, serial, qh);
+                let pos = window.pos;
+                /* The surface is one pixel thick and spans the segment along the
+                 * crossing axis, so the position inside it says where on that
+                 * segment the pointer arrived. Until now every crossing was
+                 * reported as the middle of the edge, which parked the peer's
+                 * cursor in the middle no matter where the pointer actually
+                 * left - the cursor teleporting when crossing back and forth. */
+                let along = match pos {
+                    Position::Left | Position::Right => surface_y,
+                    Position::Top | Position::Bottom => surface_x,
+                };
+                let fraction = crossing_fraction(window.offset, window.axis, along);
                 app.pending_events
-                    .push_back((pos, CaptureEvent::Begin(0.5)));
+                    .push_back((pos, CaptureEvent::Begin(fraction)));
             }
             wl_pointer::Event::Leave { .. } => {
                 /* There are rare cases, where when a window is opened in
@@ -1075,3 +1315,69 @@ delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore WlSurface);
 delegate_noop!(State: ignore ZwpKeyboardShortcutsInhibitorV1);
 delegate_noop!(State: ignore ZwpLockedPointerV1);
+
+#[cfg(test)]
+mod segment_tests {
+    use super::*;
+
+    fn range(start: f64, end: f64) -> EdgeRange {
+        EdgeRange::from_fractions(start, end).expect("valid range")
+    }
+
+    #[test]
+    fn a_full_range_spans_the_whole_axis() {
+        assert_eq!(segment_spans((0, 1079), EdgeRange::FULL), Some((0, 1079)));
+        // an axis that does not start at zero is spanned from its own start
+        assert_eq!(
+            segment_spans((100, 1179), EdgeRange::FULL),
+            Some((100, 1179))
+        );
+    }
+
+    #[test]
+    fn half_ranges_meet_without_overlapping_or_gapping() {
+        let axis = (0, 1079);
+        let top = range(0.0, 0.5);
+        let bottom = range(0.5, 1.0);
+        let (top_lo, top_hi) = segment_spans(axis, top).expect("top");
+        let (bottom_lo, bottom_hi) = segment_spans(axis, bottom).expect("bottom");
+        assert_eq!(top_hi + 1, bottom_lo);
+        assert_eq!((top_lo, top_hi), (0, 539));
+        assert_eq!((bottom_lo, bottom_hi), (540, 1079));
+    }
+
+    #[test]
+    fn three_ranges_cover_an_edge_exactly() {
+        let axis = (0, 999);
+        let ranges = [
+            range(0.0, 1.0 / 3.0),
+            range(1.0 / 3.0, 2.0 / 3.0),
+            range(2.0 / 3.0, 1.0),
+        ];
+        let spans = ranges
+            .iter()
+            .filter_map(|range| segment_spans(axis, *range))
+            .collect::<Vec<_>>();
+        assert_eq!(spans.len(), 3);
+        for pair in spans.windows(2) {
+            assert_eq!(pair[0].1 + 1, pair[1].0, "{spans:?} leave a gap");
+        }
+        assert_eq!(spans.first().map(|s| s.0), Some(0));
+        assert_eq!(spans.last().map(|s| s.1), Some(999));
+    }
+
+    #[test]
+    fn a_range_narrower_than_a_pixel_yields_no_surface() {
+        // 1 px edge, 1 permille requested: nothing to cover
+        assert_eq!(segment_spans((0, 0), range(0.0, 0.001)), None);
+    }
+
+    #[test]
+    fn the_crossing_point_is_measured_over_the_whole_edge() {
+        // a surface starting at 540 with the pointer 10 px into it
+        assert!((crossing_fraction(540, (0, 1079), 10.0) - 0.51).abs() < 0.002);
+        assert_eq!(crossing_fraction(0, (0, 1079), 0.0), 0.0);
+        // a surface that starts at the layout's own start
+        assert_eq!(crossing_fraction(100, (100, 1179), 0.0), 0.0);
+    }
+}

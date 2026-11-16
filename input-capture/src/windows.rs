@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::task::ready;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
-use super::{Capture, CaptureError, CaptureEvent, Position};
+use super::{Capture, CaptureError, CaptureEvent, EdgeRange, Position};
 
 mod display_util;
 mod event_thread;
@@ -19,9 +19,28 @@ pub struct WindowsInputCapture {
 
 #[async_trait]
 impl Capture for WindowsInputCapture {
-    async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
-        self.event_thread.create(pos);
+    async fn create(
+        &mut self,
+        pos: Position,
+        segments: Vec<EdgeRange>,
+    ) -> Result<(), CaptureError> {
+        self.event_thread.create(pos, segments);
         Ok(())
+    }
+
+    async fn update(
+        &mut self,
+        pos: Position,
+        segments: Vec<EdgeRange>,
+    ) -> Result<(), CaptureError> {
+        /* the hook checks the segments on every crossing, so replacing them is
+         * enough - there is no barrier object to move */
+        self.event_thread.create(pos, segments);
+        Ok(())
+    }
+
+    async fn screen_size(&mut self) -> Option<(u32, u32)> {
+        event_thread::screen_size()
     }
 
     async fn begin(&mut self, _pos: Position) -> Result<(), CaptureError> {

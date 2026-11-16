@@ -1,4 +1,6 @@
-use super::{Capture, CaptureError, CaptureEvent, Position, error::MacosCaptureCreationError};
+use super::{
+    Capture, CaptureError, CaptureEvent, EdgeRange, Position, error::MacosCaptureCreationError,
+};
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core_foundation::{
@@ -89,7 +91,7 @@ use keycode::{KeyMap, KeyMapping};
 use libc::c_void;
 use once_cell::unsync::Lazy;
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     ffi::{CString, c_char},
     pin::Pin,
     sync::{Arc, OnceLock},
@@ -133,8 +135,13 @@ impl Bounds {
 
 #[derive(Debug)]
 struct InputCaptureState {
-    /// active capture positions
-    active_clients: Lazy<HashSet<Position>>,
+    /// the segments of each edge a client can be reached through
+    ///
+    /// The macOS tap owns the local pointer, so unlike the compositor-driven
+    /// backends it can decide, per crossing, whether the point the cursor
+    /// reached the edge at belongs to a client. That is what makes a stretch of
+    /// edge that nobody covers behave like a wall here too.
+    active_clients: Lazy<HashMap<Position, Vec<EdgeRange>>>,
     /// the currently entered capture position, if any
     current_pos: Option<Position>,
     /// position where the cursor was captured
@@ -154,7 +161,7 @@ struct InputCaptureState {
 #[derive(Debug)]
 enum ProducerEvent {
     Release,
-    Create(Position),
+    Create(Position, Vec<EdgeRange>),
     Destroy(Position),
     Grab(Position),
     /// Take the pointer on request (a "switch device" click): grab and pin the
@@ -167,7 +174,7 @@ enum ProducerEvent {
 impl InputCaptureState {
     fn new() -> Result<Self, MacosCaptureCreationError> {
         let mut res = Self {
-            active_clients: Lazy::new(HashSet::new),
+            active_clients: Lazy::new(HashMap::new),
             current_pos: None,
             enter_position: None,
             bounds: Bounds::default(),
@@ -207,21 +214,48 @@ impl InputCaptureState {
             }
         }
 
-        for &position in self.active_clients.iter() {
+        for (&position, segments) in self.active_clients.iter() {
             if self.latched_barrier == Some(position) {
                 continue;
             }
-            if (position == Position::Left && (location.x + relative_x) <= self.bounds.xmin)
-                || (position == Position::Right && (location.x + relative_x) >= self.bounds.xmax)
-                || (position == Position::Top && (location.y + relative_y) <= self.bounds.ymin)
-                || (position == Position::Bottom && (location.y + relative_y) >= self.bounds.ymax)
-            {
+            let crossed = match position {
+                Position::Left => (location.x + relative_x) <= self.bounds.xmin,
+                Position::Right => (location.x + relative_x) >= self.bounds.xmax,
+                Position::Top => (location.y + relative_y) <= self.bounds.ymin,
+                Position::Bottom => (location.y + relative_y) >= self.bounds.ymax,
+            };
+            if !crossed {
+                continue;
+            }
+            /* The tap owns the pointer, so the point of the edge it arrived at is
+             * known: a stretch that no client covers is refused here and the
+             * cursor simply stops at the border instead of switching. */
+            let fraction =
+                self.fraction_at(position, location.x + relative_x, location.y + relative_y);
+            if segments.iter().any(|segment| segment.contains(fraction)) {
                 log::debug!("Crossed barrier into position: {position:?}");
                 self.latched_barrier = Some(position);
                 return Some(position);
             }
+            log::trace!(
+                "the {position} edge was crossed at {:.0}% but no client covers it",
+                fraction * 100.0
+            );
         }
         None
+    }
+
+    /// Where along `position` a cursor at (`x`, `y`) crosses, as a fraction.
+    fn fraction_at(&self, position: Position, x: f64, y: f64) -> f64 {
+        let (lo, hi, value) = match position {
+            Position::Left | Position::Right => (self.bounds.ymin, self.bounds.ymax, y),
+            Position::Top | Position::Bottom => (self.bounds.xmin, self.bounds.xmax, x),
+        };
+        let span = hi - lo;
+        if span <= 0.0 {
+            return 0.5;
+        }
+        ((value - lo) / span).clamp(0.0, 1.0)
     }
 
     // Get the max bounds of all displays
@@ -358,8 +392,8 @@ impl InputCaptureState {
                 self.enter_position = Some(CGPoint::new(x, y));
                 self.reset_cursor()?;
             }
-            ProducerEvent::Create(p) => {
-                self.active_clients.insert(p);
+            ProducerEvent::Create(p, segments) => {
+                self.active_clients.insert(p, segments);
             }
             ProducerEvent::Destroy(p) => {
                 if let Some(current) = self.current_pos {
@@ -927,6 +961,9 @@ pub struct MacOSInputCapture {
     event_tx: UnboundedSender<Result<(Position, CaptureEvent), CaptureError>>,
     notify_tx: Sender<ProducerEvent>,
     run_loop: CFRunLoop,
+    /// The same state the tap and the producer task run on, kept so the display
+    /// geometry can be read without a round trip through the run loop.
+    state: Arc<Mutex<InputCaptureState>>,
 }
 
 impl MacOSInputCapture {
@@ -995,6 +1032,7 @@ impl MacOSInputCapture {
             event_tx: task_event_tx,
             notify_tx,
             run_loop,
+            state: Arc::clone(&state),
         })
     }
 }
@@ -1039,17 +1077,47 @@ impl Drop for MacOSInputCapture {
 
 #[async_trait]
 impl Capture for MacOSInputCapture {
-    async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
+    async fn create(
+        &mut self,
+        pos: Position,
+        segments: Vec<EdgeRange>,
+    ) -> Result<(), CaptureError> {
         // Send synchronously: a detached task could still be pending when
         // `destroy`/`release` arrive, reordering the state updates, and on a
         // quick shutdown the hiding cursor would never be undone.
         log::debug!("creating capture, {pos}");
         self.notify_tx
-            .send(ProducerEvent::Create(pos))
+            .send(ProducerEvent::Create(pos, segments))
             .await
             .map_err(|_| CaptureError::EndOfStream)?;
         log::debug!("done !");
         Ok(())
+    }
+
+    async fn update(
+        &mut self,
+        pos: Position,
+        segments: Vec<EdgeRange>,
+    ) -> Result<(), CaptureError> {
+        /* The tap checks the segments on every crossing, so replacing them is
+         * enough - there is no barrier object to move. */
+        self.notify_tx
+            .send(ProducerEvent::Create(pos, segments))
+            .await
+            .map_err(|_| CaptureError::EndOfStream)?;
+        Ok(())
+    }
+
+    async fn screen_size(&mut self) -> Option<(u32, u32)> {
+        let state = self.state.lock().await;
+        let bounds = &state.bounds;
+        if !bounds.is_valid() {
+            return None;
+        }
+        Some((
+            (bounds.xmax - bounds.xmin).max(0.0) as u32,
+            (bounds.ymax - bounds.ymin).max(0.0) as u32,
+        ))
     }
 
     async fn begin(&mut self, pos: Position) -> Result<(), CaptureError> {

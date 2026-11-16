@@ -23,6 +23,50 @@ fn is_within_dp_boundary(point: (i32, i32), display: &RECT, pos: Position) -> bo
     }
 }
 
+/// Where along `pos` a cursor at `point` crosses the edge, as a fraction of the
+/// whole reachable area.
+///
+/// The fraction is measured over every display rather than over the one the
+/// pointer left: a client owns a segment of the *edge*, and the edge of a
+/// multi-display layout is as tall or as wide as the whole layout. Measuring per
+/// display would make the same stretch mean different things to the client that
+/// routes and to the peer that places the cursor.
+pub(crate) fn crossing_fraction(displays: &[RECT], pos: Position, point: (i32, i32)) -> f64 {
+    let Some((x0, y0, x1, y1)) = layout_bounds(displays) else {
+        return 0.5;
+    };
+    match pos {
+        Position::Left | Position::Right => {
+            let height = (y1 - y0) as f64;
+            if height <= 0.0 {
+                return 0.5;
+            }
+            ((point.1 - y0) as f64 / height).clamp(0.0, 1.0)
+        }
+        Position::Top | Position::Bottom => {
+            let width = (x1 - x0) as f64;
+            if width <= 0.0 {
+                return 0.5;
+            }
+            ((point.0 - x0) as f64 / width).clamp(0.0, 1.0)
+        }
+    }
+}
+
+/// The bounding box of every display, `(left, top, right, bottom)`, exclusive on
+/// the far side, so its extent is `right - left`.
+pub(crate) fn layout_bounds(displays: &[RECT]) -> Option<(i32, i32, i32, i32)> {
+    let first = displays.first()?;
+    let (mut x0, mut y0, mut x1, mut y1) = (first.left, first.top, first.right, first.bottom);
+    for display in displays {
+        x0 = x0.min(display.left);
+        y0 = y0.min(display.top);
+        x1 = x1.max(display.right);
+        y1 = y1.max(display.bottom);
+    }
+    (x1 > x0 && y1 > y0).then_some((x0, y0, x1, y1))
+}
+
 /// the display that contains the given point, if any
 pub(crate) fn display_at(point: (i32, i32), displays: &[RECT]) -> Option<&RECT> {
     displays.iter().find(|&d| is_within_dp_region(point, d))

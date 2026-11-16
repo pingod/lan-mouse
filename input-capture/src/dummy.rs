@@ -8,7 +8,7 @@ use futures_core::Stream;
 use input_event::PointerEvent;
 use tokio::time::{self, Instant, Interval};
 
-use super::{Capture, CaptureError, CaptureEvent, Position};
+use super::{Capture, CaptureError, CaptureEvent, EdgeRange, Position};
 
 pub struct DummyInputCapture {
     start: Option<Instant>,
@@ -34,8 +34,28 @@ impl Default for DummyInputCapture {
 
 #[async_trait]
 impl Capture for DummyInputCapture {
-    async fn create(&mut self, _pos: Position) -> Result<(), CaptureError> {
+    async fn create(
+        &mut self,
+        _pos: Position,
+        _segments: Vec<EdgeRange>,
+    ) -> Result<(), CaptureError> {
         Ok(())
+    }
+
+    async fn update(
+        &mut self,
+        _pos: Position,
+        _segments: Vec<EdgeRange>,
+    ) -> Result<(), CaptureError> {
+        Ok(())
+    }
+
+    async fn screen_size(&mut self) -> Option<(u32, u32)> {
+        /* the dummy backend drives a synthetic pointer over a synthetic screen;
+         * reporting 1920x1080 keeps the arrangement canvas drawing to scale
+         * when the pipeline is exercised without a display
+         */
+        Some((1920, 1080))
     }
 
     async fn begin(&mut self, _pos: Position) -> Result<(), CaptureError> {

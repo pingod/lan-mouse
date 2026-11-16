@@ -3,7 +3,7 @@ use ashpd::{
         Session,
         input_capture::{
             Activated, ActivatedBarrier, Barrier, BarrierID, Capabilities, CreateSessionOptions,
-            InputCapture, Region, ReleaseOptions, Zones,
+            InputCapture, Region, ReleaseOptions,
         },
     },
     enumflags2::BitFlags,
@@ -23,7 +23,10 @@ use std::{
     os::unix::net::UnixStream,
     pin::Pin,
     rc::Rc,
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -38,7 +41,7 @@ use tokio_util::sync::CancellationToken;
 
 use futures_core::Stream;
 
-use input_event::Event;
+use input_event::{EdgeRange, Event};
 
 use crate::CaptureEvent;
 
@@ -71,9 +74,10 @@ fn restart_session_on_device_change() -> bool {
 }
 
 /// events that necessitate restarting the capture session
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum LibeiNotifyEvent {
-    Create(Position),
+    /// a client arrived on this position, or its segments changed
+    Create(Position, Vec<EdgeRange>),
     Destroy(Position),
 }
 
@@ -90,18 +94,141 @@ pub struct LibeiInputCapture {
     notify_release: Arc<Notify>,
     cancellation_token: CancellationToken,
     terminated: bool,
+    /// Size of the capture area as `width << 32 | height`, `0` when unknown.
+    ///
+    /// Written by the capture task whenever it registers barriers. An atomic
+    /// rather than an `Rc<RefCell<..>>` because the trait methods are `Send`.
+    layout_size: Arc<AtomicU64>,
 }
 
-/// returns (start pos, end pos), inclusive
-fn pos_to_barrier(r: &Region, pos: Position) -> (i32, i32, i32, i32) {
-    let (x, y) = (r.x_offset(), r.y_offset());
-    let (w, h) = (r.width() as i32, r.height() as i32);
-    match pos {
-        Position::Left => (x, y, x, y + h - 1),
-        Position::Right => (x + w, y, x + w, y + h - 1),
-        Position::Top => (x, y, x + w - 1, y),
-        Position::Bottom => (x, y + h, x + w - 1, y + h),
+/// Pack a screen size into the [`LibeiInputCapture::layout_size`] atomic.
+fn pack_size(size: Option<(u32, u32)>) -> u64 {
+    match size {
+        Some((width, height)) if width > 0 && height > 0 => ((width as u64) << 32) | height as u64,
+        _ => 0,
     }
+}
+
+/// Unpack [`LibeiInputCapture::layout_size`].
+fn unpack_size(packed: u64) -> Option<(u32, u32)> {
+    if packed == 0 {
+        return None;
+    }
+    let width = (packed >> 32) as u32;
+    let height = packed as u32;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+/// A capture region in layout coordinates.
+///
+/// Extracted from the portal's `Region` so the barrier geometry can be computed
+/// and tested without a compositor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RegionRect {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+impl RegionRect {
+    fn new(region: &Region) -> Self {
+        Self {
+            x: region.x_offset(),
+            y: region.y_offset(),
+            w: region.width() as i32,
+            h: region.height() as i32,
+        }
+    }
+
+    /// last inclusive coordinate of the region along x
+    fn right(&self) -> i32 {
+        self.x + self.w - 1
+    }
+
+    /// last inclusive coordinate of the region along y
+    fn bottom(&self) -> i32 {
+        self.y + self.h - 1
+    }
+}
+
+/// The span of the whole capture area along the axis an edge is measured on.
+///
+/// Edge ranges are fractions of *this* span, not of the display that happens to
+/// touch them: it is the span the pointer crosses along and the span the
+/// frontend draws, so both sides agree on what `0-60%` of an edge means.
+/// `None` when nothing is known or the area is a single pixel wide.
+fn layout_axis(regions: &[RegionRect], pos: Position) -> Option<(i32, i32)> {
+    let first = *regions.first()?;
+    let (mut lo, mut hi) = match pos {
+        Position::Left | Position::Right => (first.y, first.bottom()),
+        Position::Top | Position::Bottom => (first.x, first.right()),
+    };
+    for region in regions {
+        let (start, end) = match pos {
+            Position::Left | Position::Right => (region.y, region.bottom()),
+            Position::Top | Position::Bottom => (region.x, region.right()),
+        };
+        lo = lo.min(start);
+        hi = hi.max(end);
+    }
+    (hi > lo).then_some((lo, hi))
+}
+
+/// The barrier line for one segment of one edge of one region.
+///
+/// `None` when the segment does not touch this region: a display whose edge is
+/// not covered by any client gets no barrier at all, so the pointer hits a wall
+/// there instead of switching to a machine that does not own that part of the
+/// edge.
+fn segment_barrier(
+    region: RegionRect,
+    pos: Position,
+    axis: (i32, i32),
+    edge: EdgeRange,
+) -> Option<(i32, i32, i32, i32)> {
+    /* the line the barrier sits on, and the extent of this region along the
+     * axis the crossing happens on */
+    let (line, region_lo, region_hi) = match pos {
+        Position::Left => (region.x, region.y, region.bottom()),
+        Position::Right => (region.x + region.w, region.y, region.bottom()),
+        Position::Top => (region.y, region.x, region.right()),
+        Position::Bottom => (region.y + region.h, region.x, region.right()),
+    };
+    let span = (axis.1 - axis.0 + 1) as f64;
+    let scale = |permille: u16| axis.0 as f64 + (permille as f64 / 1000.0) * span;
+    /* `end` is exclusive, so the last pixel of the segment is one before it */
+    let lo = scale(edge.start()).round() as i32;
+    let hi = scale(edge.end()).round() as i32 - 1;
+    let lo = lo.max(region_lo);
+    let hi = hi.min(region_hi);
+    if lo > hi {
+        return None;
+    }
+    Some(match pos {
+        Position::Left | Position::Right => (line, lo, line, hi),
+        Position::Top | Position::Bottom => (lo, line, hi, line),
+    })
+}
+
+/// where along the edge a barrier reaches, as a fraction of the whole edge
+///
+/// The portal reports the cursor position when a barrier fires but not which
+/// point of the edge it came from in a form that can be normalized, and until
+/// now every crossing was reported as the middle of the edge - so the peer
+/// always parked its cursor in the middle, no matter where the pointer actually
+/// left. With the barrier geometry known, the crossing point can be recovered
+/// from the cursor position.
+fn crossing_fraction(axis: (i32, i32), cursor: (f32, f32), pos: Position) -> f64 {
+    let span = (axis.1 - axis.0 + 1) as f64;
+    if span <= 0.0 {
+        return 0.5;
+    }
+    let along = match pos {
+        Position::Left | Position::Right => cursor.1 as f64,
+        Position::Top | Position::Bottom => cursor.0 as f64,
+    };
+    ((along - axis.0 as f64) / span).clamp(0.0, 1.0)
 }
 
 /// Ashpd does not expose fields
@@ -126,49 +253,91 @@ impl From<ICBarrier> for Barrier {
     }
 }
 
-fn select_barriers(
-    zones: &Zones,
-    clients: &[Position],
-    next_barrier_id: &mut NonZeroU32,
-) -> (Vec<ICBarrier>, HashMap<BarrierID, Position>) {
-    let mut pos_for_barrier = HashMap::new();
-    let mut barriers: Vec<ICBarrier> = vec![];
+/// The barriers registered for a session, with what is needed to interpret an
+/// activation.
+#[derive(Clone, Default)]
+struct BarrierSet {
+    barriers: Vec<ICBarrier>,
+    /// which position a barrier belongs to
+    pos_for_barrier: HashMap<BarrierID, Position>,
+    /// the span of the capture area along the axis each edge is measured on,
+    /// needed to turn the cursor position of an activation into a fraction of
+    /// the edge
+    axes: HashMap<Position, (i32, i32)>,
+    /// size of the whole capture area, width x height
+    size: Option<(u32, u32)>,
+}
 
-    for pos in clients {
-        let mut client_barriers = zones
-            .regions()
-            .iter()
-            .map(|r| {
+/// The bounding box of every capture region.
+fn regions_size(regions: &[RegionRect]) -> Option<(u32, u32)> {
+    let first = *regions.first()?;
+    let (mut x0, mut y0, mut x1, mut y1) = (first.x, first.y, first.right(), first.bottom());
+    for region in regions {
+        x0 = x0.min(region.x);
+        y0 = y0.min(region.y);
+        x1 = x1.max(region.right());
+        y1 = y1.max(region.bottom());
+    }
+    /* the bounds are inclusive: two 1920 px regions side by side span 0..=3839 */
+    Some((
+        x1.saturating_sub(x0).saturating_add(1) as u32,
+        y1.saturating_sub(y0).saturating_add(1) as u32,
+    ))
+}
+
+/// One barrier per segment per region that the segment touches.
+///
+/// A segment on a display that is only partly covered yields a barrier over just
+/// the covered part, so a crossing outside it does not fire at all.
+fn select_barriers(
+    regions: &[RegionRect],
+    clients: &[(Position, Vec<EdgeRange>)],
+    next_barrier_id: &mut NonZeroU32,
+) -> BarrierSet {
+    let mut set = BarrierSet {
+        size: regions_size(regions),
+        ..BarrierSet::default()
+    };
+    for (pos, edges) in clients {
+        let Some(axis) = layout_axis(regions, *pos) else {
+            log::warn!("no capture region is known, not creating a barrier for {pos}");
+            continue;
+        };
+        set.axes.insert(*pos, axis);
+        for edge in edges {
+            for region in regions {
+                let Some(position) = segment_barrier(*region, *pos, axis, *edge) else {
+                    continue;
+                };
                 let id = *next_barrier_id;
                 // ids wrap around instead of overflowing after 4 billion barriers
                 *next_barrier_id = next_barrier_id.checked_add(1).unwrap_or(NonZeroU32::MIN);
-                let position = pos_to_barrier(r, *pos);
-                pos_for_barrier.insert(id, *pos);
-                ICBarrier::new(id, position)
-            })
-            .collect();
-        barriers.append(&mut client_barriers);
+                set.pos_for_barrier.insert(id, *pos);
+                set.barriers.push(ICBarrier::new(id, position));
+            }
+        }
     }
-    (barriers, pos_for_barrier)
+    set
 }
 
 async fn update_barriers(
     input_capture: &InputCapture,
     session: &Session<InputCapture>,
-    active_clients: &[Position],
+    active_clients: &[(Position, Vec<EdgeRange>)],
     next_barrier_id: &mut NonZeroU32,
-) -> Result<(Vec<ICBarrier>, HashMap<BarrierID, Position>), ashpd::Error> {
+) -> Result<BarrierSet, ashpd::Error> {
     let zones = input_capture
         .zones(session, Default::default())
         .await?
         .response()?;
     log::debug!("zones: {zones:?}");
 
-    let (barriers, id_map) = select_barriers(&zones, active_clients, next_barrier_id);
-    log::debug!("barriers: {barriers:?}");
-    log::debug!("client for barrier id: {id_map:?}");
+    let regions: Vec<RegionRect> = zones.regions().iter().map(RegionRect::new).collect();
+    let set = select_barriers(&regions, active_clients, next_barrier_id);
+    log::debug!("barriers: {:?}", set.barriers);
+    log::debug!("client for barrier id: {:?}", set.pos_for_barrier);
 
-    let ashpd_barriers: Vec<Barrier> = barriers.iter().copied().map(|b| b.into()).collect();
+    let ashpd_barriers: Vec<Barrier> = set.barriers.iter().copied().map(|b| b.into()).collect();
     let response = input_capture
         .set_pointer_barriers(
             session,
@@ -179,7 +348,7 @@ async fn update_barriers(
         .await?;
     let response = response.response()?;
     log::debug!("{response:?}");
-    Ok((barriers, id_map))
+    Ok(set)
 }
 
 /// The coordinate of the barrier line that was actually crossed.
@@ -238,11 +407,12 @@ fn crossed_barrier_edge_of(
 ///
 /// Only the position matters: barrier ids are handed out from a counter that
 /// changes on every rebuild, so comparing ids would report a change every time.
-fn barriers_unchanged(candidate: &[ICBarrier], current: &[ICBarrier]) -> bool {
-    candidate.len() == current.len()
+fn barriers_unchanged(candidate: &BarrierSet, current: &BarrierSet) -> bool {
+    candidate.barriers.len() == current.barriers.len()
         && candidate
+            .barriers
             .iter()
-            .zip(current.iter())
+            .zip(current.barriers.iter())
             .all(|(a, b)| a.position == b.position)
 }
 
@@ -254,26 +424,32 @@ fn barriers_unchanged(candidate: &[ICBarrier], current: &[ICBarrier]) -> bool {
 async fn refresh_barriers_if_changed(
     input_capture: &InputCapture,
     session: &Session<InputCapture>,
-    active_clients: &[Position],
-    next_barrier_id: &mut NonZeroU32,
-    current: &[ICBarrier],
-) -> Result<Option<(Vec<ICBarrier>, HashMap<BarrierID, Position>)>, ashpd::Error> {
+    active_clients: &[(Position, Vec<EdgeRange>)],
+    state: &mut SessionState<'_>,
+    current: &BarrierSet,
+) -> Result<Option<BarrierSet>, ashpd::Error> {
     let zones = input_capture
         .zones(session, Default::default())
         .await?
         .response()?;
 
     // Compare the geometry we would register now against what is registered.
-    let mut probe = *next_barrier_id;
-    let (candidate, _) = select_barriers(&zones, active_clients, &mut probe);
+    let regions: Vec<RegionRect> = zones.regions().iter().map(RegionRect::new).collect();
+    let mut probe = *state.next_barrier_id;
+    let candidate = select_barriers(&regions, active_clients, &mut probe);
 
     if barriers_unchanged(&candidate, current) {
         return Ok(None);
     }
 
-    let (barriers, id_map) =
-        update_barriers(input_capture, session, active_clients, next_barrier_id).await?;
-    Ok(Some((barriers, id_map)))
+    let set = update_barriers(
+        input_capture,
+        session,
+        active_clients,
+        state.next_barrier_id,
+    )
+    .await?;
+    Ok(Some(set))
 }
 
 async fn create_session(
@@ -338,6 +514,7 @@ impl LibeiInputCapture {
         let notify_release = Arc::new(Notify::new());
 
         let cancellation_token = CancellationToken::new();
+        let layout_size = Arc::new(AtomicU64::new(0));
 
         let capture = do_capture(
             Arc::clone(&input_capture),
@@ -346,6 +523,7 @@ impl LibeiInputCapture {
             first_session,
             event_tx,
             cancellation_token.clone(),
+            Arc::clone(&layout_size),
         );
         let capture_task = tokio::task::spawn_local(capture);
 
@@ -357,6 +535,7 @@ impl LibeiInputCapture {
             notify_release,
             cancellation_token,
             terminated: false,
+            layout_size,
         };
 
         Ok(producer)
@@ -370,12 +549,16 @@ async fn do_capture(
     session: Option<(Session<InputCapture>, BitFlags<Capabilities>)>,
     event_tx: Sender<(Position, CaptureEvent)>,
     cancellation_token: CancellationToken,
+    layout_size: Arc<AtomicU64>,
 ) -> Result<(), CaptureError> {
     let mut session = session.map(|s| s.0);
 
     /* the task owns the `Arc`, so this borrow is valid for the whole task */
     let input_capture = input_capture.as_ref();
-    let mut active_clients: Vec<Position> = vec![];
+    /* one entry per position: the segments of every client that shares it
+     * are resolved by the caller, so the barriers cover exactly the parts of
+     * the edge that are owned */
+    let mut active_clients: Vec<(Position, Vec<EdgeRange>)> = vec![];
     let mut next_barrier_id = NonZeroU32::new(1).expect("id must be non-zero");
 
     let mut zones_changed = input_capture.receive_zones_changed().await?;
@@ -426,12 +609,16 @@ async fn do_capture(
                 None => create_session(input_capture).await?.0,
             };
 
+            let mut state = SessionState {
+                next_barrier_id: &mut next_barrier_id,
+                layout_size: &layout_size,
+            };
             let capture_session = do_capture_session(
                 input_capture,
                 &mut session,
                 &event_tx,
                 &active_clients,
-                &mut next_barrier_id,
+                &mut state,
                 &notify_release,
                 (cancel_session.clone(), cancel_update.clone()),
             );
@@ -457,8 +644,13 @@ async fn do_capture(
         // update clients if requested
         if let Some(event) = capture_event_occured.take() {
             match event {
-                LibeiNotifyEvent::Create(p) => active_clients.push(p),
-                LibeiNotifyEvent::Destroy(p) => active_clients.retain(|&pos| pos != p),
+                LibeiNotifyEvent::Create(p, edges) => {
+                    match active_clients.iter_mut().find(|(pos, _)| *pos == p) {
+                        Some(entry) => entry.1 = edges,
+                        None => active_clients.push((p, edges)),
+                    }
+                }
+                LibeiNotifyEvent::Destroy(p) => active_clients.retain(|(pos, _)| *pos != p),
             }
         }
 
@@ -469,12 +661,23 @@ async fn do_capture(
     }
 }
 
+/// The bookkeeping that has to survive a capture session.
+///
+/// Barrier ids must not be reused across sessions (the portal keeps the old ones
+/// registered until the session is closed), and the layout size is discovered
+/// inside a session, where the zones are actually read, but published for the
+/// frontend to pick up at any time.
+struct SessionState<'a> {
+    next_barrier_id: &'a mut NonZeroU32,
+    layout_size: &'a AtomicU64,
+}
+
 async fn do_capture_session(
     input_capture: &InputCapture,
     session: &mut Session<InputCapture>,
     event_tx: &Sender<(Position, CaptureEvent)>,
-    active_clients: &[Position],
-    next_barrier_id: &mut NonZeroU32,
+    active_clients: &[(Position, Vec<EdgeRange>)],
+    state: &mut SessionState<'_>,
     notify_release: &Notify,
     cancel: (CancellationToken, CancellationToken),
 ) -> Result<(), CaptureError> {
@@ -486,8 +689,16 @@ async fn do_capture_session(
     let (context, _conn, ei_event_stream) = connect_to_eis(input_capture, session).await?;
 
     // set barriers
-    let (barriers, pos_for_barrier_id) =
-        update_barriers(input_capture, session, active_clients, next_barrier_id).await?;
+    let mut barrier_set = update_barriers(
+        input_capture,
+        session,
+        active_clients,
+        state.next_barrier_id,
+    )
+    .await?;
+    state
+        .layout_size
+        .store(pack_size(barrier_set.size), Ordering::Relaxed);
 
     log::debug!("enabling session");
     input_capture.enable(session, Default::default()).await?;
@@ -523,10 +734,7 @@ async fn do_capture_session(
         // receiver for activation tokens
         let mut activated = input_capture.receive_activated().await?;
         let mut ei_devices_changed = false;
-        // Barriers are rebuilt when the display layout changes; the originals
-        // stay in scope so a refresh can replace them.
-        let mut barriers = barriers;
-        let mut pos_for_barrier_id = pos_for_barrier_id;
+        // `barrier_set` is moved into this task and replaced on a refresh.
         // Display layout can change while we run (monitor unplugged, mode
         // switch). The zones the compositor reports then no longer match the
         // barriers we registered, so the pointer can never cross back — the
@@ -561,21 +769,23 @@ async fn do_capture_session(
                         Some(ActivatedBarrier::Barrier(id)) => Some(id),
                         // workaround for KDE plasma not reporting barrier ids
                         Some(ActivatedBarrier::UnknownBarrier) | None => {
-                            cursor_position.and_then(|p| find_corresponding_client(&barriers, p))
+                            cursor_position.and_then(|p| {
+                                find_corresponding_client(&barrier_set.barriers, p)
+                            })
                         }
                     };
 
                     // find client corresponding to barrier
                     let pos = barrier_id
-                        .and_then(|id| pos_for_barrier_id.get(&id).copied())
+                        .and_then(|id| barrier_set.pos_for_barrier.get(&id).copied())
                         .or_else(|| {
                             let cursor_position = cursor_position?;
                             // The compositor reported a barrier id that we did not
                             // create (or none at all): fall back to the closest
                             // barrier instead of panicking.
                             log::warn!("invalid barrier id {barrier_id:?}, using the closest barrier");
-                            find_corresponding_client(&barriers, cursor_position)
-                                .and_then(|id| pos_for_barrier_id.get(&id).copied())
+                            find_corresponding_client(&barrier_set.barriers, cursor_position)
+                                .and_then(|id| barrier_set.pos_for_barrier.get(&id).copied())
                         });
 
                     let Some(pos) = pos else {
@@ -584,12 +794,25 @@ async fn do_capture_session(
                     };
                     current_pos.replace(Some(pos));
 
-                    // client entered => send event
-                    // The portal reports the cursor position but not the
-                    // screen edge it belongs to in a form we could normalize,
-                    // so the peer places its cursor in the middle of the edge.
+                    /* client entered => send event.
+                     *
+                     * The portal reports the cursor position, and the barrier
+                     * geometry says how wide the edge is, so the point the
+                     * pointer crossed can be recovered. Reporting the middle of
+                     * the edge for every crossing - which is what happened while
+                     * this was hardcoded to 0.5 - parks the peer's cursor in the
+                     * middle too, which is what made crossing back and forth feel
+                     * like the cursor teleporting. */
+                    let fraction = match (barrier_set.axes.get(&pos), cursor_position) {
+                        (Some(axis), Some(cursor)) => {
+                            crossing_fraction(*axis, cursor, pos)
+                        }
+                        /* a compositor that reports neither the axis nor the
+                         * cursor cannot be helped: keep the old behaviour */
+                        _ => 0.5,
+                    };
                     if event_tx
-                        .send((pos, CaptureEvent::Begin(0.5)))
+                        .send((pos, CaptureEvent::Begin(fraction)))
                         .await
                         .is_err()
                     {
@@ -611,7 +834,8 @@ async fn do_capture_session(
                         },
                     }
 
-                    release_capture(input_capture, session, activated, pos, &barriers).await?;
+                    release_capture(input_capture, session, activated, pos, &barrier_set.barriers)
+                        .await?;
 
                     // The session is no longer capturing: stop forwarding
                     // events to the client we just left, otherwise events left
@@ -635,18 +859,20 @@ async fn do_capture_session(
                         input_capture,
                         session,
                         active_clients,
-                        next_barrier_id,
-                        &barriers,
+                        state,
+                        &barrier_set,
                     )
                     .await
                     {
-                        Ok(Some((new_barriers, new_map))) => {
+                        Ok(Some(set)) => {
                             log::info!(
                                 "display layout changed — rebuilding {} barrier(s)",
-                                new_barriers.len()
+                                set.barriers.len()
                             );
-                            barriers = new_barriers;
-                            pos_for_barrier_id = new_map;
+                            state
+                                .layout_size
+                                .store(pack_size(set.size), Ordering::Relaxed);
+                            barrier_set = set;
                         }
                         Ok(None) => log::trace!("barrier layout unchanged"),
                         Err(e) => log::warn!("could not refresh barriers: {e}"),
@@ -827,10 +1053,28 @@ impl LanMouseInputCapture for LibeiInputCapture {
         Err(CaptureError::BeginUnsupported)
     }
 
-    async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
+    async fn create(
+        &mut self,
+        pos: Position,
+        segments: Vec<EdgeRange>,
+    ) -> Result<(), CaptureError> {
         let _ = self
             .notify_capture
-            .send(LibeiNotifyEvent::Create(pos))
+            .send(LibeiNotifyEvent::Create(pos, segments))
+            .await;
+        Ok(())
+    }
+
+    async fn update(
+        &mut self,
+        pos: Position,
+        segments: Vec<EdgeRange>,
+    ) -> Result<(), CaptureError> {
+        /* the same message as a new client: the task replaces the segments it
+         * registers for this position */
+        let _ = self
+            .notify_capture
+            .send(LibeiNotifyEvent::Create(pos, segments))
             .await;
         Ok(())
     }
@@ -841,6 +1085,10 @@ impl LanMouseInputCapture for LibeiInputCapture {
             .send(LibeiNotifyEvent::Destroy(pos))
             .await;
         Ok(())
+    }
+
+    async fn screen_size(&mut self) -> Option<(u32, u32)> {
+        unpack_size(self.layout_size.load(Ordering::Relaxed))
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
@@ -933,6 +1181,19 @@ mod barrier_tests {
         ICBarrier::new(id(barrier_id), position)
     }
 
+    /// A barrier set holding exactly these barriers: only the geometry is
+    /// compared, so the rest of the set is irrelevant here.
+    fn set(barriers: Vec<ICBarrier>) -> BarrierSet {
+        BarrierSet {
+            barriers,
+            ..BarrierSet::default()
+        }
+    }
+
+    fn region(x: i32, y: i32, w: i32, h: i32) -> RegionRect {
+        RegionRect { x, y, w, h }
+    }
+
     #[test]
     fn park_position_uses_the_barrier_line_not_the_reported_cursor() {
         // The compositor reported an out-of-range cursor (Hyprland does this
@@ -963,8 +1224,8 @@ mod barrier_tests {
 
     #[test]
     fn identical_geometry_is_unchanged() {
-        let a = vec![barrier((0, 0, 10, 0))];
-        let b = vec![barrier((0, 0, 10, 0))];
+        let a = set(vec![barrier((0, 0, 10, 0))]);
+        let b = set(vec![barrier((0, 0, 10, 0))]);
         assert!(barriers_unchanged(&a, &b));
     }
 
@@ -972,22 +1233,151 @@ mod barrier_tests {
     fn moved_edge_is_a_change() {
         // A display rearrangement moves the top edge; the barrier must be
         // rebuilt or the pointer can never cross back (issue #512).
-        let a = vec![barrier((0, 0, 10, 0))];
-        let b = vec![barrier((0, -100, 10, -100))];
+        let a = set(vec![barrier((0, 0, 10, 0))]);
+        let b = set(vec![barrier((0, -100, 10, -100))]);
         assert!(!barriers_unchanged(&a, &b));
     }
 
     #[test]
     fn different_barrier_count_is_a_change() {
-        let a = vec![barrier((0, 0, 10, 0))];
-        let b = vec![barrier((0, 0, 10, 0)), barrier((0, 20, 10, 20))];
+        let a = set(vec![barrier((0, 0, 10, 0))]);
+        let b = set(vec![barrier((0, 0, 10, 0)), barrier((0, 20, 10, 20))]);
         assert!(!barriers_unchanged(&a, &b));
     }
 
     #[test]
     fn ids_are_ignored() {
-        let a = vec![ICBarrier::new(id(1), (0, 0, 10, 0))];
-        let b = vec![ICBarrier::new(id(7), (0, 0, 10, 0))];
+        let a = set(vec![ICBarrier::new(id(1), (0, 0, 10, 0))]);
+        let b = set(vec![ICBarrier::new(id(7), (0, 0, 10, 0))]);
         assert!(barriers_unchanged(&a, &b));
+    }
+
+    #[test]
+    fn a_full_range_spans_the_whole_edge_of_one_display() {
+        let regions = [region(0, 0, 1920, 1080)];
+        let axis = layout_axis(&regions, Position::Right).expect("axis");
+        assert_eq!(axis, (0, 1079));
+        assert_eq!(
+            segment_barrier(regions[0], Position::Right, axis, EdgeRange::FULL),
+            Some((1920, 0, 1920, 1079))
+        );
+    }
+
+    #[test]
+    fn a_half_range_spans_half_the_edge() {
+        let regions = [region(0, 0, 1920, 1080)];
+        let axis = layout_axis(&regions, Position::Right).expect("axis");
+        let top = EdgeRange::from_fractions(0.0, 0.5).expect("range");
+        let bottom = EdgeRange::from_fractions(0.5, 1.0).expect("range");
+        assert_eq!(
+            segment_barrier(regions[0], Position::Right, axis, top),
+            Some((1920, 0, 1920, 539))
+        );
+        assert_eq!(
+            segment_barrier(regions[0], Position::Right, axis, bottom),
+            Some((1920, 540, 1920, 1079))
+        );
+    }
+
+    #[test]
+    fn the_axis_is_the_whole_layout_not_one_display() {
+        // Two 1080 px displays stacked: a client owning the bottom half of the
+        // right edge reaches the lower display only, and the ranges are measured
+        // over both displays.
+        let regions = [region(0, 0, 1920, 1080), region(0, 1080, 1920, 1080)];
+        let axis = layout_axis(&regions, Position::Right).expect("axis");
+        assert_eq!(axis, (0, 2159));
+        let bottom = EdgeRange::from_fractions(0.5, 1.0).expect("range");
+        // the lower display carries the bottom half of the edge ...
+        assert_eq!(
+            segment_barrier(regions[1], Position::Right, axis, bottom),
+            Some((1920, 1080, 1920, 2159))
+        );
+        // ... and the upper one is entirely outside that range, so it gets no
+        // barrier at all: the pointer cannot leave the layout there
+        assert_eq!(
+            segment_barrier(regions[0], Position::Right, axis, bottom),
+            None
+        );
+        let top = EdgeRange::from_fractions(0.0, 0.5).expect("range");
+        assert_eq!(
+            segment_barrier(regions[0], Position::Right, axis, top),
+            Some((1920, 0, 1920, 1079))
+        );
+    }
+
+    #[test]
+    fn a_range_outside_the_axis_yields_no_barrier() {
+        let regions = [region(0, 0, 1920, 1080)];
+        let axis = layout_axis(&regions, Position::Top).expect("axis");
+        assert_eq!(axis, (0, 1919));
+        let right_half = EdgeRange::from_fractions(0.5, 1.0).expect("range");
+        assert_eq!(
+            segment_barrier(regions[0], Position::Top, axis, right_half),
+            Some((960, 0, 1919, 0))
+        );
+    }
+
+    #[test]
+    fn the_crossing_point_is_reported_as_a_fraction_of_the_edge() {
+        let axis = (0, 1079);
+        assert_eq!(crossing_fraction(axis, (1920., 0.), Position::Right), 0.0);
+        assert_eq!(crossing_fraction(axis, (1920., 540.), Position::Right), 0.5);
+        /* The span is the height of the edge in pixels, so the last pixel reads
+         * 1079/1080 rather than exactly 1.0 - the same reading the macOS and
+         * Windows backends give. What matters is that it still falls inside the
+         * range that ends at the far end of the edge. */
+        let last = crossing_fraction(axis, (1920., 1079.), Position::Right);
+        assert!(last > 0.999 && last < 1.0, "{last}");
+        let bottom_half = EdgeRange::from_fractions(0.5, 1.0).expect("range");
+        assert!(bottom_half.contains(last));
+        // the horizontal axis for a top edge
+        assert_eq!(
+            crossing_fraction((0, 1919), (480., 0.), Position::Top),
+            0.25
+        );
+        // a compositor reporting an out-of-range cursor is clamped
+        assert_eq!(
+            crossing_fraction(axis, (1920., 4000.), Position::Right),
+            1.0
+        );
+        assert_eq!(crossing_fraction(axis, (1920., -50.), Position::Right), 0.0);
+    }
+
+    #[test]
+    fn select_barriers_creates_one_per_segment_and_region() {
+        let regions = [region(0, 0, 100, 100)];
+        let mut next = NonZeroU32::new(1).expect("nonzero");
+        let top = EdgeRange::from_fractions(0.0, 0.5).expect("range");
+        let bottom = EdgeRange::from_fractions(0.5, 1.0).expect("range");
+        let clients = [(Position::Right, vec![top, bottom])];
+        let set = select_barriers(&regions, &clients, &mut next);
+        assert_eq!(set.barriers.len(), 2);
+        assert_eq!(set.barriers[0].position, (100, 0, 100, 49));
+        assert_eq!(set.barriers[1].position, (100, 50, 100, 99));
+        assert_eq!(set.size, Some((100, 100)));
+        // every barrier maps back to the position it was created for
+        for barrier in &set.barriers {
+            assert_eq!(
+                set.pos_for_barrier.get(&barrier.barrier_id),
+                Some(&Position::Right)
+            );
+        }
+    }
+
+    #[test]
+    fn an_uncovered_edge_gets_no_barrier() {
+        let regions = [region(0, 0, 100, 100)];
+        let mut next = NonZeroU32::new(1).expect("nonzero");
+        let set = select_barriers(&regions, &[(Position::Right, vec![])], &mut next);
+        assert!(set.barriers.is_empty());
+    }
+
+    #[test]
+    fn no_region_means_no_axis_means_no_barrier() {
+        let mut next = NonZeroU32::new(1).expect("nonzero");
+        let set = select_barriers(&[], &[(Position::Right, vec![EdgeRange::FULL])], &mut next);
+        assert!(set.barriers.is_empty());
+        assert_eq!(set.size, None);
     }
 }

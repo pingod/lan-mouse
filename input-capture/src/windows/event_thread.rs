@@ -1,9 +1,9 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ptr::addr_of_mut;
 
 use std::default::Default;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use tokio::sync::mpsc::UnboundedSender;
@@ -27,7 +27,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use input_event::{
-    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, Event, KeyboardEvent, PointerEvent,
+    BTN_BACK, BTN_FORWARD, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, EdgeRange, Event, KeyboardEvent,
+    PointerEvent,
     scancode::{self, Linux},
 };
 
@@ -54,8 +55,8 @@ impl EventThread {
         self.signal(RequestType::Release);
     }
 
-    pub(crate) fn create(&self, pos: Position) {
-        self.client_update(ClientUpdate::Create(pos));
+    pub(crate) fn create(&self, pos: Position, segments: Vec<EdgeRange>) {
+        self.client_update(ClientUpdate::Create(pos, segments));
     }
 
     pub(crate) fn destroy(&self, pos: Position) {
@@ -102,7 +103,7 @@ enum RequestType {
 }
 
 enum ClientUpdate {
-    Create(Position),
+    Create(Position, Vec<EdgeRange>),
     Destroy(Position),
 }
 
@@ -126,8 +127,8 @@ fn send_event(pos: Position, event: CaptureEvent) {
 }
 
 thread_local! {
-    /// all configured clients
-    static CLIENTS: RefCell<HashSet<Position>> = RefCell::new(HashSet::new());
+    /// the segments of each edge a client can be reached through
+    static CLIENTS: RefCell<HashMap<Position, Vec<EdgeRange>>> = RefCell::new(HashMap::new());
     /// currently active client
     static ACTIVE_CLIENT: Cell<Option<Position>> = const { Cell::new(None) };
     /// input event channel
@@ -312,8 +313,28 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
         return ret;
     };
 
-    /* check if a client is registered for the barrier */
-    if !CLIENTS.with_borrow(|clients| clients.contains(&pos)) {
+    /* where along the edge the pointer left this machine, as a fraction of the
+     * whole reachable area: the ranges a client owns are measured over the whole
+     * edge, not over the display it happens to touch */
+    let fraction = DISPLAYS
+        .with_borrow(|(displays, _)| display_util::crossing_fraction(displays, pos, prev_pos));
+
+    /* check if a client owns this stretch of the barrier */
+    let owned = CLIENTS.with_borrow(|clients| {
+        clients
+            .get(&pos)
+            .is_some_and(|segments| segments.iter().any(|segment| segment.contains(fraction)))
+    });
+    if !owned {
+        if CLIENTS.with_borrow(|clients| clients.contains_key(&pos)) {
+            /* The edge has clients, just none for this stretch, so the pointer
+             * stops at the border instead of switching. Windows clamps the
+             * cursor to the virtual screen, so nothing has to be corrected. */
+            log::trace!(
+                "the {pos} edge was crossed at {:.0}% but no client covers it",
+                fraction * 100.0
+            );
+        }
         return ret;
     }
 
@@ -324,25 +345,6 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     });
     /* motion deltas are measured from the entry point on */
     LAST_POS.replace(entry_point);
-
-    /* notify main thread */
-    /* where along the edge the pointer left this display */
-    let fraction = DISPLAYS.with_borrow(|(displays, _)| {
-        let Some(display) = display_util::display_at(prev_pos, displays) else {
-            return 0.5;
-        };
-        let width = (display.right - display.left) as f64;
-        let height = (display.bottom - display.top) as f64;
-        match pos {
-            Position::Top | Position::Bottom if width > 0.0 => {
-                ((prev_pos.0 - display.left) as f64 / width).clamp(0.0, 1.0)
-            }
-            Position::Left | Position::Right if height > 0.0 => {
-                ((prev_pos.1 - display.top) as f64 / height).clamp(0.0, 1.0)
-            }
-            _ => 0.5,
-        }
-    });
 
     log::debug!(
         "ENTERED @ {prev_pos:?} -> {curr_pos:?} at {:.0}%",
@@ -409,12 +411,32 @@ unsafe extern "system" fn window_proc(
 }
 
 static DISPLAY_RESOLUTION_GENERATION: AtomicI32 = AtomicI32::new(1);
+/// Size of the whole display layout as `width << 32 | height`, `0` when nothing
+/// is known. Written by the event thread whenever it enumerates the displays and
+/// read by [`super::WindowsInputCapture::screen_size`], which cannot use the
+/// thread-local display list.
+static SCREEN_SIZE: AtomicU64 = AtomicU64::new(0);
+
+/// Read the published layout size.
+pub(crate) fn screen_size() -> Option<(u32, u32)> {
+    let packed = SCREEN_SIZE.load(Ordering::Acquire);
+    if packed == 0 {
+        return None;
+    }
+    Some(((packed >> 32) as u32, packed as u32))
+}
 
 fn update_display_regions(displays: &mut Vec<RECT>, generation: &mut i32) {
     let global_generation = DISPLAY_RESOLUTION_GENERATION.load(Ordering::Acquire);
     if *generation != global_generation {
         enumerate_displays(displays);
         log::debug!("displays: {displays:?}");
+        let size = display_util::layout_bounds(displays);
+        SCREEN_SIZE.store(
+            size.map(|(x0, y0, x1, y1)| ((x1 - x0).max(0) as u64) << 32 | (y1 - y0).max(0) as u64)
+                .unwrap_or(0),
+            Ordering::Release,
+        );
         *generation = global_generation;
     }
 }
@@ -470,8 +492,8 @@ fn enumerate_displays(display_rects: &mut Vec<RECT>) {
 
 fn update_clients(request: ClientUpdate) {
     match request {
-        ClientUpdate::Create(pos) => {
-            CLIENTS.with_borrow_mut(|clients| clients.insert(pos));
+        ClientUpdate::Create(pos, segments) => {
+            CLIENTS.with_borrow_mut(|clients| clients.insert(pos, segments));
         }
         ClientUpdate::Destroy(pos) => {
             if let Some(active_pos) = ACTIVE_CLIENT.get() {
