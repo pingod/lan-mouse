@@ -976,10 +976,18 @@ impl Window {
         row.set_hooks(client.cmd, client.leave_cmd);
         /* The canvas reads the link off the ClientObject, so the ranges have to
          * land there: a change made by the CLI or the config file would otherwise
-         * not show up until the row was rebuilt. */
+         * not show up until the row was rebuilt.
+         *
+         * Only the ranges. The hostname and the position are written by
+         * `row.set_hostname`/`set_position` above, which block the row's own
+         * `changed` handlers while they do it. Writing those two properties here
+         * as well would go through the property binding instead, which does not
+         * block anything: the entry would fire `changed`, the window would ask the
+         * daemon to set the hostname, the daemon would broadcast, and this function
+         * would write the property again - a loop that rewrote the config file
+         * hundreds of times a second.
+         */
         if let Some(object) = self.client_object_for_handle(handle) {
-            object.set_property("hostname", client.hostname);
-            object.set_property("position", client.pos.to_string());
             object.set_property("edge-start", client.edge.start() as u32);
             object.set_property("edge-end", client.edge.end() as u32);
             object.set_property("peer-edge-start", client.peer_edge.start() as u32);
