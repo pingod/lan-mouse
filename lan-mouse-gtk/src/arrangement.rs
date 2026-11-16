@@ -489,6 +489,10 @@ impl State {
         if mine.is_empty() {
             /* the picture does not describe this machine - drawing nothing would be
              * worse than drawing this side's own derivation */
+            log::warn!(
+                "cannot adopt the peer's arrangement: it has {} machine(s) but none of them is this one",
+                picture.machines.len()
+            );
             return;
         }
         self.local_displays = mine.iter().map(display_of).collect();
@@ -1085,8 +1089,30 @@ impl Canvas {
                     state.published.clear();
                 }
                 state.machines = machines.to_vec();
-                if let Some(picture) = state.newer_peer_picture() {
-                    state.adopt(&picture);
+                match state.newer_peer_picture() {
+                    Some(picture) => {
+                        log::info!(
+                            "the peer's arrangement wins (revision {} vs local {}): adopting its {} machine(s)",
+                            picture.revision,
+                            state.local_revision,
+                            picture.machines.len()
+                        );
+                        state.adopt(&picture);
+                    }
+                    None => {
+                        let received = state
+                            .machines
+                            .iter()
+                            .filter(|machine| machine.peer_picture.is_some())
+                            .count();
+                        if received > 0 {
+                            log::info!(
+                                "keeping the local arrangement (revision {}); the peer's {} picture(s) are not newer",
+                                state.local_revision,
+                                received
+                            );
+                        }
+                    }
                 }
             }
         }
