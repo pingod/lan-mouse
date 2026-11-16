@@ -245,7 +245,7 @@ impl State {
         /* `place_all` rather than `place`: two peers whose cards overlap along the
          * edge have to be drawn in successive lanes, or one hides the other and
          * the canvas looks like a layout that cannot exist */
-        layout::place_all(local, &placements)
+        layout::place_all(local, &self.local_monitors(), &placements)
     }
 
     /// Map canvas coordinates to layout coordinates.
@@ -926,7 +926,7 @@ fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
                 original.w,
                 original.h,
             );
-            let placement = layout::snap(local, current);
+            let placement = layout::snap(local, &state.local_monitors(), current);
             if let Some(drag) = state.drag.as_mut() {
                 drag.current = current;
                 drag.placement = placement;
@@ -1643,6 +1643,12 @@ mod render {
         second.peer_size = Some((1280.0, 1024.0));
         let third = machine(2, Position::Top, (0.2, 0.8), true);
         let mut state = state(vec![first, second, third]);
+        /* put one peer above the lower monitor, which is the case that used to be
+         * drawn floating above the whole desk */
+        let mut above = machine(3, Position::Top, (0.0, 0.64), true);
+        above.hostname = "above-lower".to_owned();
+        above.peer_size = Some((2560.0, 1440.0));
+        state.machines.push(above);
         /* the desk this was written for: a 2560x1440 panel turned 270 degrees at
          * (2560,0) beside an upright 2560x1440 at (0,1120) */
         state.local_displays = vec![
