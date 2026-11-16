@@ -277,10 +277,18 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             ensure_client_exists(&mut rx, &mut tx, id).await?;
             tx.request(FrontendRequest::UpdatePosition(id, pos)).await?
         }
-        CliSubcommand::SetEdge { id, edge, peer_edge } => {
-            ensure_client_exists(&mut rx, &mut tx, id).await?;
-            tx.request(FrontendRequest::UpdateEdge {
+        CliSubcommand::SetEdge {
+            id,
+            edge,
+            peer_edge,
+        } => {
+            /* the edge is only half of a link: the position has to travel with
+             * it, so the daemon gets one request instead of two half-saved
+             * states */
+            let position = client_position(&mut rx, &mut tx, id).await?;
+            tx.request(FrontendRequest::UpdateLink {
                 handle: id,
+                position,
                 edge,
                 peer_edge,
             })
@@ -455,7 +463,11 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
 fn print_screens(
     width: u32,
     height: u32,
-    clients: &[(ClientHandle, lan_mouse_ipc::ClientConfig, lan_mouse_ipc::ClientState)],
+    clients: &[(
+        ClientHandle,
+        lan_mouse_ipc::ClientConfig,
+        lan_mouse_ipc::ClientState,
+    )],
     capturing_peer: &str,
 ) {
     if width > 0 && height > 0 {
@@ -489,17 +501,9 @@ fn print_screens(
             .filter(|(_, _, state)| state.active)
             .map(|(handle, config, _)| (*handle, config.edge))
             .collect::<Vec<_>>();
-        let effective = EdgeRange::resolve(
-            &enabled
-                .iter()
-                .map(|(_, range)| *range)
-                .collect::<Vec<_>>(),
-        );
-        let reached = effective
-            .iter()
-            .flatten()
-            .copied()
-            .collect::<Vec<_>>();
+        let effective =
+            EdgeRange::resolve(&enabled.iter().map(|(_, range)| *range).collect::<Vec<_>>());
+        let reached = effective.iter().flatten().copied().collect::<Vec<_>>();
         for (handle, config, state) in on_edge.iter().map(|(h, c, s)| (*h, c.clone(), s.active)) {
             let host = config
                 .hostname
@@ -521,7 +525,9 @@ fn print_screens(
                 }
             };
             let shown = if state {
-                claim.map(|range| range.to_string()).unwrap_or_else(|| "-".to_owned())
+                claim
+                    .map(|range| range.to_string())
+                    .unwrap_or_else(|| "-".to_owned())
             } else {
                 config.edge.to_string()
             };
@@ -532,6 +538,32 @@ fn print_screens(
         }
         for gap in EdgeRange::gaps(&reached) {
             println!("  {gap} of the {position} edge is a wall");
+        }
+    }
+}
+
+/// The edge a client currently sits behind.
+///
+/// `set-edge` changes only the ranges, but the daemon takes the whole link in one
+/// request, so the position has to be read first rather than assumed.
+async fn client_position(
+    rx: &mut AsyncFrontendEventReader,
+    tx: &mut AsyncFrontendRequestWriter,
+    id: ClientHandle,
+) -> Result<Position, CliError> {
+    tx.request(FrontendRequest::Enumerate()).await?;
+    loop {
+        match rx.next().await.ok_or(CliError::ConnectionClosed)?? {
+            FrontendEvent::Error(msg) => return Err(CliError::Service(msg)),
+            FrontendEvent::Enumerate(clients) => {
+                return clients
+                    .iter()
+                    .find(|(handle, _, _)| *handle == id)
+                    .map(|(_, config, _)| config.pos)
+                    .ok_or(CliError::NoSuchClient(id));
+            }
+            // unrelated notifications may arrive while waiting
+            _ => {}
         }
     }
 }

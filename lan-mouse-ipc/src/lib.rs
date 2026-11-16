@@ -381,20 +381,23 @@ pub enum FrontendRequest {
     UpdatePort(ClientHandle, u16),
     /// update position
     UpdatePosition(ClientHandle, Position),
-    /// set both edge ranges of one client at once
+    /// move a client to another edge and/or change its ranges, in one request
     ///
-    /// The two ranges describe one link and are always edited together (the
-    /// arrangement canvas drags them as one rectangle), so a single request is
-    /// used: sending [`FrontendRequest::UpdatePosition`] and then two range
-    /// updates would broadcast half-saved states to every frontend.
+    /// A link is one thing - an edge plus the two ranges that meet on it - and
+    /// the arrangement canvas edits all three at once. Splitting it into
+    /// [`FrontendRequest::UpdatePosition`] plus a range update would broadcast a
+    /// half-saved state to every frontend and, worse, rebuild the capture twice:
+    /// once for the old ranges and once for the new.
     ///
     /// The daemon resolves overlaps against the other clients on that edge, so
-    /// the range that ends up in effect can be narrower than the one requested;
-    /// it reports that with [`FrontendEvent::EdgeConflict`].
-    UpdateEdge {
+    /// the range in effect can be narrower than the one requested; it reports
+    /// that with [`FrontendEvent::EdgeConflict`].
+    UpdateLink {
         /// the client whose link is edited
         handle: ClientHandle,
-        /// segment of the local edge the pointer crosses to reach it
+        /// the edge of this screen the client sits behind
+        position: Position,
+        /// segment of that edge the pointer crosses to reach it
         edge: EdgeRange,
         /// segment of the client's facing edge the cursor lands in
         peer_edge: EdgeRange,
@@ -743,9 +746,10 @@ mod serialization_tests {
     }
 
     #[test]
-    fn update_edge_round_trips() {
-        let request = FrontendRequest::UpdateEdge {
+    fn update_link_round_trips() {
+        let request = FrontendRequest::UpdateLink {
             handle: 7,
+            position: Position::Bottom,
             edge: EdgeRange::from_fractions(0.0, 0.4).expect("range"),
             peer_edge: EdgeRange::from_fractions(0.6, 1.0).expect("range"),
         };

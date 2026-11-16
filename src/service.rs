@@ -585,12 +585,13 @@ impl Service {
                 self.update_pos(handle, pos);
                 self.save_config();
             }
-            FrontendRequest::UpdateEdge {
+            FrontendRequest::UpdateLink {
                 handle,
+                position,
                 edge,
                 peer_edge,
             } => {
-                self.update_edge(handle, edge, peer_edge);
+                self.update_link(handle, position, edge, peer_edge);
                 self.save_config();
             }
             FrontendRequest::SetSwitchOptions(options) => {
@@ -1492,20 +1493,38 @@ impl Service {
         self.notify_edge_conflicts();
     }
 
-    /// Move a client to another part of its edge.
+    /// Move a client to another edge, or change the ranges of the link it has.
     ///
-    /// The capture is not torn down and rebuilt as it is for a position change:
-    /// the edge stays the same, only the segment shifts, and re-creating the
-    /// barrier would drop a session the pointer may be sitting in. The capture
-    /// task re-resolves the segments of the edge instead.
-    fn update_edge(&mut self, handle: ClientHandle, edge: EdgeRange, peer_edge: EdgeRange) {
+    /// One request carries all three because a link is one thing: applying the
+    /// position and the ranges separately would leave the old ranges registered on
+    /// the new edge in between, and a crossing there would reach a machine the
+    /// user has already moved away.
+    fn update_link(
+        &mut self,
+        handle: ClientHandle,
+        position: Position,
+        edge: EdgeRange,
+        peer_edge: EdgeRange,
+    ) {
+        /* the capture is only rebuilt when the edge itself changes: a barrier
+         * belongs to an edge, so moving a client along the same edge is a segment
+         * update, and tearing the barrier down would drop a session the pointer
+         * may be sitting in */
+        let moved = self.client_manager.get_pos(handle) != Some(position);
+        if moved {
+            self.update_pos(handle, position);
+        }
         if !self.client_manager.set_edge(handle, edge, peer_edge) {
+            if moved {
+                self.notify_edge_conflicts();
+            }
             return;
         }
-        if self
-            .client_manager
-            .get_state(handle)
-            .is_some_and(|(_, state)| state.active)
+        if !moved
+            && self
+                .client_manager
+                .get_state(handle)
+                .is_some_and(|(_, state)| state.active)
         {
             self.capture.set_edge(handle, edge);
         }
