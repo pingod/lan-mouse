@@ -77,6 +77,22 @@
 				</property>
 			</object>
 		</child>
+		<!-- enter/leave hook commands -->
+		<child>
+			<object class="AdwActionRow" id="hooks_row">
+				<property name="title" translatable="yes">hooks</property>
+				<property name="subtitle">no commands</property>
+				<child>
+					<object class="GtkButton" id="hooks_button">
+						<signal name="clicked" handler="handle_hooks_pressed" swapped="true"/>
+						<property name="icon-name">utilities-terminal-symbolic</property>
+						<property name="valign">center</property>
+						<property name="halign">center</property>
+						<property name="tooltip-text" translatable="yes">edit the enter/leave commands</property>
+					</object>
+				</child>
+			</object>
+		</child>
 		<!-- delete button -->
 		<child>
 			<object class="AdwActionRow" id="delete_row">

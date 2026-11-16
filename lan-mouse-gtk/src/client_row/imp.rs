@@ -32,7 +32,13 @@ pub struct ClientRow {
     pub dns_loading_indicator: TemplateChild<gtk::Spinner>,
     #[template_child]
     pub status_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub hooks_row: TemplateChild<ActionRow>,
+    #[template_child]
+    pub hooks_button: TemplateChild<gtk::Button>,
     pub bindings: RefCell<Vec<Binding>>,
+    /// the enter and leave hook command last reported by the daemon
+    pub hooks: RefCell<(Option<String>, Option<String>)>,
     /// handlers of the notify signals that compose the subtitle
     pub subtitle_handlers: RefCell<Vec<SignalHandlerId>>,
     hostname_change_handler: RefCell<Option<SignalHandlerId>>,
@@ -126,6 +132,13 @@ impl ObjectImpl for ClientRow {
                     .build(),
                 Signal::builder("request-delete").build(),
                 Signal::builder("request-dns").build(),
+                Signal::builder("request-hooks")
+                    .param_types([
+                        u64::static_type(),
+                        String::static_type(),
+                        String::static_type(),
+                    ])
+                    .build(),
                 Signal::builder("request-hostname-change")
                     .param_types([String::static_type()])
                     .build(),
@@ -156,6 +169,26 @@ impl ClientRow {
     #[template_callback]
     fn handle_client_delete(&self, _button: &Button) {
         self.obj().emit_by_name::<()>("request-delete", &[]);
+    }
+
+    /// Hand the current commands and the handle to the window, which owns the
+    /// dialog: the row has no access to the request writer.
+    #[template_callback]
+    fn handle_hooks_pressed(&self, _button: &Button) {
+        let (enter, leave) = self.hooks.borrow().clone();
+        let client_object = self.client_object.borrow().clone();
+        let Some(client_object) = client_object else {
+            return;
+        };
+        let handle = client_object.get_data().handle;
+        self.obj().emit_by_name::<()>(
+            "request-hooks",
+            &[
+                &handle,
+                &enter.unwrap_or_default(),
+                &leave.unwrap_or_default(),
+            ],
+        );
     }
 
     fn handle_port_changed(&self, port_entry: &Entry) {
@@ -252,6 +285,17 @@ impl ClientRow {
         }
     }
 
+    /// Show the hook commands the daemon holds for this client.
+    ///
+    /// Both are only stored here; the dialog in the window is filled from them
+    /// when the row's button is pressed.
+    pub(super) fn set_hooks(&self, enter: Option<String>, leave: Option<String>) {
+        let subtitle = describe_hooks(enter.as_deref(), leave.as_deref());
+        self.hooks_row.set_subtitle(&subtitle);
+        self.hooks_row.set_tooltip_text(Some(&subtitle));
+        self.hooks.replace((enter, leave));
+    }
+
     pub(super) fn set_dns_state(&self, resolved: bool) {
         if resolved {
             self.dns_button.set_css_classes(&["success"])
@@ -261,8 +305,34 @@ impl ClientRow {
     }
 }
 
+/// One-line summary of both hook commands.
+fn describe_hooks(enter: Option<&str>, leave: Option<&str>) -> String {
+    match (enter, leave) {
+        (None, None) => "no commands".to_owned(),
+        (Some(enter), None) => format!("enter: {enter}"),
+        (None, Some(leave)) => format!("leave: {leave}"),
+        (Some(enter), Some(leave)) => format!("enter: {enter} · leave: {leave}"),
+    }
+}
+
 impl WidgetImpl for ClientRow {}
 impl BoxImpl for ClientRow {}
 impl ListBoxRowImpl for ClientRow {}
 impl PreferencesRowImpl for ClientRow {}
 impl ExpanderRowImpl for ClientRow {}
+
+#[cfg(test)]
+mod hook_tests {
+    use super::describe_hooks;
+
+    #[test]
+    fn hooks_are_described_field_by_field() {
+        assert_eq!(describe_hooks(None, None), "no commands");
+        assert_eq!(describe_hooks(Some("enter.sh"), None), "enter: enter.sh");
+        assert_eq!(describe_hooks(None, Some("leave.sh")), "leave: leave.sh");
+        assert_eq!(
+            describe_hooks(Some("enter.sh"), Some("leave.sh")),
+            "enter: enter.sh · leave: leave.sh"
+        );
+    }
+}

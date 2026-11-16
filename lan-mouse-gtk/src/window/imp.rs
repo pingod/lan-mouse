@@ -50,6 +50,10 @@ pub struct Window {
     #[template_child]
     pub hotkey_placeholder_row: TemplateChild<ActionRow>,
     #[template_child]
+    pub remap_list: TemplateChild<ListBox>,
+    #[template_child]
+    pub remap_placeholder_row: TemplateChild<ActionRow>,
+    #[template_child]
     pub arrangement_box: TemplateChild<gtk::Box>,
     #[template_child]
     pub release_bind_entry: TemplateChild<gtk::Entry>,
@@ -131,6 +135,11 @@ impl Window {
     #[template_callback]
     fn handle_add_hotkey_pressed(&self, _button: &Button) {
         self.obj().open_hotkey_dialog(None);
+    }
+
+    #[template_callback]
+    fn handle_add_remap_pressed(&self, _button: &Button) {
+        self.obj().open_remap_dialog(None);
     }
 
     #[template_callback]

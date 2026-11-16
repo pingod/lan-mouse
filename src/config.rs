@@ -709,6 +709,33 @@ impl Config {
         self.toml_mut().release_bind = Some(bind);
     }
 
+    /// replace the persisted chord remapping rules
+    pub(crate) fn set_remap_rules(&mut self, rules: Vec<crate::remap::Rule>) {
+        let rules = rules
+            .into_iter()
+            .map(|r| TomlRule {
+                from: r
+                    .from
+                    .into_iter()
+                    .filter_map(|k| scancode::Linux::try_from(k).ok())
+                    .collect(),
+                to: r
+                    .to
+                    .into_iter()
+                    .filter_map(|k| scancode::Linux::try_from(k).ok())
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let cfg = self.toml_mut();
+        // An empty list has to clear the section, not write `remap = []`:
+        // otherwise the default rules would come back on the next reload.
+        if rules.is_empty() {
+            cfg.remap = None;
+        } else {
+            cfg.remap = Some(rules);
+        }
+    }
+
     /// set configured clients
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
         // An empty list is meaningful: deleting the last client has to be

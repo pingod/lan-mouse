@@ -187,6 +187,11 @@ impl ClientRow {
         self.imp().set_pos(pos);
     }
 
+    /// Update the enter/leave hook commands shown on the row.
+    pub fn set_hooks(&self, enter: Option<String>, leave: Option<String>) {
+        self.imp().set_hooks(enter, leave);
+    }
+
     /// Describe the connection in one line: reachability, round-trip time and
     /// how recently the peer was heard from.
     pub fn set_status(&self, state: &lan_mouse_ipc::ClientState) {

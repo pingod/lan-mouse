@@ -217,6 +217,17 @@ impl Window {
                         ),
                     );
                     row.connect_closure(
+                        "request-hooks",
+                        false,
+                        closure_local!(
+                            #[weak]
+                            window,
+                            move |_row: ClientRow, handle: u64, enter: String, leave: String| {
+                                window.open_hooks_dialog(handle, enter, leave);
+                            }
+                        ),
+                    );
+                    row.connect_closure(
                         "request-position-change",
                         false,
                         closure_local!(
@@ -325,9 +336,15 @@ impl Window {
         client: ClientConfig,
         state: ClientState,
     ) {
+        // Hooks are not part of `ClientObject`, so keep them until the row that
+        // the list model creates for this object exists.
+        let hooks = (client.cmd.clone(), client.leave_cmd.clone());
         let client = ClientObject::new(handle, client, state.clone());
         self.clients().append(&client);
         self.update_placeholder_visibility();
+        if let Some(row) = self.row_for_handle(handle) {
+            row.set_hooks(hooks.0, hooks.1);
+        }
 
         self.update_dns_state(handle, !state.ips.is_empty());
         self.update_active_device_row();
@@ -412,6 +429,50 @@ impl Window {
             .set_visible(rules.is_empty());
     }
 
+    /// Render the daemon's chord remapping rules.
+    pub(super) fn set_remap_rules(&self, rules: Vec<(String, String)>) {
+        let list = self.imp().remap_list.get();
+        while let Some(child) = list.first_child() {
+            list.remove(&child);
+        }
+
+        for (idx, (from, to)) in rules.iter().enumerate() {
+            let row = adw::ActionRow::builder()
+                .title(from.as_str())
+                .subtitle(format!("sends {to}"))
+                .build();
+
+            let edit = gtk::Button::builder()
+                .icon_name("document-edit-symbolic")
+                .valign(gtk::Align::Center)
+                .tooltip_text("change the keys of this remapping rule")
+                .build();
+            let window = self.clone();
+            let (edit_from, edit_to) = (from.clone(), to.clone());
+            edit.connect_clicked(move |_| {
+                window.open_remap_dialog(Some((idx, edit_from.clone(), edit_to.clone())));
+            });
+            row.add_suffix(&edit);
+
+            let delete = gtk::Button::builder()
+                .icon_name("user-trash-symbolic")
+                .valign(gtk::Align::Center)
+                .tooltip_text("remove this remapping rule")
+                .build();
+            let window = self.clone();
+            delete.connect_clicked(move |_| {
+                window.request(FrontendRequest::RemoveRemap(idx));
+            });
+            row.add_suffix(&delete);
+
+            list.append(&row);
+        }
+
+        self.imp()
+            .remap_placeholder_row
+            .set_visible(rules.is_empty());
+    }
+
     /// Show the keys that pull the pointer back to this machine.
     pub(super) fn set_release_bind(&self, bind: &str) {
         let entry = self.imp().release_bind_entry.get();
@@ -428,6 +489,7 @@ impl Window {
     /// Ask the daemon for the hotkey rules, version and autostart state.
     pub(super) fn request_initial_state(&self) {
         self.request(FrontendRequest::EnumerateHotkeys);
+        self.request(FrontendRequest::EnumerateRemap);
         self.request(FrontendRequest::EnumerateVersion);
         self.request(FrontendRequest::EnumerateServiceState);
         self.request_logs();
@@ -592,26 +654,119 @@ impl Window {
             .set_text(&secs.map(|s| s.to_string()).unwrap_or_default());
     }
 
-    /// Prompt for `from` and `to`, then add the rule.
-    /// Record a chord by pressing it, instead of typing key names by hand.
-    ///
-    /// Hand-typed names are easy to get wrong (`KeyLeftAlt` vs `LeftAlt`), and
-    /// a mistyped rule silently never fires. Capturing the actual keystroke
-    /// removes that class of mistake.
     /// Open the hotkey editor.
     ///
     /// `existing` carries the index and the current keys when an existing rule
     /// is being changed; `None` adds a new one.
     pub(super) fn open_hotkey_dialog(&self, existing: Option<(usize, String, String)>) {
+        self.open_chord_dialog(ChordTarget::Hotkey, existing);
+    }
+
+    /// Open the chord remapping editor.
+    ///
+    /// `existing` carries the index and the current keys when an existing rule
+    /// is being changed; `None` adds a new one.
+    pub(super) fn open_remap_dialog(&self, existing: Option<(usize, String, String)>) {
+        self.open_chord_dialog(ChordTarget::Remap, existing);
+    }
+
+    /// Edit the enter/leave hook commands of one client.
+    ///
+    /// Both commands are sent in a single request: two separate updates would
+    /// make the daemon broadcast an intermediate state in which only one of
+    /// them is applied. An empty field clears that hook.
+    pub(super) fn open_hooks_dialog(&self, handle: ClientHandle, enter: String, leave: String) {
+        let dialog = gtk::Dialog::builder()
+            .transient_for(self)
+            .modal(true)
+            .title("Edit hooks")
+            .build();
+
+        let enter_entry = gtk::Entry::builder()
+            .placeholder_text("e.g. notify-send \"entered the other machine\"")
+            .text(enter)
+            .build();
+        let leave_entry = gtk::Entry::builder()
+            .placeholder_text("e.g. notify-send \"back on this machine\"")
+            .text(leave)
+            .build();
+
+        let box_ = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        box_.set_margin_top(12);
+        box_.set_margin_bottom(12);
+        box_.set_margin_start(12);
+        box_.set_margin_end(12);
+
+        box_.append(
+            &gtk::Label::builder()
+                .label("Shell commands run on this machine when the pointer enters or leaves this client. They are passed to `sh -c`, so quotes and pipes work.")
+                .xalign(0.0)
+                .wrap(true)
+                .build(),
+        );
+        box_.append(
+            &gtk::Label::builder()
+                .label("When the pointer enters")
+                .xalign(0.0)
+                .css_classes(["dim-label"])
+                .build(),
+        );
+        box_.append(&enter_entry);
+        box_.append(
+            &gtk::Label::builder()
+                .label("When the pointer leaves")
+                .xalign(0.0)
+                .css_classes(["dim-label"])
+                .build(),
+        );
+        box_.append(&leave_entry);
+        box_.append(
+            &gtk::Label::builder()
+                .label("Leave a field empty to run nothing.")
+                .xalign(0.0)
+                .wrap(true)
+                .css_classes(["dim-label"])
+                .build(),
+        );
+
+        dialog.content_area().append(&box_);
+        dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+        dialog.add_button("Save", gtk::ResponseType::Accept);
+        dialog.set_default_response(gtk::ResponseType::Accept);
+
+        let window = self.clone();
+        dialog.connect_response(move |dialog, response| {
+            if response == gtk::ResponseType::Accept {
+                let enter = enter_entry.text().to_string();
+                let leave = leave_entry.text().to_string();
+                window.request(FrontendRequest::UpdateHooks {
+                    handle,
+                    enter,
+                    leave,
+                });
+            }
+            dialog.close();
+        });
+        dialog.present();
+    }
+
+    /// Prompt for `from` and `to`, then add or update the rule.
+    ///
+    /// Record a chord by pressing it, instead of typing key names by hand.
+    /// Hand-typed names are easy to get wrong (`KeyLeftAlt` vs `LeftAlt`), and
+    /// a mistyped rule silently never fires. Capturing the actual keystroke
+    /// removes that class of mistake. Hotkeys and remapping rules are stored in
+    /// the same `+`-joined key-name form, so both editors share this dialog.
+    fn open_chord_dialog(&self, target: ChordTarget, existing: Option<(usize, String, String)>) {
         let editing = existing.is_some();
         let dialog = gtk::Dialog::builder()
             .transient_for(self)
             .modal(true)
-            .title(if editing { "Edit hotkey" } else { "Add hotkey" })
+            .title(target.title(editing))
             .build();
 
         let from_entry = gtk::Entry::builder()
-            .placeholder_text("press the keys, or type e.g. Shift+Alt+Z")
+            .placeholder_text(target.chord_placeholder())
             .text(
                 existing
                     .as_ref()
@@ -620,12 +775,12 @@ impl Window {
             )
             .build();
         let to_entry = gtk::Entry::builder()
-            .placeholder_text("Z")
+            .placeholder_text(target.to_placeholder())
             .text(
                 existing
                     .as_ref()
                     .map(|(_, _, to)| to.as_str())
-                    .unwrap_or("Z"),
+                    .unwrap_or_else(|| target.to_placeholder()),
             )
             .build();
         let recorder = gtk::Label::builder()
@@ -643,7 +798,7 @@ impl Window {
 
         box_.append(
             &gtk::Label::builder()
-                .label("Local keys — sent to the other machine, your own keystroke still works")
+                .label(target.chord_hint())
                 .xalign(0.0)
                 .wrap(true)
                 .build(),
@@ -661,7 +816,7 @@ impl Window {
 
         box_.append(
             &gtk::Label::builder()
-                .label("Keys sent to the peer")
+                .label(target.to_label())
                 .xalign(0.0)
                 .build(),
         );
@@ -683,7 +838,11 @@ impl Window {
                     return glib::Propagation::Stop;
                 };
                 from_entry.set_text(&chord);
-                recorder.set_text("Captured — click Add");
+                recorder.set_text(if editing {
+                    "Captured — click Save"
+                } else {
+                    "Captured — click Add"
+                });
                 record_button.set_active(false);
                 glib::Propagation::Stop
             });
@@ -704,12 +863,11 @@ impl Window {
                 let from = from_entry.text().to_string();
                 let to = to_entry.text().to_string();
                 if !from.trim().is_empty() {
-                    match existing {
-                        Some((idx, _, _)) => {
-                            window.request(FrontendRequest::UpdateHotkey(idx, from, to))
-                        }
-                        None => window.request(FrontendRequest::AddHotkey(from, to)),
-                    }
+                    let request = match existing {
+                        Some((idx, _, _)) => target.update_request(idx, from, to),
+                        None => target.add_request(from, to),
+                    };
+                    window.request(request);
                 }
             }
             dialog.close();
@@ -751,6 +909,9 @@ impl Window {
         row.set_hostname(client.hostname);
         row.set_port(client.port);
         row.set_position(client.pos);
+        // The hook commands are part of the client configuration, so the row
+        // shows them after every broadcast — including another frontend's edit.
+        row.set_hooks(client.cmd, client.leave_cmd);
         self.refresh_arrangement();
     }
 
@@ -1227,6 +1388,76 @@ impl Window {
     }
 }
 
+/// Which rule list the shared chord dialog edits.
+///
+/// Hotkeys and remapping rules are both stored as `+`-joined key names and both
+/// live in `config.toml`, so they differ only in wording and in which requests
+/// the dialog sends.
+#[derive(Clone, Copy)]
+enum ChordTarget {
+    /// `[[hotkey]]`: fire a key on the peer while you keep typing here.
+    Hotkey,
+    /// `[[remap]]`: rewrite a chord into different keys before it is sent.
+    Remap,
+}
+
+impl ChordTarget {
+    fn title(self, editing: bool) -> &'static str {
+        match (self, editing) {
+            (ChordTarget::Hotkey, true) => "Edit hotkey",
+            (ChordTarget::Hotkey, false) => "Add hotkey",
+            (ChordTarget::Remap, true) => "Edit remap rule",
+            (ChordTarget::Remap, false) => "Add remap rule",
+        }
+    }
+
+    fn chord_placeholder(self) -> &'static str {
+        match self {
+            ChordTarget::Hotkey => "press the keys, or type e.g. Shift+Alt+Z",
+            ChordTarget::Remap => "press the chord to intercept, e.g. Shift+Alt+Q",
+        }
+    }
+
+    fn chord_hint(self) -> &'static str {
+        match self {
+            ChordTarget::Hotkey => {
+                "Local keys — sent to the other machine, your own keystroke still works"
+            }
+            ChordTarget::Remap => {
+                "Keys to intercept — the peer receives the keys below instead of these"
+            }
+        }
+    }
+
+    fn to_label(self) -> &'static str {
+        match self {
+            ChordTarget::Hotkey => "Keys sent to the peer",
+            ChordTarget::Remap => "Keys sent instead",
+        }
+    }
+
+    fn to_placeholder(self) -> &'static str {
+        match self {
+            ChordTarget::Hotkey => "Z",
+            ChordTarget::Remap => "Q",
+        }
+    }
+
+    fn add_request(self, from: String, to: String) -> FrontendRequest {
+        match self {
+            ChordTarget::Hotkey => FrontendRequest::AddHotkey(from, to),
+            ChordTarget::Remap => FrontendRequest::AddRemap(from, to),
+        }
+    }
+
+    fn update_request(self, idx: usize, from: String, to: String) -> FrontendRequest {
+        match self {
+            ChordTarget::Hotkey => FrontendRequest::UpdateHotkey(idx, from, to),
+            ChordTarget::Remap => FrontendRequest::UpdateRemap(idx, from, to),
+        }
+    }
+}
+
 /// Build a chord string (`Shift+Alt+Z`) from a key press.
 ///
 /// Returns `None` when the press is a bare modifier: the user is still
@@ -1445,5 +1676,27 @@ mod chord_tests {
     fn punctuation_is_rejected_rather_than_misnamed() {
         // Better to record nothing than a name the daemon cannot resolve.
         assert_eq!(chord_from_key(Key::semicolon, ModifierType::empty()), None);
+    }
+
+    #[test]
+    fn chord_target_routes_to_the_matching_request() {
+        // The shared dialog must talk to the remap rule list, not the hotkey
+        // list: the two are stored in different parts of config.toml.
+        assert_eq!(
+            ChordTarget::Remap.add_request("KeyLeftShift+Q".to_owned(), "Q".to_owned()),
+            FrontendRequest::AddRemap("KeyLeftShift+Q".to_owned(), "Q".to_owned())
+        );
+        assert_eq!(
+            ChordTarget::Remap.update_request(2, "KeyLeftShift+Q".to_owned(), "Q".to_owned()),
+            FrontendRequest::UpdateRemap(2, "KeyLeftShift+Q".to_owned(), "Q".to_owned())
+        );
+        assert_eq!(
+            ChordTarget::Hotkey.update_request(1, "A".to_owned(), "B".to_owned()),
+            FrontendRequest::UpdateHotkey(1, "A".to_owned(), "B".to_owned())
+        );
+        assert_eq!(
+            ChordTarget::Hotkey.add_request("A".to_owned(), "B".to_owned()),
+            FrontendRequest::AddHotkey("A".to_owned(), "B".to_owned())
+        );
     }
 }

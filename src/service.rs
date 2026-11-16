@@ -582,12 +582,24 @@ impl Service {
                 self.update_leave_hook(handle, leave_hook);
                 self.save_config();
             }
+            FrontendRequest::UpdateHooks {
+                handle,
+                enter,
+                leave,
+            } => {
+                self.update_hooks(handle, &enter, &leave);
+                self.save_config();
+            }
             FrontendRequest::SaveConfiguration => self.save_config(),
             FrontendRequest::EnumerateHotkeys => self.notify_hotkeys(),
             FrontendRequest::AddHotkey(from, to) => self.add_hotkey(&from, &to),
             FrontendRequest::UpdateHotkey(idx, from, to) => self.update_hotkey(idx, &from, &to),
             FrontendRequest::RemoveHotkey(idx) => self.remove_hotkey(idx),
             FrontendRequest::UpdateReleaseBind(spec) => self.update_release_bind(&spec),
+            FrontendRequest::EnumerateRemap => self.notify_remap(),
+            FrontendRequest::AddRemap(from, to) => self.add_remap(&from, &to),
+            FrontendRequest::UpdateRemap(idx, from, to) => self.update_remap(idx, &from, &to),
+            FrontendRequest::RemoveRemap(idx) => self.remove_remap(idx),
             FrontendRequest::EnumerateVersion => self.notify_version(),
             FrontendRequest::SetAutostart(enabled) => self.set_autostart(enabled),
         }
@@ -711,6 +723,98 @@ impl Service {
             .collect();
         self.notify_frontend(FrontendEvent::Hotkeys(rules));
         self.notify_release_bind();
+    }
+
+    /// Replace both hook commands of a client at once.
+    ///
+    /// An empty (or whitespace-only) command clears that hook, matching what
+    /// `lan-mouse cli add-client --enter-hook ""` stores.
+    fn update_hooks(&mut self, handle: ClientHandle, enter: &str, leave: &str) {
+        let enter = (!enter.trim().is_empty()).then(|| enter.to_owned());
+        let leave = (!leave.trim().is_empty()).then(|| leave.to_owned());
+        self.client_manager.set_enter_hook(handle, enter);
+        self.client_manager.set_leave_hook(handle, leave);
+        self.broadcast_client(handle);
+    }
+
+    /// Add a chord remapping rule from human-readable key names.
+    fn add_remap(&mut self, from: &str, to: &str) {
+        let from_keys = match parse_keys(from) {
+            Ok(k) if !k.is_empty() => k,
+            Ok(_) => return self.remap_error("no keys given"),
+            Err(e) => return self.remap_error(&e),
+        };
+        let to_keys = match parse_keys(to) {
+            Ok(k) if !k.is_empty() => k,
+            Ok(_) => return self.remap_error("no replacement keys given"),
+            Err(e) => return self.remap_error(&e),
+        };
+
+        let mut rules = self.config.remap_rules();
+        if rules.iter().any(|r| r.from == from_keys && r.to == to_keys) {
+            return self.notify_remap();
+        }
+        rules.push(crate::remap::Rule {
+            from: from_keys,
+            to: to_keys,
+        });
+        self.apply_remap(rules);
+    }
+
+    /// Replace one remapping rule, keeping its position in the list.
+    fn update_remap(&mut self, idx: usize, from: &str, to: &str) {
+        let from_keys = match parse_keys(from) {
+            Ok(k) if !k.is_empty() => k,
+            Ok(_) => return self.remap_error("no keys given"),
+            Err(e) => return self.remap_error(&e),
+        };
+        let to_keys = match parse_keys(to) {
+            Ok(k) if !k.is_empty() => k,
+            Ok(_) => return self.remap_error("no replacement keys given"),
+            Err(e) => return self.remap_error(&e),
+        };
+
+        let mut rules = self.config.remap_rules();
+        if idx >= rules.len() {
+            return self.remap_error("no such remap rule");
+        }
+        rules[idx].from = from_keys;
+        rules[idx].to = to_keys;
+        self.apply_remap(rules);
+    }
+
+    fn remove_remap(&mut self, idx: usize) {
+        let mut rules = self.config.remap_rules();
+        if idx >= rules.len() {
+            return self.remap_error("no such remap rule");
+        }
+        rules.remove(idx);
+        self.apply_remap(rules);
+    }
+
+    /// Persist `rules`, push them to the capture task and refresh the UI.
+    fn apply_remap(&mut self, rules: Vec<crate::remap::Rule>) {
+        self.config.set_remap_rules(rules.clone());
+        self.capture.set_remap_rules(rules);
+        self.save_config();
+        self.notify_remap();
+    }
+
+    fn remap_error(&mut self, msg: &str) {
+        log::warn!("remap: {msg}");
+        self.notify_frontend(FrontendEvent::Error(msg.to_owned()));
+        self.notify_remap();
+    }
+
+    /// Send the current chord remapping rules to the frontend.
+    fn notify_remap(&mut self) {
+        let rules = self
+            .config
+            .remap_rules()
+            .into_iter()
+            .map(|r| (format_keys(&r.from), format_keys(&r.to)))
+            .collect();
+        self.notify_frontend(FrontendEvent::Remap(rules));
     }
 
     fn notify_version(&mut self) {
@@ -993,6 +1097,10 @@ impl Service {
         ));
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        // Rules live in the config file, not in the client list, so a frontend
+        // connecting later only learns about them from this snapshot. The hook
+        // commands travel on their own inside each client's configuration.
+        self.notify_remap();
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;

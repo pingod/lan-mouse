@@ -264,6 +264,8 @@ pub enum FrontendEvent {
     ConnectionAttempt { fingerprint: String },
     /// current global hotkey rules
     Hotkeys(Vec<(String, String)>),
+    /// current chord remapping rules, as human-readable key names
+    Remap(Vec<(String, String)>),
     /// keys that pull the pointer back, as human-readable key names
     ReleaseBind(String),
     /// version information of this build
@@ -337,6 +339,20 @@ pub enum FrontendRequest {
     UpdateEnterHook(u64, Option<String>),
     /// change the leave hook command
     UpdateLeaveHook(u64, Option<String>),
+    /// replace both hook commands of one client at once
+    ///
+    /// Sending [`FrontendRequest::UpdateEnterHook`] and
+    /// [`FrontendRequest::UpdateLeaveHook`] separately makes the daemon
+    /// broadcast two intermediate states, so a frontend could briefly show
+    /// half of what the editor saved. An empty string clears that hook.
+    UpdateHooks {
+        /// the client whose hooks are edited
+        handle: ClientHandle,
+        /// command run when the pointer enters this client
+        enter: String,
+        /// command run when the pointer leaves this client
+        leave: String,
+    },
     /// save config file
     SaveConfiguration,
     /// request the current hotkey rules
@@ -349,6 +365,14 @@ pub enum FrontendRequest {
     RemoveHotkey(usize),
     /// replace the keys that pull the pointer back while it is on a peer
     UpdateReleaseBind(String),
+    /// request the current chord remapping rules
+    EnumerateRemap,
+    /// add a remap rule (from, to) as human-readable key names
+    AddRemap(String, String),
+    /// replace the remap rule at this index with (from, to) key names
+    UpdateRemap(usize, String, String),
+    /// remove the remap rule with this index
+    RemoveRemap(usize),
     /// request version information
     EnumerateVersion,
     /// enable or disable starting with the session

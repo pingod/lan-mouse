@@ -572,6 +572,41 @@
                         </child>
                         <child>
                           <object class="AdwPreferencesGroup">
+                            <property name="title" translatable="yes">Key remapping</property>
+                            <property name="description" translatable="yes">Rewrite key combinations before they are sent to the other machine. The local keystroke still works here.</property>
+                            <property name="header-suffix">
+                              <object class="GtkButton" id="add_remap_button">
+                                <signal name="clicked" handler="handle_add_remap_pressed" swapped="true"/>
+                                <property name="child">
+                                  <object class="AdwButtonContent">
+                                    <property name="icon-name">list-add-symbolic</property>
+                                    <property name="label" translatable="yes">Add</property>
+                                  </object>
+                                </property>
+                                <style>
+                                  <class name="flat"/>
+                                </style>
+                              </object>
+                            </property>
+                            <child>
+                              <object class="GtkListBox" id="remap_list">
+                                <property name="selection-mode">none</property>
+                                <property name="show-separators">true</property>
+                                <style>
+                                  <class name="boxed-list"/>
+                                </style>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="AdwActionRow" id="remap_placeholder_row">
+                                <property name="title" translatable="yes">No remapping rules</property>
+                                <property name="subtitle" translatable="yes">add a rule with the + button</property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="AdwPreferencesGroup">
                             <property name="title" translatable="yes">About</property>
                             <child>
                               <object class="AdwActionRow" id="version_row">
