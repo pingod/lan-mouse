@@ -64,6 +64,7 @@ Windows 目前仍是空实现（`noop`）。
 | 热键组合键改不了 | GUI 只能增删 → 新增 `UpdateHotkey` / 行内编辑按钮 |
 | `release_bind` 没有 UI | 新增 `UpdateReleaseBind` + Settings 里的 Release shortcut 行 |
 | Switch 按钮在对端驱动本机时"点了没反应" | `switch_device()` 只在 `active_capture` 有值时生效，另一方向直接报错 → 记 `driving_peer`，向它发 Leave 要回指针 |
+| 日志时间比系统时间慢 8 小时 | `timestamp()` 直接拿 `secs % 86400` 当时分秒，即永远输出 UTC → 改用 `localtime_r`（Windows 用 `SystemTimeToTzSpecificLocalTime`），并缓存每秒的渲染结果 |
 
 ## 上游 issue 已修
 

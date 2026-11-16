@@ -73,6 +73,11 @@ libc = "0.2.148"
 # Global hotkeys on macOS are read from a passive Quartz event tap: the same
 # mechanism the capture backend uses, so the app needs no extra permission
 # beyond the Accessibility grant it already holds.
+# Local time for the log timestamps: `std` only exposes UTC, so the Windows
+# implementation asks the system for the local reading.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Time"] }
+
 [target.'cfg(target_os="macos")'.dependencies]
 core-foundation = "0.10.0"
 core-graphics = { version = "0.25.0", features = ["highsierra"] }

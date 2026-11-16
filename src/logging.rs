@@ -201,29 +201,103 @@ fn stderr_is_open() -> bool {
     true
 }
 
-/// Seconds since the Unix epoch, read at most once per second.
+/// The rendered timestamp of the last record, and the second it belongs to.
 ///
 /// Formatting a timestamp per record is measurable at debug level, and a log
 /// view does not need sub-second resolution. The cached value is only used for
 /// display; ordering comes from the ring buffer.
-static CACHED_SECS: AtomicUsize = AtomicUsize::new(usize::MAX);
+static CACHED_TIMESTAMP: LazyLock<Mutex<(usize, String)>> =
+    LazyLock::new(|| Mutex::new((usize::MAX, String::new())));
 
+/// The current time of day, rendered as `HH:MM:SS` in the local time zone.
+///
+/// The zone is whatever the process environment says it is, including daylight
+/// saving, so the log matches what the system clock shows next to it.
 fn timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
+    let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as usize)
         .unwrap_or_default();
 
-    // A relaxed load/store pair: worst case two threads compute the same
-    // string, which is harmless.
-    let mut secs = CACHED_SECS.load(Ordering::Relaxed);
-    if secs == usize::MAX || secs != now {
-        CACHED_SECS.store(now, Ordering::Relaxed);
-        secs = now;
+    let mut cached = CACHED_TIMESTAMP.lock().unwrap_or_else(|e| e.into_inner());
+    if cached.0 != secs {
+        let (hour, minute, second) = local_hms(secs as u64);
+        *cached = (secs, format_hms(hour, minute, second));
     }
+    cached.1.clone()
+}
+
+/// `HH:MM:SS`, zero padded.
+fn format_hms(hour: u32, minute: u32, second: u32) -> String {
+    format!("{hour:02}:{minute:02}:{second:02}")
+}
+
+/// Split epoch seconds into the local time of day.
+///
+/// Anything unexpected falls back to UTC, which is what this function used to
+/// return unconditionally.
+fn local_hms(secs: u64) -> (u32, u32, u32) {
+    from_local_zone(secs).unwrap_or_else(|| utc_hms(secs))
+}
+
+/// UTC time of day, used as the fallback when the local zone is unavailable.
+fn utc_hms(secs: u64) -> (u32, u32, u32) {
     let day = secs % 86_400;
-    format!("{:02}:{:02}:{:02}", day / 3600, (day % 3600) / 60, day % 60)
+    (
+        (day / 3600) as u32,
+        ((day % 3600) / 60) as u32,
+        (day % 60) as u32,
+    )
+}
+
+#[cfg(unix)]
+fn from_local_zone(secs: u64) -> Option<(u32, u32, u32)> {
+    let time = secs as libc::time_t;
+    let mut local: libc::tm = unsafe { std::mem::zeroed() };
+    // `localtime_r` reads the process time zone and applies daylight saving.
+    if unsafe { libc::localtime_r(&time, &mut local) }.is_null() {
+        return None;
+    }
+    Some((
+        local.tm_hour.clamp(0, 23) as u32,
+        local.tm_min.clamp(0, 59) as u32,
+        local.tm_sec.clamp(0, 60) as u32,
+    ))
+}
+
+#[cfg(windows)]
+fn from_local_zone(secs: u64) -> Option<(u32, u32, u32)> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Time::{
+        FileTimeToSystemTime, SYSTEMTIME, SystemTimeToTzSpecificLocalTime,
+    };
+
+    // 100-nanosecond intervals between 1601-01-01 and 1970-01-01.
+    const EPOCH_DIFFERENCE: u64 = 11_644_473_600;
+    let ticks = secs
+        .checked_add(EPOCH_DIFFERENCE)?
+        .checked_mul(10_000_000)?;
+    let utc_filetime = FILETIME {
+        dwLowDateTime: (ticks & 0xffff_ffff) as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+
+    let mut utc = SYSTEMTIME::default();
+    unsafe { FileTimeToSystemTime(&utc_filetime, &mut utc) }.ok()?;
+
+    let mut local = SYSTEMTIME::default();
+    unsafe { SystemTimeToTzSpecificLocalTime(None, &utc, &mut local) }.ok()?;
+    Some((
+        local.wHour as u32,
+        local.wMinute as u32,
+        local.wSecond as u32,
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn from_local_zone(_secs: u64) -> Option<(u32, u32, u32)> {
+    None
 }
 
 /// Map a level name to the filter used for the stderr mirror.
@@ -269,6 +343,46 @@ mod tests {
         CaptureLogger.log(&record);
         let tail = recent(10);
         assert!(tail.iter().any(|l| l.contains("ring buffer probe")));
+    }
+
+    #[test]
+    fn format_hms_is_zero_padded() {
+        assert_eq!(format_hms(9, 4, 5), "09:04:05");
+        assert_eq!(format_hms(23, 59, 59), "23:59:59");
+    }
+
+    #[test]
+    fn utc_hms_wraps_at_one_day() {
+        assert_eq!(utc_hms(0), (0, 0, 0));
+        assert_eq!(utc_hms(86_399), (23, 59, 59));
+        assert_eq!(utc_hms(90_061), (1, 1, 1));
+    }
+
+    /// The timestamp has to follow the machine clock, not UTC. Skipped on a
+    /// machine that happens to run in UTC, where both readings agree.
+    #[test]
+    fn timestamp_uses_the_local_time_zone() {
+        if from_local_zone(0).is_none() {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let (hour, minute, second) = local_hms(now);
+        let expected = format_hms(hour, minute, second);
+        assert_eq!(
+            timestamp(),
+            expected,
+            "the rendered timestamp must match the local time of day"
+        );
+        if utc_hms(now) != (hour, minute, second) {
+            assert_ne!(
+                timestamp(),
+                format_hms(utc_hms(now).0, utc_hms(now).1, utc_hms(now).2),
+                "the log must not be rendered in UTC on a machine with a time zone offset"
+            );
+        }
     }
 
     #[test]
