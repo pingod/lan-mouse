@@ -307,12 +307,32 @@ pub fn chunks(info: &PeerInfo) -> Vec<lan_mouse_proto::ProtoEvent> {
 }
 
 /// Collects chunks until a full report is available.
+///
+/// Order-independent, and that is the point. A report is 20 slots of 32 bytes split
+/// into 16-byte pieces - forty datagrams - and UDP delivers them in any order and
+/// loses some. The first version demanded `index == next` exactly, so a single
+/// reordered or dropped packet discarded the whole report: the peer kept an older
+/// one, which for the display list was invisible (it rarely changes) and for the
+/// arrangement meant a picture that never arrived.
+///
+/// Each chunk is stored where it belongs, and the report is produced once every
+/// piece is present. A new report starting at index 0 resets the buffer.
 #[derive(Default)]
 pub struct Reassembler {
-    buf: Vec<u8>,
+    /// one entry per chunk index; `None` until that chunk arrives
+    parts: Vec<Option<[u8; lan_mouse_proto::PEER_INFO_CHUNK]>>,
     total: Option<u8>,
-    next: u8,
+    /// when the current report started arriving
+    ///
+    /// A report that never completes - a datagram lost for good - would otherwise
+    /// hold its slots forever, and since the sender keeps sending, every later report
+    /// would be a different `total` or the same one with holes. A stale partial report
+    /// is dropped rather than waited on.
+    started: Option<std::time::Instant>,
 }
+
+/// How long to wait for the rest of a report before giving up on it.
+const REASSEMBLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl Reassembler {
     /// Feed one chunk; returns the report once every piece has arrived.
@@ -324,32 +344,42 @@ impl Reassembler {
     ) -> Option<PeerInfo> {
         use lan_mouse_proto::{PEER_INFO_CHUNK, PEER_INFO_FIELD, PEER_INFO_FIELDS};
 
-        // A new report starts at index 0; anything else is a stray piece from a
-        // previous one and would corrupt the buffer.
-        if index == 0 {
-            self.buf.clear();
-            self.next = 0;
+        if total == 0 || index >= total {
+            return None;
+        }
+        /* A different `total` is a different report - the sender changed size, which
+         * happens when the picture it carries grew. Start over rather than mixing
+         * pieces of two reports. */
+        let stale = self
+            .started
+            .is_some_and(|started| started.elapsed() > REASSEMBLY_TIMEOUT);
+        if self.total != Some(total) || stale {
+            self.parts = vec![None; total as usize];
             self.total = Some(total);
+            self.started = Some(std::time::Instant::now());
         }
-        if self.total != Some(total) || index != self.next {
-            return None;
-        }
-        self.buf.extend_from_slice(data);
-        self.next += 1;
+        self.parts[index as usize] = Some(*data);
 
-        if self.next < total {
+        if self.parts.iter().any(Option::is_none) {
             return None;
         }
+        let mut buf = Vec::with_capacity(self.parts.len() * PEER_INFO_CHUNK);
+        for part in &self.parts {
+            buf.extend_from_slice(part.as_ref().expect("checked above"));
+        }
+        /* Ready for the next report, which starts at index 0 again. */
+        self.total = None;
+        self.started = None;
+
         let expected = PEER_INFO_FIELDS * PEER_INFO_FIELD;
-        if self.buf.len() < expected {
+        if buf.len() < expected {
             return None;
         }
         let mut fields = [[0u8; PEER_INFO_FIELD]; PEER_INFO_FIELDS];
-        for (slot, out) in fields.iter_mut().zip(self.buf.chunks(PEER_INFO_FIELD)) {
+        for (slot, out) in fields.iter_mut().zip(buf.chunks(PEER_INFO_FIELD)) {
             let n = out.len().min(PEER_INFO_FIELD);
             slot[..n].copy_from_slice(&out[..n]);
         }
-        let _ = PEER_INFO_CHUNK;
         Some(PeerInfo { fields })
     }
 }
@@ -547,6 +577,64 @@ mod tests {
             };
             assert_eq!(r.push(*index, *total, data), None);
         }
+    }
+
+    /// UDP reorders and drops, so the reassembler must not depend on arrival order.
+    ///
+    /// A report is forty datagrams. The first version required `index == next`
+    /// exactly and threw the whole report away on a single reordered packet, which is
+    /// why the picture arrived only sometimes - and never, on a busy link.
+    #[test]
+    fn chunks_may_arrive_in_any_order() {
+        let _exclusive = exclusive();
+        let mut info = PeerInfo::new(["linux", "CachyOS", "", "x86_64", "host", "", ""]);
+        info.set_displays("DP-2:2560,0:1440x2560:normal:1;DP-3:0,1120:2560x1440:normal:1");
+        info.set_world(
+            "1999999999999|cachyos|1|0,1120,2560,1440;2560,0,1440,2560|0|0,-1500,2560,1440",
+        );
+
+        let pieces = chunks(&info);
+        assert!(pieces.len() > 10, "the report should span many datagrams");
+        let mut r = Reassembler::default();
+        let mut out = None;
+        /* reversed, which is the worst case a real network can produce */
+        for piece in pieces.iter().rev() {
+            let lan_mouse_proto::ProtoEvent::PeerInfoChunk { index, total, data } = piece else {
+                panic!("expected a chunk");
+            };
+            out = r.push(*index, *total, data).or(out);
+        }
+        let out = out.expect("all chunks arrived");
+        assert_eq!(out.displays(), info.displays());
+        assert_eq!(out.world(), info.world());
+    }
+
+    #[test]
+    fn a_lost_chunk_does_not_corrupt_the_next_report() {
+        let _exclusive = exclusive();
+        let info = PeerInfo::new(["linux", "", "", "", "host", "", ""]);
+        let pieces = chunks(&info);
+
+        let mut r = Reassembler::default();
+        /* drop one piece of the first report */
+        for (i, piece) in pieces.iter().enumerate() {
+            if i == 3 {
+                continue;
+            }
+            let lan_mouse_proto::ProtoEvent::PeerInfoChunk { index, total, data } = piece else {
+                panic!("expected a chunk");
+            };
+            assert_eq!(r.push(*index, *total, data), None);
+        }
+        /* the next report still assembles */
+        let mut out = None;
+        for piece in &pieces {
+            let lan_mouse_proto::ProtoEvent::PeerInfoChunk { index, total, data } = piece else {
+                panic!("expected a chunk");
+            };
+            out = r.push(*index, *total, data).or(out);
+        }
+        assert_eq!(out.expect("second report").get(info_slot::HOSTNAME), "host");
     }
 
     #[test]
