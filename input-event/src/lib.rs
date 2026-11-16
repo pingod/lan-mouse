@@ -1,5 +1,6 @@
 use std::fmt::{self, Display};
 
+pub mod display;
 pub mod edge;
 pub mod error;
 pub mod scancode;
@@ -7,6 +8,7 @@ pub mod scancode;
 // The edge a client is reached through travels with the event types: capture
 // backends, the daemon and the frontends all need it, so it is not buried in
 // the module.
+pub use display::{DisplayInfo, Layout, Rotation, ScreenRect, Side};
 pub use edge::EdgeRange;
 
 #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]

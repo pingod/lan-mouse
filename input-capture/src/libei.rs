@@ -23,10 +23,7 @@ use std::{
     os::unix::net::UnixStream,
     pin::Pin,
     rc::Rc,
-    sync::{
-        Arc, LazyLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, LazyLock, Mutex},
     task::{Context, Poll},
     time::Duration,
 };
@@ -41,7 +38,7 @@ use tokio_util::sync::CancellationToken;
 
 use futures_core::Stream;
 
-use input_event::{EdgeRange, Event};
+use input_event::{DisplayInfo, EdgeRange, Event, Layout, Rotation};
 
 use crate::CaptureEvent;
 
@@ -98,25 +95,13 @@ pub struct LibeiInputCapture {
     ///
     /// Written by the capture task whenever it registers barriers. An atomic
     /// rather than an `Rc<RefCell<..>>` because the trait methods are `Send`.
-    layout_size: Arc<AtomicU64>,
-}
-
-/// Pack a screen size into the [`LibeiInputCapture::layout_size`] atomic.
-fn pack_size(size: Option<(u32, u32)>) -> u64 {
-    match size {
-        Some((width, height)) if width > 0 && height > 0 => ((width as u64) << 32) | height as u64,
-        _ => 0,
-    }
-}
-
-/// Unpack [`LibeiInputCapture::layout_size`].
-fn unpack_size(packed: u64) -> Option<(u32, u32)> {
-    if packed == 0 {
-        return None;
-    }
-    let width = (packed >> 32) as u32;
-    let height = packed as u32;
-    (width > 0 && height > 0).then_some((width, height))
+    ///
+    /// The whole layout, not one size: a desk has several monitors, one of them
+    /// possibly rotated, and the canvas has to draw each of them. The portal's
+    /// `Region` already reports the rectangle *after* rotation, so no rotation has
+    /// to be reconstructed here - it is recorded as `Normal` and the rectangle is
+    /// taken verbatim.
+    layout: Arc<Mutex<Layout>>,
 }
 
 /// A capture region in layout coordinates.
@@ -264,25 +249,33 @@ struct BarrierSet {
     /// needed to turn the cursor position of an activation into a fraction of
     /// the edge
     axes: HashMap<Position, (i32, i32)>,
-    /// size of the whole capture area, width x height
-    size: Option<(u32, u32)>,
+    /// every monitor the portal reported, in layout coordinates
+    layout: Layout,
 }
 
-/// The bounding box of every capture region.
-fn regions_size(regions: &[RegionRect]) -> Option<(u32, u32)> {
-    let first = *regions.first()?;
-    let (mut x0, mut y0, mut x1, mut y1) = (first.x, first.y, first.right(), first.bottom());
-    for region in regions {
-        x0 = x0.min(region.x);
-        y0 = y0.min(region.y);
-        x1 = x1.max(region.right());
-        y1 = y1.max(region.bottom());
-    }
-    /* the bounds are inclusive: two 1920 px regions side by side span 0..=3839 */
-    Some((
-        x1.saturating_sub(x0).saturating_add(1) as u32,
-        y1.saturating_sub(y0).saturating_add(1) as u32,
-    ))
+/// Every capture region as a monitor.
+///
+/// The portal reports each region as the rectangle it occupies *after* rotation,
+/// so the rotation itself is not recoverable here and is recorded as `Normal`: what
+/// matters downstream is the rectangle, and reconstructing a rotation from it would
+/// be a guess.
+fn regions_layout(regions: &[RegionRect]) -> Layout {
+    Layout::new(
+        regions
+            .iter()
+            .enumerate()
+            .filter(|(_, region)| region.w > 0 && region.h > 0)
+            .map(|(index, region)| DisplayInfo {
+                name: format!("output{}", index + 1),
+                x: region.x,
+                y: region.y,
+                width: region.w as u32,
+                height: region.h as u32,
+                rotation: Rotation::Normal,
+                enabled: true,
+            })
+            .collect(),
+    )
 }
 
 /// One barrier per segment per region that the segment touches.
@@ -295,7 +288,7 @@ fn select_barriers(
     next_barrier_id: &mut NonZeroU32,
 ) -> BarrierSet {
     let mut set = BarrierSet {
-        size: regions_size(regions),
+        layout: regions_layout(regions),
         ..BarrierSet::default()
     };
     for (pos, edges) in clients {
@@ -514,7 +507,7 @@ impl LibeiInputCapture {
         let notify_release = Arc::new(Notify::new());
 
         let cancellation_token = CancellationToken::new();
-        let layout_size = Arc::new(AtomicU64::new(0));
+        let layout = Arc::new(Mutex::new(Layout::default()));
 
         let capture = do_capture(
             Arc::clone(&input_capture),
@@ -523,7 +516,7 @@ impl LibeiInputCapture {
             first_session,
             event_tx,
             cancellation_token.clone(),
-            Arc::clone(&layout_size),
+            Arc::clone(&layout),
         );
         let capture_task = tokio::task::spawn_local(capture);
 
@@ -535,7 +528,7 @@ impl LibeiInputCapture {
             notify_release,
             cancellation_token,
             terminated: false,
-            layout_size,
+            layout,
         };
 
         Ok(producer)
@@ -549,7 +542,7 @@ async fn do_capture(
     session: Option<(Session<InputCapture>, BitFlags<Capabilities>)>,
     event_tx: Sender<(Position, CaptureEvent)>,
     cancellation_token: CancellationToken,
-    layout_size: Arc<AtomicU64>,
+    layout: Arc<Mutex<Layout>>,
 ) -> Result<(), CaptureError> {
     let mut session = session.map(|s| s.0);
 
@@ -611,7 +604,7 @@ async fn do_capture(
 
             let mut state = SessionState {
                 next_barrier_id: &mut next_barrier_id,
-                layout_size: &layout_size,
+                layout: &layout,
             };
             let capture_session = do_capture_session(
                 input_capture,
@@ -669,7 +662,7 @@ async fn do_capture(
 /// frontend to pick up at any time.
 struct SessionState<'a> {
     next_barrier_id: &'a mut NonZeroU32,
-    layout_size: &'a AtomicU64,
+    layout: &'a Mutex<Layout>,
 }
 
 async fn do_capture_session(
@@ -697,8 +690,10 @@ async fn do_capture_session(
     )
     .await?;
     state
-        .layout_size
-        .store(pack_size(barrier_set.size), Ordering::Relaxed);
+        .layout
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone_from(&barrier_set.layout);
 
     log::debug!("enabling session");
     input_capture.enable(session, Default::default()).await?;
@@ -870,8 +865,10 @@ async fn do_capture_session(
                                 set.barriers.len()
                             );
                             state
-                                .layout_size
-                                .store(pack_size(set.size), Ordering::Relaxed);
+                                .layout
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone_from(&set.layout);
                             barrier_set = set;
                         }
                         Ok(None) => log::trace!("barrier layout unchanged"),
@@ -1087,8 +1084,16 @@ impl LanMouseInputCapture for LibeiInputCapture {
         Ok(())
     }
 
-    async fn screen_size(&mut self) -> Option<(u32, u32)> {
-        unpack_size(self.layout_size.load(Ordering::Relaxed))
+    async fn layout(&mut self) -> Option<Layout> {
+        /* a poisoned lock still holds a usable layout: the task that panicked was
+         * not the one that would corrupt it, and refusing to report any geometry
+         * for the rest of the process is worse than reading it */
+        let layout = self
+            .layout
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        (!layout.is_empty()).then_some(layout)
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
@@ -1355,7 +1360,7 @@ mod barrier_tests {
         assert_eq!(set.barriers.len(), 2);
         assert_eq!(set.barriers[0].position, (100, 0, 100, 49));
         assert_eq!(set.barriers[1].position, (100, 50, 100, 99));
-        assert_eq!(set.size, Some((100, 100)));
+        assert_eq!(set.layout.size(), Some((100, 100)));
         // every barrier maps back to the position it was created for
         for barrier in &set.barriers {
             assert_eq!(
@@ -1378,6 +1383,6 @@ mod barrier_tests {
         let mut next = NonZeroU32::new(1).expect("nonzero");
         let set = select_barriers(&[], &[(Position::Right, vec![EdgeRange::FULL])], &mut next);
         assert!(set.barriers.is_empty());
-        assert_eq!(set.size, None);
+        assert_eq!(set.layout.size(), None);
     }
 }

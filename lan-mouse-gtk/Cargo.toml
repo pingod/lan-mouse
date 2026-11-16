@@ -17,6 +17,9 @@ async-channel = { version = "2.1.1" }
 hostname = "0.4.0"
 log = "0.4.20"
 lan-mouse-ipc = { path = "../lan-mouse-ipc", version = "0.3.0" }
+# the per-monitor geometry: `Layout` is what the daemon reports and what the
+# arrangement canvas draws
+input-event = { path = "../input-event", version = "0.4.0" }
 thiserror = "2.0.0"
 
 [dev-dependencies]

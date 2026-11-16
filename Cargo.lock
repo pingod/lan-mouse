@@ -1761,6 +1761,7 @@ dependencies = [
  "glib-build-tools",
  "gtk4",
  "hostname",
+ "input-event",
  "lan-mouse-ipc",
  "libadwaita",
  "log",

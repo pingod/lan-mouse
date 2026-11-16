@@ -61,6 +61,7 @@ use wayland_client::{
     },
 };
 
+use input_event::Layout as ScreenLayout;
 use input_event::{EdgeRange, Event, KeyboardEvent, PointerEvent};
 
 use crate::{CaptureError, CaptureEvent};
@@ -320,17 +321,6 @@ impl Layout {
             Position::Left | Position::Right => (self.y0, self.y1),
             Position::Top | Position::Bottom => (self.x0, self.x1),
         }
-    }
-
-    /// Width and height of the whole capture area.
-    ///
-    /// The bounds are inclusive, so the extent is one more than their
-    /// difference: two 1920 px outputs side by side span `0..=3839`.
-    fn size(&self) -> (u32, u32) {
-        (
-            self.x1.saturating_sub(self.x0).saturating_add(1) as u32,
-            self.y1.saturating_sub(self.y0).saturating_add(1) as u32,
-        )
     }
 }
 
@@ -864,11 +854,29 @@ impl Capture for LayerShellInputCapture {
         Ok(inner.flush_events()?)
     }
 
-    async fn screen_size(&mut self) -> Option<(u32, u32)> {
+    async fn layout(&mut self) -> Option<ScreenLayout> {
         /* the output list is filled by the event loop, which runs on this task's
          * polls, so whatever it has seen so far is what is available here */
         let inner = self.0.get_mut();
-        layout_geometry(&inner.state.outputs).map(|layout| layout.size())
+        let displays = inner
+            .state
+            .outputs
+            .iter()
+            .filter_map(|output| output.info.as_ref())
+            .map(|info| input_event::DisplayInfo {
+                name: info.name.clone(),
+                x: info.position.0,
+                y: info.position.1,
+                width: info.size.0.max(0) as u32,
+                height: info.size.1.max(0) as u32,
+                /* wl_output reports the size after the transform, and the
+                 * compositor applies it when it lays the output out, so the
+                 * rectangle here is already the one the pointer moves in */
+                rotation: input_event::Rotation::Normal,
+                enabled: true,
+            })
+            .collect::<Vec<_>>();
+        (!displays.is_empty()).then(|| ScreenLayout::new(displays))
     }
 
     async fn begin(&mut self, _pos: Position) -> Result<(), CaptureError> {

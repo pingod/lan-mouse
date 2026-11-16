@@ -126,6 +126,40 @@ two screens of different sizes agree without knowing each other's pixels.
 The first two need the stretch at capture-creation time and rebuild the barrier
 when it changes; the latter two read it per event.
 
+### A machine is a list of monitors, not one rectangle
+
+A desk has two monitors, one of them turned on its side. Flattening them into one
+bounding box - which is what this code did first - makes an edge range mean "the
+stretch of the box", and a box around a rotated monitor contains area no screen
+covers: the pointer cannot be there, so a bridge drawn over it promises a crossing
+that cannot happen.
+
+`input_event::Layout` is a list of `DisplayInfo` - name, offset, panel size,
+rotation, enabled. `DisplayInfo::on_screen()` applies the rotation, which is the
+rectangle the compositor lays out and the pointer moves in; a 2560x1440 panel
+turned 270 degrees occupies 1440x2560 at its offset.
+
+Two rectangles are derived from it and they are not the same thing:
+
+| | what it is | who uses it |
+|---|---|---|
+| `Layout::bounds()` | the bounding box of the enabled monitors | edge ranges, barriers, the corner radius |
+| `Layout::enabled()` | the individual monitors | the arrangement canvas, hit testing |
+
+An edge range is a fraction of the *bounding box*, because that is what a barrier
+spans. The canvas draws the *monitors*, because that is what exists.
+
+The layout travels in the existing `PeerInfo` display slot, as one entry per
+monitor: `name:x,y:WxH:rotation:enabled`, separated by `;`. That is more than the
+32-byte slot holds, which is why the report was already chunked; `parse_screen_size`
+still accepts the size-only and `N displays, WxH` forms an older peer sends.
+
+The backends differ in what they can report. The portal (`libei`) and CoreGraphics
+both hand back each region *after* rotation, so the rectangle is taken verbatim and
+the rotation is recorded as `normal` - reconstructing it from the rectangle would be
+a guess. `layer-shell` reads `wl_output`, which reports the size after the
+transform, and does the same.
+
 ### The screen size comes from the backend, eventually
 
 The canvas draws the local screen to scale with a size the capture backend

@@ -57,8 +57,8 @@ pub struct Window {
     pub arrangement_box: TemplateChild<gtk::Box>,
     /// edge-crossing thresholds, shown on the Screens page
     pub switch_options: RefCell<lan_mouse_ipc::SwitchOptions>,
-    /// the size of the reachable screen area, as reported by the daemon
-    pub screen_size: RefCell<Option<(f64, f64)>>,
+    /// every monitor of this machine, encoded the way the daemon reports it
+    pub displays: RefCell<String>,
     /// The arrangement canvas.
     ///
     /// Built on the first refresh and then only updated: rebuilding it on every

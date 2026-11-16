@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures_core::Stream;
 
-use input_event::{Event, KeyboardEvent, scancode};
+use input_event::{Event, KeyboardEvent, Layout, scancode};
 
 // The edge a client is reached through is part of every backend's barrier
 // geometry, so the type is part of this crate's API rather than an import.
@@ -212,13 +212,15 @@ impl InputCapture {
         self.capture.update(pos, self.segments[&pos].clone()).await
     }
 
-    /// Size of the area the pointer can reach, in pixels.
+    /// The physical monitors this machine has, with their geometry.
     ///
-    /// The arrangement canvas draws the local screen to scale with it, which is
-    /// what turns an edge range from a decoration into something the user can
-    /// see the length of.
-    pub async fn screen_size(&mut self) -> Option<(u32, u32)> {
-        self.capture.screen_size().await
+    /// The arrangement canvas draws each of them to scale, which is what turns an
+    /// edge range from a decoration into something the user can see the length of.
+    /// A machine is not one rectangle: a desk with a monitor turned on its side has
+    /// a layout whose bounding box covers area no screen does, and drawing that
+    /// bounding box would promise a crossing where the pointer cannot go.
+    pub async fn layout(&mut self) -> Option<Layout> {
+        self.capture.layout().await
     }
 
     /// destroy the client with the given id, if it exists
@@ -393,12 +395,12 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
     /// destroy the client with the given id, if it exists
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError>;
 
-    /// Size of the area the pointer can reach, in pixels.
+    /// The physical monitors this machine has, with their geometry.
     ///
-    /// `None` when the backend has no display geometry. The frontend draws the
-    /// local screen to scale with it, which is what makes an edge range mean
-    /// something visually instead of being a decoration.
-    async fn screen_size(&mut self) -> Option<(u32, u32)>;
+    /// `None` when the backend has no display geometry. The frontend draws each
+    /// monitor to scale with it, which is what makes an edge range mean something
+    /// visually instead of being a decoration.
+    async fn layout(&mut self) -> Option<Layout>;
 
     /// release mouse
     async fn release(&mut self) -> Result<(), CaptureError>;

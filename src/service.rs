@@ -108,7 +108,7 @@ pub struct Service {
     /// Tracked so a change can be announced to peers instead of only being
     /// noticed by the frontend: a peer draws this screen to scale, and after a
     /// monitor is plugged in its picture of our edge is stale.
-    screen_size: Option<(u32, u32)>,
+    layout: Option<input_event::Layout>,
     /// when a frontend is streaming logs: how often to poll and where we are
     log_stream: Option<(tokio::time::Interval, usize)>,
 }
@@ -210,7 +210,7 @@ impl Service {
             capture_backend_name: capture_backend_name.clone(),
             emulation_backend_name: emulation_backend_name.clone(),
             switch_options,
-            screen_size: None,
+            layout: None,
             log_stream: None,
         };
         Ok(service)
@@ -1142,39 +1142,39 @@ impl Service {
     /// Publish live counters. These change while the service runs, so unlike the
     /// peer reports they are refreshed on a timer — one small message per
     /// second, and only while a frontend is listening.
-    /// Notice a change in the reachable screen area and tell the peers about it.
+    /// Notice a change in the monitor layout and tell the peers about it.
     ///
     /// The report travels as part of our own `PeerInfo`: asking a peer for its
     /// details makes it answer, and the answer path sends our report back to it,
     /// so one round trip refreshes both ends.
-    fn refresh_screen_size(&mut self) {
-        let size = self.capture.screen_size();
-        if size == self.screen_size {
+    fn refresh_layout(&mut self) {
+        let layout = self.capture.layout();
+        if layout == self.layout {
             return;
         }
-        /* A backend that has not answered yet must not erase a size that is
+        /* A backend that has not answered yet must not erase a layout that is
          * already known: the capture task keeps polling and will publish the new
          * one when it has it, so ignoring this read loses nothing. */
-        if size.is_none() && self.screen_size.is_some() {
+        if layout.is_none() && self.layout.is_some() {
             return;
         }
-        self.screen_size = size;
-        match size {
+        self.layout = layout;
+        match self.layout.as_ref().and_then(input_event::Layout::size) {
             Some((width, height)) => log::info!("reachable screen area is {width}x{height}"),
             None => log::debug!("the capture backend reports no screen geometry yet"),
         }
-        crate::sysinfo::set_screen_size(size);
+        crate::sysinfo::set_layout(self.layout.clone());
         for handle in self.client_manager.active_clients() {
             self.capture.request_peer_info(handle);
         }
         /* The frontend does not need a separate notification: `publish_runtime`
          * calls this function and then broadcasts, and it runs on the one-second
-         * tick, so an open canvas picks the size up on the next tick. Calling
+         * tick, so an open canvas picks the layout up on the next tick. Calling
          * `publish_runtime` from here would recurse into it. */
     }
 
     fn publish_runtime(&mut self) {
-        self.refresh_screen_size();
+        self.refresh_layout();
         let outbound = self
             .client_manager
             .active_clients()
@@ -1211,8 +1211,23 @@ impl Service {
              * that reports no geometry leaves the cards equal sized. The capture
              * task refreshes the value whenever it registers barriers, which is
              * when a monitor plug-in or a mode change alters them. */
-            screen_width: self.screen_size.map(|(w, _)| w).unwrap_or(0),
-            screen_height: self.screen_size.map(|(_, h)| h).unwrap_or(0),
+            screen_width: self
+                .layout
+                .as_ref()
+                .and_then(input_event::Layout::size)
+                .map(|(w, _)| w)
+                .unwrap_or(0),
+            screen_height: self
+                .layout
+                .as_ref()
+                .and_then(input_event::Layout::size)
+                .map(|(_, h)| h)
+                .unwrap_or(0),
+            displays: self
+                .layout
+                .as_ref()
+                .map(input_event::Layout::encode)
+                .unwrap_or_default(),
         }));
     }
 

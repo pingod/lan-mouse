@@ -9,7 +9,7 @@ use futures::StreamExt;
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, EdgeRange, InputCapture, InputCaptureError, Position,
 };
-use input_event::{Event, KeyboardEvent, scancode};
+use input_event::{Event, KeyboardEvent, Layout, scancode};
 use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
@@ -30,7 +30,8 @@ pub(crate) struct Capture {
     /// Written by the capture task, which is the only component that talks to a
     /// backend. The service reads it for the frontend, and the task reads it to
     /// turn a corner radius in pixels into a fraction of an edge.
-    screen_size: Rc<Cell<u64>>,
+    /// the monitors the backend reported, shared with the service
+    layout: Rc<RefCell<Option<Layout>>>,
     /// whether the pointer is currently captured by a remote client
     ///
     /// Updated by the capture task itself rather than derived from the
@@ -72,22 +73,6 @@ pub(crate) enum ICaptureEvent {
     ClientLeft(u64),
 }
 
-/// Pack a screen size into the shared cell. See [`Capture::screen_size`].
-fn pack_size(size: Option<(u32, u32)>) -> u64 {
-    match size {
-        Some((width, height)) if width > 0 && height > 0 => ((width as u64) << 32) | height as u64,
-        _ => 0,
-    }
-}
-
-/// Unpack the shared screen size cell.
-fn unpack_size(packed: u64) -> Option<(u32, u32)> {
-    if packed == 0 {
-        return None;
-    }
-    Some(((packed >> 32) as u32, packed as u32))
-}
-
 impl CaptureTask {
     /// Publish a geometry the backend just reported.
     ///
@@ -96,9 +81,9 @@ impl CaptureTask {
     /// screens", and writing it would erase a size that is already correct.
     /// The session loop polls until an answer arrives, so nothing is lost by
     /// ignoring this one.
-    fn publish_size(&mut self, size: Option<(u32, u32)>) {
-        if let Some(size) = size {
-            self.screen_size.set(pack_size(Some(size)));
+    fn publish_layout(&mut self, layout: Option<Layout>) {
+        if let Some(layout) = layout.filter(|layout| !layout.is_empty()) {
+            *self.layout.borrow_mut() = Some(layout);
         }
     }
 }
@@ -162,13 +147,13 @@ impl Capture {
         let (event_tx, event_rx) = channel();
         let cancellation_token = CancellationToken::new();
         let active = Rc::new(Cell::new(false));
-        let screen_size = Rc::new(Cell::new(0));
+        let layout = Rc::new(RefCell::new(None));
         let capture_task = CaptureTask {
             active_client: None,
             enter_fraction: 0.5,
             switch_options: SwitchOptions::default(),
             last_edge_hit: Default::default(),
-            screen_size: Rc::clone(&screen_size),
+            layout: Rc::clone(&layout),
             backend,
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
@@ -191,7 +176,7 @@ impl Capture {
             task,
             event_rx,
             active,
-            screen_size,
+            layout,
         }
     }
 
@@ -253,8 +238,9 @@ impl Capture {
     }
 
     /// Size of the reachable screen area, `None` when no backend reported one.
-    pub(crate) fn screen_size(&self) -> Option<(u32, u32)> {
-        unpack_size(self.screen_size.get())
+    /// The monitors the backend last reported.
+    pub(crate) fn layout(&self) -> Option<Layout> {
+        self.layout.borrow().clone()
     }
 
     pub(crate) fn destroy(&self, handle: CaptureHandle) {
@@ -375,7 +361,8 @@ struct CaptureTask {
     /// when an edge was last hit but refused, for the double-tap requirement
     last_edge_hit: HashMap<Position, Instant>,
     /// size of the reachable screen area, shared with the service
-    screen_size: Rc<Cell<u64>>,
+    /// the monitors the backend reported, shared with the service
+    layout: Rc<RefCell<Option<Layout>>>,
     conn: LanMouseConnection,
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
@@ -540,8 +527,8 @@ impl CaptureTask {
         /* Worth a read here - a backend that builds its barriers synchronously
          * (layer-shell) already knows the answer - but not the only one: the
          * session loop keeps asking until the asynchronous ones catch up. */
-        let size = capture.screen_size().await;
-        self.publish_size(size);
+        let layout = capture.layout().await;
+        self.publish_layout(layout);
         Ok(())
     }
 
@@ -555,7 +542,14 @@ impl CaptureTask {
     /// Returns `Err(reason)` when a threshold refuses it, so the caller can say
     /// why in the log.
     fn crossing_allowed(&mut self, pos: Position, fraction: f64) -> Result<(), &'static str> {
-        let size = unpack_size(self.screen_size.get());
+        /* the corner radius is in pixels and the crossing only as a fraction, so
+         * the bounding box is what it is measured against - the same box the
+         * barrier spans */
+        let size = self
+            .layout
+            .borrow()
+            .as_ref()
+            .and_then(input_event::Layout::size);
         if in_blocked_corner(&self.switch_options, size, pos, fraction) {
             return Err("corner is blocked");
         }
@@ -676,8 +670,8 @@ impl CaptureTask {
                 _ = self.cancellation_token.cancelled() => return Ok(()),
             }
         }
-        let size = capture.screen_size().await;
-        self.publish_size(size);
+        let layout = capture.layout().await;
+        self.publish_layout(layout);
         /* the barriers belong to a position, not to a client, so the segments of
          * every edge are handed over once all clients are registered */
         let mut positions = self
@@ -715,14 +709,17 @@ impl CaptureTask {
                      * value rather than blanking it - "not ready yet" and "no
                      * screens at all" are indistinguishable from here, and
                      * blanking a working layout is the worse mistake. */
-                    if let Some(size) = capture.screen_size().await {
-                        if unpack_size(self.screen_size.get()) != Some(size) {
+                    if let Some(layout) = capture.layout().await {
+                        if self.layout.borrow().as_ref() != Some(&layout) {
                             log::info!(
-                                "the capture backend reports a {}x{} screen area",
-                                size.0,
-                                size.1
+                                "the capture backend reports {} monitor(s), {}",
+                                layout.enabled().count(),
+                                layout
+                                    .size()
+                                    .map(|(w, h)| format!("{w}x{h}"))
+                                    .unwrap_or_else(|| "unknown size".to_owned()),
                             );
-                            self.screen_size.set(pack_size(Some(size)));
+                            *self.layout.borrow_mut() = Some(layout);
                         }
                     }
                 }
@@ -1469,44 +1466,34 @@ mod routing_tests {
         ));
     }
 
-    #[test]
-    fn pack_and_unpack_round_trip_a_screen_size() {
-        for size in [
-            Some((1920, 1080)),
-            Some((3840, 2160)),
-            None,
-            Some((0, 1080)),
-        ] {
-            let packed = pack_size(size);
-            let unpacked = unpack_size(packed);
-            match size {
-                Some((w, h)) if w > 0 && h > 0 => assert_eq!(unpacked, size),
-                _ => assert_eq!(unpacked, None),
-            }
-        }
-    }
-
-    /// A backend that answers "not yet" must not erase a size that is already
+    /// A backend that answers "not yet" must not erase a layout that is already
     /// known.
     ///
     /// The ordering that caused the bug: `create_captures` reads the geometry
     /// right after registering the barriers, and for the portal backend that is
     /// before the session exists - `libei`'s `create` only queues a message - so
-    /// the read returns nothing. Writing that `None` over a size that a later
-    /// read had already filled in would blank the layout, and the canvas would
-    /// fall back to a guessed 1920x1080.
+    /// the read returns nothing. Writing that `None` over a layout that a later
+    /// read had already filled in would blank the canvas.
     #[test]
-    fn an_unanswered_geometry_read_does_not_erase_a_known_size() {
-        let known = pack_size(Some((2560, 1440)));
-        assert_eq!(unpack_size(known), Some((2560, 1440)));
+    fn an_unanswered_geometry_read_does_not_erase_a_known_layout() {
+        let layout = Layout::new(vec![input_event::DisplayInfo::new(
+            "DP-1",
+            0,
+            0,
+            2560,
+            1440,
+            input_event::Rotation::Normal,
+        )]);
 
-        /* what `publish_size` does with a `None`: nothing */
-        let after_none = known;
-        assert_eq!(unpack_size(after_none), Some((2560, 1440)));
-
-        /* and with a real answer: replaces it */
-        let after_change = pack_size(Some((1920, 1080)));
-        assert_eq!(unpack_size(after_change), Some((1920, 1080)));
+        /* what `publish_layout` does with a `None`: nothing, the field keeps what
+         * it had */
+        let mut published: Option<Layout> = Some(layout.clone());
+        for next in [None, Some(Layout::default())] {
+            if let Some(next) = next.filter(|layout| !layout.is_empty()) {
+                published = Some(next);
+            }
+        }
+        assert_eq!(published, Some(layout));
     }
 
     /// The poll interval has to be short enough to be invisible and long enough

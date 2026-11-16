@@ -331,14 +331,14 @@ impl Window {
         let imp = self.imp();
         let local_hostname = imp.hostname_label.text().to_string();
         let switch_options = imp.switch_options.borrow().clone();
-        let screen_size = *imp.screen_size.borrow();
+        let displays = imp.displays.borrow().clone();
         /* The one line that says whether the canvas has the numbers it needs. A
          * peer that never reported a size is drawn at a derived one, which looks
          * like a layout bug until you can see that the size was `None`. */
         log::debug!(
             "arrangement: local {:?} at {:?}, {} machine(s): {}",
             local_hostname,
-            screen_size,
+            displays,
             machines.len(),
             machines
                 .iter()
@@ -365,7 +365,7 @@ impl Window {
                 ),
             )
         });
-        canvas.update(&local_hostname, &machines, screen_size, &switch_options);
+        canvas.update(&local_hostname, &machines, &displays, &switch_options);
     }
 
     /// Turn what the canvas decided into a request for the daemon.
@@ -1184,12 +1184,25 @@ impl Window {
             .set_subtitle(&format_duration(info.uptime_secs));
         imp.port_row.set_subtitle(&info.port.to_string());
 
-        /* The arrangement canvas draws the local screen to scale with this, which
-         * is what makes an edge range mean something on the picture. */
-        let size = (info.screen_width > 0 && info.screen_height > 0)
-            .then_some((info.screen_width as f64, info.screen_height as f64));
-        if *imp.screen_size.borrow() != size {
-            *imp.screen_size.borrow_mut() = size;
+        /* The arrangement canvas draws every monitor to scale with this, which is
+         * what makes an edge range mean something on the picture. `displays` is the
+         * per-monitor report; `screen_width`/`screen_height` are only its bounding
+         * box, kept for a daemon that predates the per-monitor field. */
+        let displays = if info.displays.is_empty() {
+            /* an older daemon: fall back to the one box it knows */
+            if info.screen_width > 0 && info.screen_height > 0 {
+                format!(
+                    "screen:0,0:{}x{}:normal:1",
+                    info.screen_width, info.screen_height
+                )
+            } else {
+                String::new()
+            }
+        } else {
+            info.displays.clone()
+        };
+        if *imp.displays.borrow() != displays {
+            *imp.displays.borrow_mut() = displays;
             self.refresh_arrangement();
         }
 

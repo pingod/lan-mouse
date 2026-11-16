@@ -28,22 +28,22 @@ thread_local! {
 /// The peer draws this machine's screen to scale with it, which is what turns an
 /// edge range from a decoration into something both ends agree on. `None` keeps
 /// whatever the platform probe found.
-pub fn set_screen_size(size: Option<(u32, u32)>) {
+pub fn set_layout(layout: Option<input_event::Layout>) {
     LOCAL.with(|local| {
-        let updated = build(size);
+        let updated = build(layout);
         if *local.borrow() != updated {
             *local.borrow_mut() = updated;
         }
     });
 }
 
-fn build(size: Option<(u32, u32)>) -> PeerInfo {
+fn build(layout: Option<input_event::Layout>) -> PeerInfo {
     // `PeerInfo::new` takes `&str`; the owned values live until the call
     // returns, so bind them first.
     let os_version = os_version();
     let kernel = kernel_version();
     let hostname = hostname();
-    let displays = displays(size);
+    let displays = displays(layout);
     let commit = short_commit();
     PeerInfo::new([
         os_name(),
@@ -137,9 +137,9 @@ fn short_commit() -> String {
 /// backend does not report one does this fall back to a platform probe, and the
 /// probe keeps the `N displays, WxH` shape it always had - the size parser reads
 /// the leading `WxH` of either form.
-fn displays(size: Option<(u32, u32)>) -> String {
-    if let Some((width, height)) = size.filter(|(w, h)| *w > 0 && *h > 0) {
-        return format!("{width}x{height}");
+fn displays(layout: Option<input_event::Layout>) -> String {
+    if let Some(layout) = layout.filter(|layout| !layout.is_empty()) {
+        return layout.encode();
     }
     probe_displays()
 }
@@ -306,24 +306,33 @@ pub fn describe(info: &PeerInfo) -> String {
 mod tests {
     use super::*;
 
+    fn one_monitor() -> input_event::Layout {
+        input_event::Layout::new(vec![input_event::DisplayInfo::new(
+            "DP-1",
+            0,
+            0,
+            2560,
+            1440,
+            input_event::Rotation::Normal,
+        )])
+    }
+
     /// The report is refreshed, not built once, so a test that changes it must
-    /// not leave the new size behind for the tests that run after it.
+    /// not leave the new layout behind for the tests that run after it.
     #[test]
-    fn screen_size_goes_into_the_display_slot() {
+    fn the_layout_goes_into_the_display_slot() {
         let before = local().get(info_slot::DISPLAYS).to_owned();
 
-        set_screen_size(Some((2560, 1440)));
-        assert_eq!(local().get(info_slot::DISPLAYS), "2560x1440");
+        set_layout(Some(one_monitor()));
+        assert_eq!(
+            local().get(info_slot::DISPLAYS),
+            "DP-1:0,0:2560x1440:normal:1"
+        );
 
         /* A backend that reports nothing falls back to the platform probe, which
          * is what an older or geometry-less backend used to produce. */
-        set_screen_size(None);
+        set_layout(None);
         assert_eq!(local().get(info_slot::DISPLAYS), before);
-
-        // a zero size is not a size
-        set_screen_size(Some((0, 0)));
-        assert_eq!(local().get(info_slot::DISPLAYS), before);
-        set_screen_size(None);
     }
 
     #[test]
@@ -336,36 +345,28 @@ mod tests {
         assert!(!info.get(info_slot::OS).is_empty());
     }
 
-    /// The display slot is what a peer reads this machine's screen size out of,
-    /// so what goes on the wire has to be parseable by `parse_screen_size`.
+    /// The display slot is what a peer reads this machine's screens out of, so
+    /// what goes on the wire has to come back as the same layout.
     ///
-    /// This is the join between the two halves of the feature: `set_screen_size`
-    /// writes the slot, `flatten` copies it into the peer report, and the canvas
-    /// on the other end parses it back into pixels.
+    /// This is the join between the halves of the feature: `set_layout` writes the
+    /// slot, `flatten` copies it into the peer report, and the canvas on the other
+    /// end decodes it back into rectangles.
     #[test]
     fn the_display_slot_round_trips_through_the_peer_report() {
-        set_screen_size(Some((2560, 1440)));
+        set_layout(Some(one_monitor()));
 
         let report = flatten(&local());
-        assert_eq!(report.displays, "2560x1440");
+        let decoded = input_event::Layout::decode(&report.displays).expect("decodes");
+        assert_eq!(decoded, one_monitor());
+        // and the bounding box an older peer would look for is still derivable
         assert_eq!(
             lan_mouse_ipc::parse_screen_size(&report.displays),
             Some((2560, 1440)),
-            "the peer cannot read the size back out of {:?}",
+            "an older peer cannot read a size out of {:?}",
             report.displays
         );
 
-        // a backend that reports nothing keeps the platform probe, which an
-        // older peer still parses
-        set_screen_size(None);
-        let report = flatten(&local());
-        if report.displays.contains('x') {
-            assert!(
-                lan_mouse_ipc::parse_screen_size(&report.displays).is_some(),
-                "the fallback report {:?} is not parseable either",
-                report.displays
-            );
-        }
+        set_layout(None);
     }
 
     #[test]

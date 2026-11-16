@@ -175,13 +175,26 @@ fn full_edge() -> EdgeRange {
 /// it is what the arrangement canvas draws the peer's screen to scale with, and
 /// without it the cards stay equal sized and an edge range says nothing visually.
 pub fn parse_screen_size(report: &str) -> Option<(u32, u32)> {
+    /* Three shapes have to work: the per-monitor layout this build writes
+     * (`name:x,y:WxH:rotation:enabled`, several separated by `;`), the size-only
+     * form the previous build wrote (`2560x1440`), and the `N displays, WxH` form
+     * before that. The first is a *bounding box* of the monitors; a caller that
+     * needs the individual rectangles should decode the layout instead. */
+    if let Some(layout) = input_event::Layout::decode(report) {
+        return layout.size();
+    }
     let token = report
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .find(|part| part.contains('x'))?;
-    let (width, height) = token.split_once('x')?;
-    let width = width.trim().parse::<u32>().ok()?;
-    let height = height.trim().parse::<u32>().ok()?;
-    (width > 0 && height > 0).then_some((width, height))
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .find_map(|part| {
+            /* in a layout entry the size is the third colon-separated field, so a
+             * part may still carry a trailing `:rotation:enabled` */
+            let candidate = part.split(':').find(|field| field.contains('x'))?;
+            let (width, height) = candidate.split_once('x')?;
+            let width = width.trim().parse::<u32>().ok()?;
+            let height = height.trim().parse::<u32>().ok()?;
+            (width > 0 && height > 0).then_some((width, height))
+        })?;
+    Some(token)
 }
 
 impl Default for ClientConfig {
@@ -594,6 +607,14 @@ pub struct RuntimeInfo {
     /// height of the reachable screen area in pixels; 0 when unknown
     #[serde(default)]
     pub screen_height: u32,
+    /// every monitor, in the same encoding the peer report uses.
+    ///
+    /// `screen_width`/`screen_height` are only the bounding box, which is not
+    /// enough to draw a desk: a rotated monitor makes the box cover area no screen
+    /// does. Empty for a frontend that predates this, and for a backend that
+    /// reports no geometry at all.
+    #[serde(default)]
+    pub displays: String,
 }
 
 /// One device currently driving (or allowed to drive) this machine.

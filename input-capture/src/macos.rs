@@ -1,5 +1,6 @@
 use super::{
-    Capture, CaptureError, CaptureEvent, EdgeRange, Position, error::MacosCaptureCreationError,
+    Capture, CaptureError, CaptureEvent, EdgeRange, Layout, Position,
+    error::MacosCaptureCreationError,
 };
 use async_trait::async_trait;
 use bitflags::bitflags;
@@ -148,6 +149,8 @@ struct InputCaptureState {
     enter_position: Option<CGPoint>,
     /// bounds of the input capture area
     bounds: Bounds,
+    /// the individual displays, for the arrangement canvas
+    displays: Vec<input_event::DisplayInfo>,
     /// current state of modifier keys
     modifier_state: XMods,
     /// barrier the cursor was last released from. While the cursor stays
@@ -178,6 +181,7 @@ impl InputCaptureState {
             current_pos: None,
             enter_position: None,
             bounds: Bounds::default(),
+            displays: Vec::new(),
             modifier_state: Default::default(),
             latched_barrier: None,
         };
@@ -266,8 +270,21 @@ impl InputCaptureState {
         // recompute from scratch, so that disconnected displays do not keep
         // stretching the bounds
         let mut bounds = Bounds::default();
+        let mut displays = Vec::with_capacity(active_ids.len());
         for d in active_ids {
             let display_bounds = CGDisplay::new(d).bounds();
+            /* CoreGraphics already reports each display's rectangle with its
+             * rotation applied, in the same coordinate space as the bounds, so
+             * the rectangle is taken as it is. */
+            displays.push(input_event::DisplayInfo {
+                name: format!("CGDisplay{d}"),
+                x: display_bounds.origin.x as i32,
+                y: display_bounds.origin.y as i32,
+                width: display_bounds.size.width.max(0.0) as u32,
+                height: display_bounds.size.height.max(0.0) as u32,
+                rotation: input_event::Rotation::Normal,
+                enabled: true,
+            });
             bounds.xmin = bounds.xmin.min(display_bounds.origin.x);
             bounds.xmax = bounds
                 .xmax
@@ -282,6 +299,7 @@ impl InputCaptureState {
             log::warn!("no active display found, input capture is disabled");
         }
         self.bounds = bounds;
+        self.displays = displays;
 
         log::debug!("Updated displays bounds: {0:?}", self.bounds);
         Ok(())
@@ -1112,16 +1130,12 @@ impl Capture for MacOSInputCapture {
         Ok(())
     }
 
-    async fn screen_size(&mut self) -> Option<(u32, u32)> {
+    async fn layout(&mut self) -> Option<Layout> {
         let state = self.state.lock().await;
-        let bounds = &state.bounds;
-        if !bounds.is_valid() {
+        if state.displays.is_empty() {
             return None;
         }
-        Some((
-            (bounds.xmax - bounds.xmin).max(0.0) as u32,
-            (bounds.ymax - bounds.ymin).max(0.0) as u32,
-        ))
+        Some(Layout::new(state.displays.clone()))
     }
 
     async fn begin(&mut self, pos: Position) -> Result<(), CaptureError> {

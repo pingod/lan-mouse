@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_core::Stream;
-use input_event::PointerEvent;
+use input_event::{DisplayInfo, Layout, PointerEvent, Rotation};
 use tokio::time::{self, Instant, Interval};
 
 use super::{Capture, CaptureError, CaptureEvent, EdgeRange, Position};
@@ -50,12 +50,19 @@ impl Capture for DummyInputCapture {
         Ok(())
     }
 
-    async fn screen_size(&mut self) -> Option<(u32, u32)> {
+    async fn layout(&mut self) -> Option<Layout> {
         /* the dummy backend drives a synthetic pointer over a synthetic screen;
-         * reporting 1920x1080 keeps the arrangement canvas drawing to scale
-         * when the pipeline is exercised without a display
+         * reporting one 1920x1080 monitor keeps the arrangement canvas drawing to
+         * scale when the pipeline is exercised without a display
          */
-        Some((1920, 1080))
+        Some(Layout::new(vec![DisplayInfo::new(
+            "dummy",
+            0,
+            0,
+            1920,
+            1080,
+            Rotation::Normal,
+        )]))
     }
 
     async fn begin(&mut self, _pos: Position) -> Result<(), CaptureError> {

@@ -59,23 +59,50 @@ pub(super) fn draw(cr: &cairo::Context, width: f64, height: f64, state: &State, 
         draw_snap_preview(cr, state, drag, palette);
     }
 
-    /* the local screen */
+    /* The local screen: every monitor drawn where it actually is.
+     *
+     * Drawing one box for the bounding rectangle would claim screen where a desk
+     * with a rotated monitor has none - and the pointer cannot be there, so the
+     * picture would promise a crossing at a place the edge range does not cover.
+     */
+    let monitors = state.local_monitors();
+    for (index, monitor) in monitors.iter().enumerate() {
+        let canvas_monitor = state.to_canvas(*monitor);
+        paint::fill_card(cr, canvas_monitor, palette);
+        paint::set(cr, palette.accent, 0.9);
+        cr.set_line_width(2.0);
+        let _ = cr.stroke();
+        /* a hairline between monitors, so two touching screens read as two */
+        if monitors.len() > 1 {
+            paint::set(cr, palette.foreground, 0.25);
+            cr.set_line_width(1.0);
+            let _ = cr.stroke();
+        }
+        let _ = index;
+    }
     let canvas_local = state.to_canvas(local);
-    paint::fill_card(cr, canvas_local, palette);
-    paint::set(cr, palette.accent, 0.9);
-    cr.set_line_width(2.0);
-    let _ = cr.stroke();
     /* `active` is false here on purpose: the green subtitle means "a pointer can
      * cross to this machine", which is a statement about a peer. The local screen
      * is the thing being crossed *from*, and it is already outlined in accent. */
+    /* The label goes on the largest monitor, not on the bounding box: with a
+     * rotated monitor in the desk the box's centre can be a place where there is
+     * no screen at all, and the name would float over nothing. */
+    let labelled = monitors
+        .iter()
+        .max_by(|a, b| (a.w * a.h).total_cmp(&(b.w * b.h)))
+        .copied()
+        .map(|rect| state.to_canvas(rect))
+        .unwrap_or(canvas_local);
     draw_card(
         cr,
-        canvas_local,
+        labelled,
         &state.local_hostname,
-        if state.screen_size.is_some() {
-            "this screen".to_owned()
-        } else {
+        if state.local_displays.is_empty() {
             "this screen · size unknown".to_owned()
+        } else if state.local_displays.len() > 1 {
+            format!("this screen · {} displays", state.local_displays.len())
+        } else {
+            "this screen".to_owned()
         },
         None,
         palette,

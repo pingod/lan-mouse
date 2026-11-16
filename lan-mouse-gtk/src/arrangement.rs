@@ -137,8 +137,9 @@ struct Resize {
 
 struct State {
     local_hostname: String,
-    /// size of the local screen in pixels, `None` when no backend reported one
-    screen_size: Option<(f64, f64)>,
+    /// every monitor of this machine, in pixels; empty when no backend reported
+    /// any geometry
+    local_displays: Vec<input_event::DisplayInfo>,
     machines: Vec<Machine>,
     switch_options: SwitchOptions,
     on_request: Rc<dyn Fn(MachineRequest)>,
@@ -166,9 +167,53 @@ impl State {
     /// Without a reported size the canvas falls back to 16:9 and says so on the
     /// card: an edge range means nothing visually if the screen it is a range of
     /// has no size, but the layout is still worth drawing.
+    /// The local screen in layout units: the bounding box of every monitor.
+    ///
+    /// The bounding box is what an edge range is a fraction of - the barrier spans
+    /// it - so the peers are placed against it. The monitors themselves are drawn
+    /// inside it by [`State::local_monitors`], because a desk with a rotated
+    /// monitor has area inside the box that no screen covers.
     fn local_screen(&self) -> Screen {
-        let (w, h) = self.screen_size.unwrap_or((1920.0, 1080.0));
-        Screen::new(0.0, 0.0, w, h)
+        let Some(bounds) = self.local_bounds() else {
+            /* no backend reported geometry: fall back to a 16:9 box and say so on
+             * the card, so the layout is still worth drawing */
+            return Screen::new(0.0, 0.0, 1920.0, 1080.0);
+        };
+        Screen::new(
+            bounds.x as f64,
+            bounds.y as f64,
+            bounds.width as f64,
+            bounds.height as f64,
+        )
+    }
+
+    fn local_layout(&self) -> Option<input_event::Layout> {
+        (!self.local_displays.is_empty())
+            .then(|| input_event::Layout::new(self.local_displays.clone()))
+    }
+
+    fn local_bounds(&self) -> Option<input_event::ScreenRect> {
+        self.local_layout()?.bounds()
+    }
+
+    /// The individual monitors, in layout units.
+    fn local_monitors(&self) -> Vec<Screen> {
+        let layout = self.local_layout();
+        let Some(layout) = layout else {
+            return vec![self.local_screen()];
+        };
+        layout
+            .enabled()
+            .map(|display| {
+                let rect = display.on_screen();
+                Screen::new(
+                    rect.x as f64,
+                    rect.y as f64,
+                    rect.width as f64,
+                    rect.height as f64,
+                )
+            })
+            .collect()
     }
 
     fn placement_of(&self, machine: &Machine, local: Screen) -> Placement {
@@ -452,7 +497,7 @@ impl Canvas {
 
         let state = Rc::new(RefCell::new(State {
             local_hostname: String::new(),
-            screen_size: None,
+            local_displays: Vec::new(),
             machines: Vec::new(),
             switch_options: SwitchOptions::default(),
             on_request: Rc::new(on_request),
@@ -544,7 +589,7 @@ impl Canvas {
         &self,
         local_hostname: &str,
         machines: &[Machine],
-        screen_size: Option<(f64, f64)>,
+        displays: &str,
         switch_options: &SwitchOptions,
     ) {
         {
@@ -553,7 +598,9 @@ impl Canvas {
              * drag owns the machine it started on until it ends */
             if state.drag.is_none() && state.resize.is_none() {
                 state.local_hostname = local_hostname.to_string();
-                state.screen_size = screen_size;
+                state.local_displays = input_event::Layout::decode(displays)
+                    .map(|l| l.displays)
+                    .unwrap_or_default();
                 state.switch_options = switch_options.clone();
                 state.machines = machines.to_vec();
             }
@@ -1008,7 +1055,14 @@ mod tests {
     fn state(machines: Vec<Machine>) -> State {
         State {
             local_hostname: "local".to_owned(),
-            screen_size: Some((1920.0, 1080.0)),
+            local_displays: vec![input_event::DisplayInfo::new(
+                "test",
+                0,
+                0,
+                1920,
+                1080,
+                input_event::Rotation::Normal,
+            )],
             machines,
             switch_options: SwitchOptions::default(),
             on_request: Rc::new(|_| {}),
@@ -1143,7 +1197,7 @@ mod tests {
     #[test]
     fn a_local_screen_of_unknown_size_still_lays_out() {
         let mut state = state(vec![machine(0, Position::Right, (0.0, 1.0))]);
-        state.screen_size = None;
+        state.local_displays.clear();
         state.relayout(800.0, 460.0);
         assert!(state.geometry.scale > 0.0);
         assert_eq!(state.geometry.peers.len(), 1);
@@ -1269,7 +1323,14 @@ mod render {
     fn state(machines: Vec<Machine>) -> State {
         State {
             local_hostname: "workstation".to_owned(),
-            screen_size: Some((1920.0, 1080.0)),
+            local_displays: vec![input_event::DisplayInfo::new(
+                "test",
+                0,
+                0,
+                1920,
+                1080,
+                input_event::Rotation::Normal,
+            )],
             machines,
             switch_options: SwitchOptions::default(),
             on_request: Rc::new(|_| {}),
@@ -1471,6 +1532,71 @@ mod render {
         assert!(red > 20, "the squeezed peer was not flagged ({red} pixels)");
     }
 
+    /// A desk with a rotated monitor: the bounding box covers area no screen does,
+    /// and the canvas has to draw the monitors, not the box.
+    ///
+    /// This is the layout that made the bug visible: `4000x2560` is the bounding
+    /// box of a 2560x1440 panel turned 270 degrees at (2560,0) and an upright
+    /// 2560x1440 at (0,1120). The box contains a 1120 px tall band at the top left
+    /// where there is no screen at all, and a crossing there must not be drawn as
+    /// reachable.
+    #[test]
+    fn a_rotated_desk_is_drawn_as_two_monitors_not_one_box() {
+        let mut state = state(Vec::new());
+        state.local_displays = vec![
+            input_event::DisplayInfo {
+                name: "DP-2".to_owned(),
+                x: 2560,
+                y: 0,
+                width: 2560,
+                height: 1440,
+                rotation: input_event::Rotation::Right,
+                enabled: true,
+            },
+            input_event::DisplayInfo {
+                name: "DP-3".to_owned(),
+                x: 0,
+                y: 1120,
+                width: 2560,
+                height: 1440,
+                rotation: input_event::Rotation::Normal,
+                enabled: true,
+            },
+        ];
+        state.relayout(1000.0, 620.0);
+
+        let monitors = state.local_monitors();
+        assert_eq!(monitors.len(), 2, "both monitors are drawn");
+
+        /* the rotated one is taller than it is wide on screen */
+        let rotated = monitors
+            .iter()
+            .find(|rect| (rect.w - 1440.0).abs() < 1.0)
+            .expect("the rotated monitor");
+        assert!(rotated.h > rotated.w, "{rotated:?}");
+
+        /* and the two do not cover the whole bounding box: the band at the top
+         * left is empty */
+        let bounds = state.local_screen();
+        assert_eq!((bounds.w, bounds.h), (4000.0, 2560.0));
+        let covered: f64 = monitors.iter().map(|rect| rect.w * rect.h).sum();
+        assert!(
+            covered < bounds.w * bounds.h,
+            "the monitors cover the whole bounding box, so they were drawn as one"
+        );
+
+        /* and the empty corner really is empty on the surface */
+        let mut surface = render(&mut state, 1000, 620);
+        let palette = Palette::resolve(false);
+        let background = count_closest(
+            &mut surface,
+            palette.foreground,
+            0.04,
+            &[(palette.accent, 0.9), (palette.card, 1.0)],
+        );
+        assert!(background > 1000, "{background} background pixels");
+    }
+
     /// Write a PNG of a representative layout so the picture can be looked at.
     ///
     /// Only with `LAN_MOUSE_RENDER_DEMO=/path`: a test that writes files
@@ -1488,6 +1614,28 @@ mod render {
         second.peer_size = Some((1280.0, 1024.0));
         let third = machine(2, Position::Top, (0.2, 0.8), true);
         let mut state = state(vec![first, second, third]);
+        /* the desk this was written for: a 2560x1440 panel turned 270 degrees at
+         * (2560,0) beside an upright 2560x1440 at (0,1120) */
+        state.local_displays = vec![
+            input_event::DisplayInfo {
+                name: "DP-2".to_owned(),
+                x: 2560,
+                y: 0,
+                width: 2560,
+                height: 1440,
+                rotation: input_event::Rotation::Right,
+                enabled: true,
+            },
+            input_event::DisplayInfo {
+                name: "DP-3".to_owned(),
+                x: 0,
+                y: 1120,
+                width: 2560,
+                height: 1440,
+                rotation: input_event::Rotation::Normal,
+                enabled: true,
+            },
+        ];
         let surface = render(&mut state, 1000, 620);
         let mut file =
             std::io::BufWriter::new(std::fs::File::create(path).expect("create the demo image"));

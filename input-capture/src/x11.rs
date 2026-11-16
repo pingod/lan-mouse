@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use futures_core::Stream;
 
 use super::{
-    Capture, CaptureError, CaptureEvent, EdgeRange, Position, error::X11InputCaptureCreationError,
+    Capture, CaptureError, CaptureEvent, EdgeRange, Layout, Position,
+    error::X11InputCaptureCreationError,
 };
 
 pub struct X11InputCapture {}
@@ -33,7 +34,7 @@ impl Capture for X11InputCapture {
         Ok(())
     }
 
-    async fn screen_size(&mut self) -> Option<(u32, u32)> {
+    async fn layout(&mut self) -> Option<Layout> {
         None
     }
 
