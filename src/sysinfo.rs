@@ -7,8 +7,6 @@
 //! scale, and it changes when a monitor is plugged in, so it is refreshed from
 //! the capture backend rather than probed here.
 
-use std::cell::RefCell;
-
 use lan_mouse_proto::{PeerInfo, info_slot};
 
 /// This machine's description, with the display slot kept up to date.
@@ -16,16 +14,39 @@ use lan_mouse_proto::{PeerInfo, info_slot};
 /// `PeerInfo` is `Copy`, so the borrow ends here and nothing hands out a
 /// reference into the thread local.
 pub fn local() -> PeerInfo {
-    LOCAL.with(|local| *local.borrow())
+    shared().info
 }
 
-thread_local! {
-    static LOCAL: RefCell<PeerInfo> = RefCell::new(build(None, None));
-    /* the last geometry the capture backend reported, so a later rebuild of the
-     * report does not have to ask for it again */
-    static LAYOUT: RefCell<Option<input_event::Layout>> = const { RefCell::new(None) };
-    /* the picture this machine is drawing */
-    static ARRANGEMENT: RefCell<Option<input_event::Arrangement>> = const { RefCell::new(None) };
+/// Everything the report is assembled from, shared by every thread.
+///
+/// Deliberately *not* a thread-local. The capture and emulation backends run on
+/// their own OS threads, so a thread-local copy meant each of them answered
+/// `PeerInfoRequest` with a report built from its own half-remembered state: the
+/// display list was there because the capture thread is what sets it, and the
+/// arrangement was missing because it is published on the service thread. The peer
+/// then stored a report that looked complete and carried nothing.
+static SHARED: std::sync::OnceLock<std::sync::Mutex<Shared>> = std::sync::OnceLock::new();
+
+struct Shared {
+    /// the last geometry the capture backend reported
+    layout: Option<input_event::Layout>,
+    /// the picture this machine is drawing
+    arrangement: Option<input_event::Arrangement>,
+    /// the assembled report
+    info: PeerInfo,
+}
+
+fn shared() -> std::sync::MutexGuard<'static, Shared> {
+    SHARED
+        .get_or_init(|| {
+            std::sync::Mutex::new(Shared {
+                layout: None,
+                arrangement: None,
+                info: build(None, None),
+            })
+        })
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Record the size of the area the pointer can reach and put it in the report.
@@ -34,45 +55,28 @@ thread_local! {
 /// edge range from a decoration into something both ends agree on. `None` keeps
 /// whatever the platform probe found.
 pub fn set_layout(layout: Option<input_event::Layout>) {
-    LAYOUT.with(|slot| *slot.borrow_mut() = layout.clone());
-    rebuild();
+    let mut shared = shared();
+    shared.layout = layout;
+    rebuild(&mut shared);
 }
 
 /// Publish the arrangement this machine is showing so the peer can draw the same
 /// one, and report whether it changed - a report is only worth resending when it
 /// did.
-///
-/// The revision is assigned here rather than by the caller: it has to increase on
-/// every edit *and* stay tied to the machine that made it, otherwise the two sides
-/// cannot agree on which of two pictures is current.
 pub fn set_arrangement(arrangement: Option<input_event::Arrangement>) -> bool {
-    let changed = ARRANGEMENT.with(|cell| {
-        let mut cell = cell.borrow_mut();
-        let Some(arrangement) = arrangement else {
-            return cell.take().is_some();
-        };
-        if cell.as_ref() == Some(&arrangement) {
-            return false;
-        }
-        *cell = Some(arrangement);
-        true
-    });
-    if changed {
-        rebuild();
+    let mut shared = shared();
+    if shared.arrangement == arrangement {
+        return false;
     }
-    changed
+    shared.arrangement = arrangement;
+    rebuild(&mut shared);
+    true
 }
 
 /// Re-assemble the report from the parts that change.
-fn rebuild() {
-    let layout = LAYOUT.with(|slot| slot.borrow().clone());
-    let arrangement = ARRANGEMENT.with(|cell| cell.borrow().clone());
-    LOCAL.with(|local| {
-        let updated = build(layout, arrangement);
-        if *local.borrow() != updated {
-            *local.borrow_mut() = updated;
-        }
-    });
+fn rebuild(shared: &mut Shared) {
+    let updated = build(shared.layout.clone(), shared.arrangement.clone());
+    shared.info = updated;
 }
 
 fn build(
@@ -366,6 +370,17 @@ pub fn describe(info: &PeerInfo) -> String {
 mod tests {
     use super::*;
 
+    /// The report is one per process now, so these tests cannot run at the same time
+    /// as each other - `set_layout` in one would be visible to another. Each test
+    /// takes this first; the guard is released when the test ends.
+    static EXCLUSIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+        EXCLUSIVE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn one_monitor() -> input_event::Layout {
         input_event::Layout::new(vec![input_event::DisplayInfo::new(
             "DP-1",
@@ -381,6 +396,7 @@ mod tests {
     /// not leave the new layout behind for the tests that run after it.
     #[test]
     fn the_layout_goes_into_the_display_slot() {
+        let _exclusive = exclusive();
         let before = local().get(info_slot::DISPLAYS).to_owned();
 
         set_layout(Some(one_monitor()));
@@ -397,6 +413,7 @@ mod tests {
 
     #[test]
     fn local_info_is_populated() {
+        let _exclusive = exclusive();
         let info = &local();
         // Architecture and app version are compile-time constants and must
         // always be present; OS detection always resolves to something.
@@ -413,6 +430,7 @@ mod tests {
     /// end decodes it back into rectangles.
     #[test]
     fn the_display_slot_round_trips_through_the_peer_report() {
+        let _exclusive = exclusive();
         set_layout(Some(one_monitor()));
 
         let report = flatten(&local());
@@ -431,6 +449,7 @@ mod tests {
 
     #[test]
     fn chunks_reassemble_to_the_original() {
+        let _exclusive = exclusive();
         let mut info = PeerInfo::new([
             "linux",
             "CachyOS",
@@ -465,6 +484,7 @@ mod tests {
 
     #[test]
     fn a_missing_chunk_yields_nothing() {
+        let _exclusive = exclusive();
         let info = PeerInfo::new(["a", "b", "c", "d", "e", "f", "g"]);
         let mut r = Reassembler::default();
         let pieces = chunks(&info);
@@ -479,6 +499,7 @@ mod tests {
 
     #[test]
     fn long_values_are_truncated_not_corrupted() {
+        let _exclusive = exclusive();
         let long = "x".repeat(500);
         let info = PeerInfo::new([&long, "", "", "", "", "", ""]);
         let got = info.get(info_slot::OS);
