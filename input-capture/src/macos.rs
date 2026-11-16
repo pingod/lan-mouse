@@ -50,7 +50,9 @@ fn media_key_event(cg_ev: &CGEvent) -> Option<CaptureEvent> {
         let event = &*(ForeignType::as_ptr(cg_ev) as *const objc2_core_graphics::CGEvent);
         objc2_app_kit::NSEvent::eventWithCGEvent(event)?
     };
-    let (key, state) = media_key_evdev(ns_event.data1())?;
+    let data1 = ns_event.data1();
+    let (key, state) = media_key_evdev(data1)?;
+    log::trace!("media key event: data1 = {data1:#x}, key = {key}, state = {state}");
     Some(CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
         time: 0,
         key,

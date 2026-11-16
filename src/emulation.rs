@@ -1,7 +1,7 @@
 use crate::config::local_commit;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
-use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
+use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError, ScreenEdge};
 use input_event::Event;
 use lan_mouse_proto::{Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
@@ -173,16 +173,10 @@ impl ListenTask {
                             ProtoEvent::Enter(pos, fraction) => {
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
-                                    // where the peer crossed its edge, mapped
-                                    // onto this screen in per-mille. `pos` is
-                                    // the edge of *this* device it came through.
-                                    let (x, y) = match pos {
-                                        Position::Left => (0.0, fraction),
-                                        Position::Right => (1.0, fraction),
-                                        Position::Top => (fraction, 0.0),
-                                        Position::Bottom => (fraction, 1.0),
-                                    };
-                                    self.emulation_proxy.enter(addr, x, y);
+                                    // `pos` is the edge of *this* device the
+                                    // peer came through, `fraction` the point
+                                    // along that edge it crossed at.
+                                    self.emulation_proxy.enter(addr, to_screen_edge(pos), fraction);
                                     send_event(&self.event_tx, EmulationEvent::ReleaseNotify);
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                                     send_event(&self.event_tx, EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint});
@@ -313,10 +307,9 @@ pub(crate) struct EmulationProxy {
 
 enum ProxyRequest {
     Input(Event, SocketAddr),
-    /// the peer entered this device again; clears any prior `Leave` latch
-    /// The peer entered this device; the payload is the point it crossed
-    /// its edge at, expressed as a fraction of this screen (0..=1 each).
-    Enter(SocketAddr, f64, f64),
+    /// The peer entered this device through `ScreenEdge`, at that fraction
+    /// (0..=1) along the edge. Also clears any prior `Leave` latch.
+    Enter(SocketAddr, ScreenEdge, f64),
     Remove(SocketAddr),
     Terminate,
     Reenable,
@@ -367,8 +360,8 @@ impl EmulationProxy {
         }
     }
 
-    fn enter(&self, addr: SocketAddr, x: f64, y: f64) {
-        send_event(&self.request_tx, ProxyRequest::Enter(addr, x, y));
+    fn enter(&self, addr: SocketAddr, edge: ScreenEdge, fraction: f64) {
+        send_event(&self.request_tx, ProxyRequest::Enter(addr, edge, fraction));
     }
 
     fn remove(&self, addr: SocketAddr) {
@@ -506,7 +499,7 @@ impl EmulationTask {
                         };
                         emulation.consume(event, handle).await?;
                     },
-                    Some(ProxyRequest::Enter(addr, x, y)) => {
+                    Some(ProxyRequest::Enter(addr, edge, fraction)) => {
                         self.left.remove(&addr);
                         // The pointer just crossed into this device. Make sure
                         // the peer has a virtual input to place the cursor
@@ -522,7 +515,7 @@ impl EmulationTask {
                                 handle
                             }
                         };
-                        emulation.enter(handle, x, y).await;
+                        emulation.enter(handle, edge, fraction).await;
                     }
                     Some(ProxyRequest::Remove(addr)) => {
                         self.left.insert(addr, Instant::now());
@@ -544,6 +537,15 @@ impl EmulationTask {
                 },
             }
         }
+    }
+}
+
+fn to_screen_edge(pos: Position) -> ScreenEdge {
+    match pos {
+        Position::Left => ScreenEdge::Left,
+        Position::Right => ScreenEdge::Right,
+        Position::Top => ScreenEdge::Top,
+        Position::Bottom => ScreenEdge::Bottom,
     }
 }
 

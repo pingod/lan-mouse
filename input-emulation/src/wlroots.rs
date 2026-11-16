@@ -12,6 +12,7 @@ use wayland_client::WEnum;
 use wayland_client::backend::WaylandError;
 
 use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
+use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_pointer::{Axis, AxisSource, ButtonState};
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_protocols_wlr::virtual_pointer::v1::client::{
@@ -32,10 +33,25 @@ use wayland_client::{
 
 use input_event::{Event, KeyboardEvent, PointerEvent};
 
-use super::EmulationHandle;
 use super::error::WaylandBindError;
+use super::{EmulationHandle, ScreenEdge};
+
+/// The layout rectangle of one output, in compositor coordinates.
+#[derive(Debug, Clone, Copy, Default)]
+struct OutputInfo {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
 
 struct State {
+    /// every output's layout rectangle, needed to place the cursor on the
+    /// output the peer actually crossed into instead of the whole layout
+    outputs: Vec<OutputInfo>,
+    /// outputs being built: `wl_output` reports geometry, mode and scale in
+    /// several events, `done` says the picture is complete
+    pending_outputs: HashMap<WlOutput, OutputInfo>,
     keymap: Option<(u32, OwnedFd, u32)>,
     /// whether the seat already reported its capabilities
     capabilities_known: bool,
@@ -74,11 +90,24 @@ impl WlrootsEmulation {
             .bind(&qh, 1..=1, ())
             .map_err(|e| WaylandBindError::new(e, "virtual-keyboard-unstable-v1"))?;
 
+        for global in globals.contents().clone_list() {
+            if global.interface == "wl_output" {
+                let _ = globals.registry().bind::<WlOutput, _, _>(
+                    global.name,
+                    global.version.min(4),
+                    &qh,
+                    (),
+                );
+            }
+        }
+
         let input_for_client: HashMap<EmulationHandle, VirtualInput> = HashMap::new();
 
         let mut emulate = WlrootsEmulation {
             last_flush_failed: false,
             state: State {
+                outputs: Vec::new(),
+                pending_outputs: HashMap::new(),
                 keymap: None,
                 capabilities_known: false,
                 keyboard_available: false,
@@ -121,6 +150,19 @@ impl WlrootsEmulation {
                 "the seat does not advertise a keyboard: key events can not be emulated yet"
             );
         }
+        /* The output rectangles arrive right after binding them; without this
+         * the cursor placement falls back to the whole layout, which puts it
+         * into dead space when the outputs are not a filled rectangle.
+         */
+        for _ in 0..8 {
+            if !emulate.state.outputs.is_empty() {
+                break;
+            }
+            emulate.queue.blocking_dispatch(&mut emulate.state)?;
+        }
+        if emulate.state.outputs.is_empty() {
+            log::debug!("the compositor reported no outputs, the cursor is placed on the layout");
+        }
         // let fd = unsafe { &File::from_raw_fd(emulate.state.keymap.unwrap().1.as_raw_fd()) };
         // let mmap = unsafe { MmapOptions::new().map_copy(fd).unwrap() };
         // log::debug!("{:?}", &mmap[..100]);
@@ -160,6 +202,80 @@ impl State {
         // the shared keyboard outlives every client; keys are released by InputEmulation::destroy
         if let Some(input) = self.input_for_client.remove(&handle) {
             input.pointer.destroy();
+        }
+    }
+}
+
+impl State {
+    /// The rectangle spanning every output. Absolute pointer motion is in
+    /// these coordinates, so the layout is the coordinate space the cursor is
+    /// placed in.
+    fn layout(&self) -> Option<OutputInfo> {
+        let first = *self.outputs.first()?;
+        let mut layout = first;
+        for output in &self.outputs[1..] {
+            let right = layout.x + layout.width;
+            let bottom = layout.y + layout.height;
+            let out_right = output.x + output.width;
+            let out_bottom = output.y + output.height;
+            layout.x = layout.x.min(output.x);
+            layout.y = layout.y.min(output.y);
+            layout.width = right.max(out_right) - layout.x;
+            layout.height = bottom.max(out_bottom) - layout.y;
+        }
+        Some(layout)
+    }
+
+    /// The output whose rectangle touches the layout boundary the peer came
+    /// through, i.e. the one that is actually reachable over that edge.
+    fn output_at_edge(&self, edge: ScreenEdge) -> Option<OutputInfo> {
+        self.outputs
+            .iter()
+            .copied()
+            .min_by_key(|output| match edge {
+                ScreenEdge::Left => output.x,
+                ScreenEdge::Right => -(output.x + output.width),
+                ScreenEdge::Top => output.y,
+                ScreenEdge::Bottom => -(output.y + output.height),
+            })
+    }
+}
+
+impl Dispatch<WlOutput, ()> for State {
+    fn event(
+        state: &mut Self,
+        proxy: &WlOutput,
+        event: wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let output = state.pending_outputs.entry(proxy.clone()).or_default();
+        match event {
+            wl_output::Event::Geometry { x, y, .. } => {
+                output.x = x;
+                output.y = y;
+            }
+            wl_output::Event::Mode {
+                flags: WEnum::Value(flags),
+                width,
+                height,
+                ..
+            } => {
+                // only the current mode describes the rectangle in use
+                if flags.contains(wl_output::Mode::Current) {
+                    output.width = width;
+                    output.height = height;
+                }
+            }
+            wl_output::Event::Done => {
+                let done = *output;
+                if done.width > 0 && done.height > 0 {
+                    state.outputs.push(done);
+                }
+                state.pending_outputs.remove(proxy);
+            }
+            _ => {}
         }
     }
 }
@@ -208,7 +324,7 @@ impl Emulation for WlrootsEmulation {
         Ok(())
     }
 
-    async fn enter(&mut self, handle: EmulationHandle, x: f64, y: f64) {
+    async fn enter(&mut self, handle: EmulationHandle, edge: ScreenEdge, fraction: f64) {
         let Some(input) = self.state.input_for_client.get(&handle) else {
             log::debug!("no virtual pointer for handle {handle}, not placing the cursor");
             return;
@@ -218,9 +334,33 @@ impl Emulation for WlrootsEmulation {
          * looks like the cursor teleported when the user left the peer at the
          * top of its screen while this one had it parked at the bottom.
          * Absolute motion is the only way to place it without knowing its
-         * current position; the extent is arbitrary as long as it matches the
-         * coordinates (`1000` therefore means the whole layout).
+         * current position.
+         *
+         * The point is placed on the output that touches the layout edge the
+         * peer came through: with an irregular layout (say a second monitor
+         * that hangs below the first) a fraction of the whole layout can land
+         * in dead space, and the compositor then clamps it to whatever output
+         * is closest, which is neither the expected monitor nor the expected
+         * position.
          */
+        let Some(layout) = self.state.layout() else {
+            log::debug!("no output is known, not placing the cursor");
+            return;
+        };
+        let target = self.state.output_at_edge(edge).unwrap_or(layout);
+        /* Keep the cursor a few pixels inside: on the edge itself this side
+         * immediately sees it leave the screen again and hands the pointer
+         * straight back to the peer.
+         */
+        const INSET: f64 = 8.0;
+        let (x, y) = edge.point_on_inset(
+            fraction,
+            target.x as f64,
+            target.y as f64,
+            (target.x + target.width - 1) as f64,
+            (target.y + target.height - 1) as f64,
+            INSET,
+        );
         static START: OnceLock<Instant> = OnceLock::new();
         let now: u32 = START
             .get_or_init(Instant::now)
@@ -228,15 +368,33 @@ impl Emulation for WlrootsEmulation {
             .as_millis()
             .try_into()
             .unwrap_or(u32::MAX);
+        /* `motion_absolute` is in per-mille of the layout. Strict wlroots
+         * compositors place the cursor exactly there; Hyprland is known to
+         * apply its pointer acceleration to these events instead, so the
+         * placement can be off there.
+         */
         const EXTENT: u32 = 1000;
-        let x = (x.clamp(0.0, 1.0) * EXTENT as f64) as u32;
-        let y = (y.clamp(0.0, 1.0) * EXTENT as f64) as u32;
-        input.pointer.motion_absolute(now, x, y, EXTENT, EXTENT);
+        let rel_x = (x - layout.x as f64) / (layout.width.max(1) as f64);
+        let rel_y = (y - layout.y as f64) / (layout.height.max(1) as f64);
+        let target_x = (rel_x.clamp(0.0, 1.0) * EXTENT as f64) as u32;
+        let target_y = (rel_y.clamp(0.0, 1.0) * EXTENT as f64) as u32;
+        log::debug!(
+            "placing the cursor at {target_x}/{EXTENT} x {target_y}/{EXTENT} (edge {edge:?}, \
+             fraction {fraction:.2}, output {}x{}+{}+{})",
+            target.width,
+            target.height,
+            target.x,
+            target.y
+        );
+        input
+            .pointer
+            .motion_absolute(now, target_x, target_y, EXTENT, EXTENT);
         input.pointer.frame();
         if let Err(e) = self.queue.flush() {
             log::error!("failed to position the cursor: {e}");
         }
     }
+
     async fn create(&mut self, handle: EmulationHandle) {
         self.state.add_client(handle);
         if let Err(e) = self.queue.flush() {

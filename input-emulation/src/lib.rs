@@ -32,6 +32,53 @@ mod error;
 
 pub type EmulationHandle = u64;
 
+/// The edge of a screen a pointer crosses when it moves to another device.
+///
+/// It is named from the point of view of the device being entered: a peer that
+/// leaves through its own top edge enters this device through `Bottom`? No —
+/// the sender reports the edge of the receiving screen, so `Top` always means
+/// "came in over the top edge of this screen".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenEdge {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl ScreenEdge {
+    /// The point `fraction` (0..=1) along this edge of the rectangle spanning
+    /// `(x0, y0)` to `(x1, y1)`.
+    pub fn point_on(self, fraction: f64, x0: f64, y0: f64, x1: f64, y1: f64) -> (f64, f64) {
+        self.point_on_inset(fraction, x0, y0, x1, y1, 0.0)
+    }
+
+    /// Like [`ScreenEdge::point_on`], but `inset` pixels inside the rectangle.
+    ///
+    /// Placing the cursor exactly on the edge makes the receiving side see it
+    /// cross that same edge again, which bounces the pointer straight back to
+    /// the peer, so the cursor is kept a little inside.
+    pub fn point_on_inset(
+        self,
+        fraction: f64,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        inset: f64,
+    ) -> (f64, f64) {
+        let fraction = fraction.clamp(0.0, 1.0);
+        let along_x = x0 + fraction * (x1 - x0);
+        let along_y = y0 + fraction * (y1 - y0);
+        match self {
+            Self::Left => (x0 + inset, along_y),
+            Self::Right => (x1 - inset, along_y),
+            Self::Top => (along_x, y0 + inset),
+            Self::Bottom => (along_x, y1 - inset),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Backend {
     #[cfg(wlroots)]
@@ -153,10 +200,10 @@ impl InputEmulation {
         }
     }
 
-    /// Place the cursor at the point a peer crossed its edge, given as a
-    /// fraction of this screen (`0..=1` each). See [`Emulation::enter`].
-    pub async fn enter(&mut self, handle: EmulationHandle, x: f64, y: f64) {
-        self.emulation.enter(handle, x, y).await;
+    /// Place the cursor where the peer crossed the matching edge of this
+    /// screen. See [`Emulation::enter`].
+    pub async fn enter(&mut self, handle: EmulationHandle, edge: ScreenEdge, fraction: f64) {
+        self.emulation.enter(handle, edge, fraction).await;
     }
 
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
@@ -284,15 +331,15 @@ trait Emulation: Send {
     ) -> Result<(), EmulationError>;
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
-    /// A peer started driving this device: place the cursor at `x`/`y`
-    /// (fractions of the screen, 0..=1) so the pointer continues from the
-    /// point it crossed on the peer instead of from wherever it was parked.
+    /// A peer started driving this device: place the cursor where it crossed
+    /// the peer's `edge`, at the same `fraction` (0..=1) along that edge of
+    /// this screen.
     ///
-    /// Backends without absolute pointer positioning keep the cursor where it
-    /// is, which is what they did before.
-    /// Place the cursor on this device at the given fraction of the screen
-    /// (0..=1 along each axis). Backends that cannot position the pointer
-    /// absolutely keep the default, which does nothing.
-    async fn enter(&mut self, _handle: EmulationHandle, _x: f64, _y: f64) {}
+    /// Without it the pointer continues from wherever it was parked here,
+    /// which looks like the cursor jumped when the peer was left at one corner
+    /// of its screen while this one had it parked in the opposite corner.
+    /// Backends without absolute pointer positioning keep the default, which
+    /// leaves the cursor alone.
+    async fn enter(&mut self, _handle: EmulationHandle, _edge: ScreenEdge, _fraction: f64) {}
     async fn terminate(&mut self);
 }

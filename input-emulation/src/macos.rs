@@ -1,4 +1,4 @@
-use super::{Emulation, EmulationHandle, error::EmulationError};
+use super::{Emulation, EmulationHandle, ScreenEdge, error::EmulationError};
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core_foundation::{base::TCFType, string::CFString};
@@ -509,7 +509,7 @@ fn clamp_to_screen_space(
 
 #[async_trait]
 impl Emulation for MacOSEmulation {
-    async fn enter(&mut self, _handle: EmulationHandle, x: f64, y: f64) {
+    async fn enter(&mut self, _handle: EmulationHandle, edge: ScreenEdge, fraction: f64) {
         /*
          * Synthesized motion is relative, so without this the pointer would
          * continue from wherever it was on this screen — which looks like the
@@ -517,10 +517,14 @@ impl Emulation for MacOSEmulation {
          * while this one had it parked at the bottom.
          */
         let bounds = CGDisplay::main().bounds();
-        let point = CGPoint::new(
-            bounds.origin.x + bounds.size.width * x.clamp(0.0, 1.0),
-            bounds.origin.y + bounds.size.height * y.clamp(0.0, 1.0),
+        let (x, y) = edge.point_on(
+            fraction,
+            bounds.origin.x,
+            bounds.origin.y,
+            bounds.origin.x + bounds.size.width - 1.0,
+            bounds.origin.y + bounds.size.height - 1.0,
         );
+        let point = CGPoint::new(x, y);
         if let Err(e) = CGDisplay::warp_mouse_cursor_position(point) {
             log::warn!("failed to position the cursor: {e}");
         }

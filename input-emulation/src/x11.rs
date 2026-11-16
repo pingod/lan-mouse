@@ -11,7 +11,7 @@ use input_event::{
 
 use crate::error::EmulationError;
 
-use super::{Emulation, EmulationHandle, error::X11EmulationCreationError};
+use super::{Emulation, EmulationHandle, ScreenEdge, error::X11EmulationCreationError};
 
 pub(crate) struct X11Emulation {
     display: *mut xlib::Display,
@@ -109,7 +109,7 @@ impl Drop for X11Emulation {
 
 #[async_trait]
 impl Emulation for X11Emulation {
-    async fn enter(&mut self, _handle: EmulationHandle, x: f64, y: f64) {
+    async fn enter(&mut self, _handle: EmulationHandle, edge: ScreenEdge, fraction: f64) {
         /*
          * Place the cursor at the point the peer crossed its edge instead of
          * letting it continue from wherever it was parked on this screen.
@@ -125,8 +125,9 @@ impl Emulation for X11Emulation {
             log::debug!("cannot position the cursor on a {width}x{height} screen");
             return;
         }
-        let x = (x.clamp(0.0, 1.0) * (width - 1) as f64) as i32;
-        let y = (y.clamp(0.0, 1.0) * (height - 1) as f64) as i32;
+        let (x, y) = edge.point_on(fraction, 0.0, 0.0, (width - 1) as f64, (height - 1) as f64);
+        let x = x as i32;
+        let y = y as i32;
         unsafe {
             xlib::XWarpPointer(
                 self.display,
