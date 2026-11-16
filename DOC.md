@@ -126,6 +126,25 @@ two screens of different sizes agree without knowing each other's pixels.
 The first two need the stretch at capture-creation time and rebuild the barrier
 when it changes; the latter two read it per event.
 
+### The screen size comes from the backend, eventually
+
+The canvas draws the local screen to scale with a size the capture backend
+reports, and that size is not available when the barriers are registered: the
+portal backend's `create` only queues a message, and the session that can answer
+`zones` is established afterwards inside the capture task. So the first read
+comes back empty.
+
+The capture task therefore polls the backend once a second and publishes the
+first answer it gets - unconditionally, because plugging a monitor in changes the
+answer without changing which stretch of an edge anybody owns. A read that
+returns nothing never overwrites a size that is already known: from inside the
+task "the backend has not talked to the compositor yet" and "there are no
+screens" look the same, and blanking a working layout is the worse mistake.
+
+The size travels to the peer in the existing `PeerInfo` display slot, as
+`"<width>x<height>"`; `parse_screen_size` reads it back out, and also reads the
+older `"<n> displays, <w>x<h>"` a peer on an earlier build still sends.
+
 ### Non-goals
 
 - **Per-monitor geometry.** A machine's monitors are flattened into one rectangle.
