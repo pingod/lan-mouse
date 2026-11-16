@@ -394,6 +394,58 @@ mod tests {
 
     /// The report is refreshed, not built once, so a test that changes it must
     /// not leave the new layout behind for the tests that run after it.
+    /// The picture has to fit in the slots it travels in.
+    ///
+    /// It did not: this desk needed 140 bytes for a slot of 124, so the arrangement
+    /// arrived truncated - and a truncated one still decodes, as a desk with a screen
+    /// missing, which is why nothing looked broken while nothing synced.
+    #[test]
+    fn the_arrangement_fits_in_the_slots_it_travels_in() {
+        let _exclusive = exclusive();
+        let mut arrangement = input_event::Arrangement::new(1, "cachyos-x8664");
+        arrangement.machines.push(input_event::ArrangedMachine {
+            hostname: "cachyos-x8664".to_owned(),
+            authored: true,
+            screens: vec![
+                input_event::ScreenRect {
+                    x: 0,
+                    y: 1120,
+                    width: 2560,
+                    height: 1440,
+                },
+                input_event::ScreenRect {
+                    x: 2560,
+                    y: 0,
+                    width: 1440,
+                    height: 2560,
+                },
+            ],
+        });
+        arrangement.machines.push(input_event::ArrangedMachine {
+            hostname: "192.168.1.5".to_owned(),
+            authored: false,
+            screens: vec![input_event::ScreenRect {
+                x: 0,
+                y: -1500,
+                width: 2560,
+                height: 1440,
+            }],
+        });
+        set_arrangement(Some(arrangement));
+        let report = local();
+        assert_eq!(report.world(), {
+            let mut expected = input_event::Arrangement::decode(&report.world()).expect("decodes");
+            expected.revision = 1;
+            expected.author = "cachyos-x8664".to_owned();
+            expected.encode()
+        });
+        /* two screens survived, not one */
+        let decoded = input_event::Arrangement::decode(&report.world()).expect("decodes");
+        assert_eq!(decoded.authored_screens().len(), 2);
+        assert_eq!(decoded.peer_screens().len(), 1);
+        set_arrangement(None);
+    }
+
     #[test]
     fn the_layout_goes_into_the_display_slot() {
         let _exclusive = exclusive();

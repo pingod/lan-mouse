@@ -787,7 +787,11 @@ impl State {
          * desk instead of deriving its own. Skipped while a peer's picture is being
          * drawn, otherwise each side would republish the other's and the revision
          * would only ever go up. */
-        if self.newer_peer_picture().is_none() {
+        /* Not while something is being dragged: the picture would be the transient
+         * geometry of a card mid-gesture, published dozens of times a second to a peer
+         * that cannot use it. The commit that ends the drag publishes the result. */
+        let settled = self.drag.is_none() && self.resize.is_none() && self.moving_local.is_none();
+        if settled && self.newer_peer_picture().is_none() {
             let encoded = self.local_picture().encode();
             if encoded != self.published {
                 self.published = encoded.clone();

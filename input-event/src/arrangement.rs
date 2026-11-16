@@ -115,18 +115,23 @@ impl Arrangement {
             .unwrap_or(&[])
     }
 
-    /// `revision|author|host|x,y,w,h;...|host|x,y,w,h;...`
+    /// `revision|author|flag|x,y,w,h;...|flag|x,y,w,h;...`
     ///
-    /// Deliberately textual: it travels in a fixed-width report that only needs to
-    /// be understood by the same code on the other machine, and a format that can be
-    /// read in a log is worth more than a compact one here.
+    /// Deliberately textual: it travels in a fixed-width report that only needs to be
+    /// understood by the same code on the other machine, and a format that can be
+    /// read in a log is worth more than a compact one.
+    ///
+    /// The hostnames are left out. They are not identities - each side names the other
+    /// however its own configuration says, which is what made adoption look for itself
+    /// and find nothing - and a picture is read by the machine that produced it and
+    /// the machine it is about, so the flag says everything the receiver needs. It is
+    /// also what keeps the encoding inside the report: with names it was 140 bytes for
+    /// this desk, in a slot of 124.
     pub fn encode(&self) -> String {
         let mut out = format!("{}|{}", self.revision, clean(&self.author));
         for machine in &self.machines {
             out.push('|');
             out.push(if machine.authored { '1' } else { '0' });
-            out.push(':');
-            out.push_str(&clean(&machine.hostname));
             out.push('|');
             let screens = machine
                 .screens
@@ -150,22 +155,21 @@ impl Arrangement {
         let revision = parts.next()?.parse().ok()?;
         let author = parts.next()?.to_owned();
         let mut machines = Vec::new();
-        while let Some(header) = parts.next() {
-            let (authored, hostname) = header
-                .split_once(':')
-                .map(|(flag, host)| (flag == "1", host.to_owned()))
-                .unwrap_or((false, header.to_owned()));
+        while let Some(flag) = parts.next() {
+            let authored = flag == "1";
             let screens = parts.next().unwrap_or_default();
             let screens = screens
                 .split(';')
                 .filter(|piece| !piece.is_empty())
                 .filter_map(parse_screen)
                 .collect::<Vec<_>>();
-            if hostname.is_empty() && screens.is_empty() {
+            if screens.is_empty() {
                 continue;
             }
             machines.push(ArrangedMachine {
-                hostname,
+                /* the name is not on the wire; a caller that needs one has the machine
+                 * it asked about */
+                hostname: String::new(),
                 authored,
                 screens,
             });
@@ -237,8 +241,23 @@ mod tests {
     #[test]
     fn an_arrangement_survives_a_round_trip() {
         let arrangement = desk();
-        let text = arrangement.encode();
-        assert_eq!(Arrangement::decode(&text), Some(arrangement));
+        let decoded = Arrangement::decode(&arrangement.encode()).expect("decodes");
+        assert_eq!(decoded.revision, arrangement.revision);
+        assert_eq!(decoded.author, arrangement.author);
+        /* names are not on the wire; the flag and the rectangles are */
+        assert_eq!(decoded.authored_screens(), arrangement.authored_screens());
+        assert_eq!(
+            decoded
+                .peer_screens()
+                .iter()
+                .map(|(_, s)| *s)
+                .collect::<Vec<_>>(),
+            arrangement
+                .peer_screens()
+                .iter()
+                .map(|(_, s)| *s)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -301,8 +320,8 @@ mod tests {
             screens: vec![rect(0, 0, 10, 10)],
         });
         let decoded = Arrangement::decode(&arrangement.encode()).expect("decodes");
+        /* the author still travels, so it still has to be cleaned */
         assert_eq!(decoded.author, "a_b_c");
-        assert_eq!(decoded.machines[0].hostname, "x_y");
         assert!(decoded.machines[0].authored);
         assert_eq!(decoded.machines[0].screens, vec![rect(0, 0, 10, 10)]);
     }

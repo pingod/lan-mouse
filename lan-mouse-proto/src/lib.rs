@@ -27,7 +27,7 @@ pub const PEER_INFO_FIELD: usize = 32;
 /// somewhere and it does not fit in one slot: two monitors are around 60 bytes
 /// and `PEER_INFO_FIELD` is 32. It spans `DISPLAYS..PEER_INFO_FIELDS` and is
 /// reassembled on the other side.
-pub const PEER_INFO_FIELDS: usize = 16;
+pub const PEER_INFO_FIELDS: usize = 20;
 
 /// Bytes of a [`ProtoEvent::PeerInfo`] carried per chunk.
 ///
