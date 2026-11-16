@@ -589,6 +589,13 @@ impl Service {
                     self.resend_report = true;
                 }
             }
+            FrontendRequest::DumpOwnReport => {
+                let report = crate::sysinfo::local();
+                log::info!("own report: displays={:?}", report.displays());
+                log::info!("own report: world={:?}", report.world());
+                let chunks = crate::sysinfo::chunks(&report);
+                log::info!("own report: {} chunk(s)", chunks.len());
+            }
             FrontendRequest::RefreshPeerInfo(handle) => {
                 log::info!("refreshing machine details for client {handle}");
                 self.capture.request_peer_info(handle);

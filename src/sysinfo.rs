@@ -287,9 +287,23 @@ pub fn flatten(info: &PeerInfo) -> lan_mouse_ipc::IncomingInfo {
 pub fn chunks(info: &PeerInfo) -> Vec<lan_mouse_proto::ProtoEvent> {
     use lan_mouse_proto::{PEER_INFO_CHUNK, ProtoEvent};
 
-    // Flatten the fixed slots into one byte string; trailing NULs are kept so
-    // the receiver can rebuild the exact same layout.
-    let bytes: Vec<u8> = info.fields.iter().flatten().copied().collect();
+    // Flatten the fixed slots into one byte string.
+    //
+    // Only up to the last slot that carries anything. The record is fixed width, but
+    // most of it is empty - the picture lives in the last few slots - and sending the
+    // padding meant forty datagrams where a handful do. Forty datagrams over UDP means
+    // forty chances to lose one, and a report missing one piece is a report that never
+    // arrives: the picture was being dropped by its own transport.
+    let used = info
+        .fields
+        .iter()
+        .rposition(|slot| slot.iter().any(|byte| *byte != 0))
+        .map(|last| last + 1)
+        .unwrap_or(0);
+    let bytes: Vec<u8> = info.fields.iter().take(used).flatten().copied().collect();
+    if bytes.is_empty() {
+        return Vec::new();
+    }
     let total = bytes.len().div_ceil(PEER_INFO_CHUNK);
     bytes
         .chunks(PEER_INFO_CHUNK)
@@ -371,8 +385,10 @@ impl Reassembler {
         self.total = None;
         self.started = None;
 
-        let expected = PEER_INFO_FIELDS * PEER_INFO_FIELD;
-        if buf.len() < expected {
+        /* A report only carries the slots up to its last non-empty one, so it can be
+         * shorter than the full record; the rest is zero, which is what an absent slot
+         * means. */
+        if buf.is_empty() || buf.len() > PEER_INFO_FIELDS * PEER_INFO_FIELD {
             return None;
         }
         let mut fields = [[0u8; PEER_INFO_FIELD]; PEER_INFO_FIELDS];
@@ -579,6 +595,41 @@ mod tests {
         }
     }
 
+    /// A report must not be mostly padding.
+    ///
+    /// The record is fixed width but almost all of it is empty: sending all 20 slots
+    /// took forty datagrams for a desk with two screens, and forty datagrams over UDP is
+    /// forty chances to lose one - a report missing one piece never arrives at all.
+    #[test]
+    fn a_report_is_only_as_long_as_its_content() {
+        let _exclusive = exclusive();
+        let mut info = PeerInfo::new(["linux", "CachyOS", "", "x86_64", "host", "", ""]);
+        info.set_displays("DP-2:2560,0:1440x2560:normal:1;DP-3:0,1120:2560x1440:normal:1");
+        info.set_world(
+            "1999999999999|cachyos|1|0,1120,2560,1440;2560,0,1440,2560|0|0,-1500,2560,1440",
+        );
+        let pieces = chunks(&info);
+        /* the picture is in the last slots, so it is the length that matters */
+        assert!(
+            pieces.len() <= 16,
+            "{} datagrams is too many to arrive reliably",
+            pieces.len()
+        );
+
+        /* and it still reassembles, in any order */
+        let mut r = Reassembler::default();
+        let mut out = None;
+        for piece in pieces.iter().rev() {
+            let lan_mouse_proto::ProtoEvent::PeerInfoChunk { index, total, data } = piece else {
+                panic!("expected a chunk");
+            };
+            out = r.push(*index, *total, data).or(out);
+        }
+        let out = out.expect("reassembled");
+        assert_eq!(out.world(), info.world());
+        assert_eq!(out.displays(), info.displays());
+    }
+
     /// UDP reorders and drops, so the reassembler must not depend on arrival order.
     ///
     /// A report is forty datagrams. The first version required `index == next`
@@ -594,7 +645,7 @@ mod tests {
         );
 
         let pieces = chunks(&info);
-        assert!(pieces.len() > 10, "the report should span many datagrams");
+        assert!(pieces.len() > 1, "the report should span several datagrams");
         let mut r = Reassembler::default();
         let mut out = None;
         /* reversed, which is the worst case a real network can produce */
@@ -615,10 +666,14 @@ mod tests {
         let info = PeerInfo::new(["linux", "", "", "", "host", "", ""]);
         let pieces = chunks(&info);
 
+        assert!(
+            pieces.len() > 1,
+            "the test needs a report with several pieces"
+        );
         let mut r = Reassembler::default();
         /* drop one piece of the first report */
         for (i, piece) in pieces.iter().enumerate() {
-            if i == 3 {
+            if i == 0 {
                 continue;
             }
             let lan_mouse_proto::ProtoEvent::PeerInfoChunk { index, total, data } = piece else {

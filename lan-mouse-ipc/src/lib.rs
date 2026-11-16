@@ -519,6 +519,8 @@ pub enum FrontendRequest {
     SubscribeLogs(Option<usize>),
     /// re-ask a peer for its machine details
     RefreshPeerInfo(ClientHandle),
+    /// ask the daemon to print the report it sends peers
+    DumpOwnReport,
     /// Publish the arrangement this frontend is drawing.
     ///
     /// The canvas owns the geometry, so it produces the picture; the daemon only

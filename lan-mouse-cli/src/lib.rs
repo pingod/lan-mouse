@@ -90,6 +90,8 @@ enum CliSubcommand {
     SetPort { id: ClientHandle, port: u16 },
     /// set position
     SetPosition { id: ClientHandle, pos: Position },
+    /// Print the report this daemon sends peers, and how many chunks it takes.
+    DumpOwnReport,
     /// Publish an arrangement as if the canvas had drawn it.
     ///
     /// The window normally does this; the command exists to check the transport
@@ -307,6 +309,10 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         CliSubcommand::SetPosition { id, pos } => {
             ensure_client_exists(&mut rx, &mut tx, id).await?;
             tx.request(FrontendRequest::UpdatePosition(id, pos)).await?
+        }
+        CliSubcommand::DumpOwnReport => {
+            tx.request(FrontendRequest::DumpOwnReport).await?;
+            println!("asked; see the daemon log");
         }
         CliSubcommand::PublishArrangement { arrangement } => {
             tx.request(FrontendRequest::PublishArrangement { arrangement })

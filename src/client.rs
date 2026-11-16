@@ -370,8 +370,29 @@ impl ClientManager {
             s.peer_hostname = info.get(info_slot::HOSTNAME).to_owned();
             s.peer_app_version = info.get(info_slot::APP_VERSION).to_owned();
             s.peer_commit_short = info.get(info_slot::COMMIT).to_owned();
-            s.peer_displays = info.displays();
-            s.peer_arrangement = info.world();
+            /* A report reaches this machine from three places - the handshake, an
+             * answer to `PeerInfoRequest`, and a push when the peer's picture changes -
+             * and they race. A push that arrives before an older answer was then
+             * overwritten by it, which is why the arrangement was missing while the
+             * display list (which rarely changes, so any report carries it) survived.
+             *
+             * The picture carries a revision, so an older one never replaces a newer
+             * one. A report with no picture at all is accepted only when nothing is
+             * stored yet: a peer that genuinely cleared its arrangement sends a
+             * report whose revision is newer, not an empty slot. */
+            let incoming = info.world();
+            let incoming_rev = input_event::Arrangement::decode(&incoming).map(|a| a.revision);
+            let stored_rev =
+                input_event::Arrangement::decode(&s.peer_arrangement).map(|a| a.revision);
+            let keep = match (stored_rev, incoming_rev) {
+                (Some(stored), Some(incoming)) => stored > incoming,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if !keep {
+                s.peer_displays = info.displays();
+                s.peer_arrangement = incoming;
+            }
         }
     }
 

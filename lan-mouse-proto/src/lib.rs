@@ -35,7 +35,12 @@ pub const PEER_INFO_FIELDS: usize = 20;
 /// few bytes never reach the connecting side, while its 2-byte `Pong` and
 /// 9-byte `Hello` do. 16 keeps a chunk at 19 bytes, inside that window, and the
 /// 257-byte report needs 17 of them.
-pub const PEER_INFO_CHUNK: usize = 16;
+/// How many bytes of a report travel in one datagram.
+///
+/// Larger is better here: a report is one datagram per chunk, and every datagram is a
+/// chance for the report to be lost for good. At 16 bytes a two-monitor desk needed
+/// forty of them; at 64 it needs a handful, and 64 is far below any path MTU.
+pub const PEER_INFO_CHUNK: usize = 64;
 
 /// defines the maximum size an encoded event can take up
 ///
