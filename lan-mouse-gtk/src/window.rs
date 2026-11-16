@@ -16,8 +16,11 @@ use lan_mouse_ipc::{
 };
 
 use crate::{
-    arrangement::Machine, authorization_window::AuthorizationWindow,
-    fingerprint_window::FingerprintWindow, key_object::KeyObject, key_row::KeyRow,
+    arrangement::{Canvas, Machine, MachineRequest},
+    authorization_window::AuthorizationWindow,
+    fingerprint_window::FingerprintWindow,
+    key_object::KeyObject,
+    key_row::KeyRow,
 };
 
 use super::{client_object::ClientObject, client_row::ClientRow};
@@ -292,9 +295,13 @@ impl Window {
         row
     }
 
-    /// Redraw the visual arrangement from the client store. Called from every
+    /// Update the visual arrangement from the client store. Called from every
     /// place that can change a peer (a new snapshot entry, a position change or
-    /// an activation), so the grid never shows stale edges.
+    /// an activation), so the canvas never shows a stale edge.
+    ///
+    /// The canvas is built once and then only fed new data: a rebuild on every
+    /// broadcast destroyed the widget the pointer was pressed into, which killed
+    /// a drag in the middle of a gesture and reset the zoom.
     fn refresh_arrangement(&self) {
         let machines = self
             .clients()
@@ -302,6 +309,10 @@ impl Window {
             .filter_map(|client| client.ok())
             .map(|client| {
                 let data = client.get_data();
+                /* read the ranges before `data.hostname` is moved out of the
+                 * struct by `Option::filter`, which borrows the rest */
+                let (edge, peer_edge, peer_size) =
+                    (data.edge(), data.peer_edge(), data.peer_size());
                 Machine {
                     handle: client.handle(),
                     hostname: data
@@ -310,24 +321,64 @@ impl Window {
                         .unwrap_or_else(|| "unknown host".to_string()),
                     position: data.position.parse().unwrap_or_default(),
                     active: data.active,
+                    edge,
+                    peer_edge,
+                    peer_size,
                 }
             })
             .collect::<Vec<_>>();
 
-        let local_hostname = self.imp().hostname_label.text().to_string();
-        crate::arrangement::rebuild(
-            &self.imp().arrangement_box,
-            &local_hostname,
-            &machines,
-            clone!(
-                #[weak(rename_to = window)]
-                self,
-                move |handle: ClientHandle, position: Position| {
-                    log::debug!("request: moving client {handle} to the {position} edge");
-                    window.request(FrontendRequest::UpdatePosition(handle, position));
+        let imp = self.imp();
+        let local_hostname = imp.hostname_label.text().to_string();
+        let switch_options = imp.switch_options.borrow().clone();
+        let screen_size = *imp.screen_size.borrow();
+
+        let mut canvas = imp.canvas.borrow_mut();
+        let canvas = canvas.get_or_insert_with(|| {
+            Canvas::build(
+                &imp.arrangement_box,
+                clone!(
+                    #[weak(rename_to = window)]
+                    self,
+                    move |request| window.handle_arrangement_request(request)
+                ),
+            )
+        });
+        canvas.update(&local_hostname, &machines, screen_size, &switch_options);
+    }
+
+    /// Turn what the canvas decided into a request for the daemon.
+    ///
+    /// One request per link: the daemon takes the edge and both ranges together,
+    /// so a move does not leave the old ranges registered on the new edge in
+    /// between.
+    fn handle_arrangement_request(&self, request: MachineRequest) {
+        match request {
+            MachineRequest::Move {
+                handle,
+                position,
+                edge,
+                peer_edge,
+            } => {
+                log::debug!("request: client {handle} on the {position} edge {edge}");
+                self.request(FrontendRequest::UpdateLink {
+                    handle,
+                    position,
+                    edge,
+                    peer_edge,
+                });
+            }
+            MachineRequest::AutoArrange(updates) => {
+                for (handle, position, edge, peer_edge) in updates {
+                    self.request(FrontendRequest::UpdateLink {
+                        handle,
+                        position,
+                        edge,
+                        peer_edge,
+                    });
                 }
-            ),
-        );
+            }
+        }
     }
 
     pub(super) fn new_client(
@@ -484,6 +535,17 @@ impl Window {
 
     pub(super) fn request_release_bind(&self, bind: String) {
         self.request(FrontendRequest::UpdateReleaseBind(bind));
+    }
+
+    /// Show the edge-crossing thresholds on the Screens page.
+    ///
+    /// They change what a crossing means: an edge that needs a second hit, or
+    /// whose corners are blocked, is not reachable the way the canvas alone
+    /// suggests, so the canvas states them instead of leaving them in the config
+    /// file.
+    pub(super) fn set_switch_options(&self, options: &lan_mouse_ipc::SwitchOptions) {
+        self.imp().switch_options.replace(options.clone());
+        self.refresh_arrangement();
     }
 
     /// Ask the daemon for the hotkey rules, version and autostart state.
@@ -906,12 +968,23 @@ impl Window {
             log::warn!("could not find row for handle {handle}");
             return;
         };
-        row.set_hostname(client.hostname);
+        row.set_hostname(client.hostname.clone());
         row.set_port(client.port);
         row.set_position(client.pos);
         // The hook commands are part of the client configuration, so the row
         // shows them after every broadcast — including another frontend's edit.
         row.set_hooks(client.cmd, client.leave_cmd);
+        /* The canvas reads the link off the ClientObject, so the ranges have to
+         * land there: a change made by the CLI or the config file would otherwise
+         * not show up until the row was rebuilt. */
+        if let Some(object) = self.client_object_for_handle(handle) {
+            object.set_property("hostname", client.hostname);
+            object.set_property("position", client.pos.to_string());
+            object.set_property("edge-start", client.edge.start() as u32);
+            object.set_property("edge-end", client.edge.end() as u32);
+            object.set_property("peer-edge-start", client.peer_edge.start() as u32);
+            object.set_property("peer-edge-end", client.peer_edge.end() as u32);
+        }
         self.refresh_arrangement();
     }
 
@@ -947,6 +1020,8 @@ impl Window {
             "peer-commit",
             crate::client_object::peer_commit_to_string(state.peer_commit),
         );
+        /* the peer's screen size, which the canvas draws its card to */
+        client_object.set_property("peer-displays", state.peer_displays);
         row.refresh_version_status();
         self.update_active_device_row();
     }
@@ -1079,6 +1154,15 @@ impl Window {
         imp.uptime_row
             .set_subtitle(&format_duration(info.uptime_secs));
         imp.port_row.set_subtitle(&info.port.to_string());
+
+        /* The arrangement canvas draws the local screen to scale with this, which
+         * is what makes an edge range mean something on the picture. */
+        let size = (info.screen_width > 0 && info.screen_height > 0)
+            .then_some((info.screen_width as f64, info.screen_height as f64));
+        if *imp.screen_size.borrow() != size {
+            *imp.screen_size.borrow_mut() = size;
+            self.refresh_arrangement();
+        }
 
         // Traffic totals live on the clients; sum them here so the row is
         // filled even when the runtime snapshot has no counter of its own.

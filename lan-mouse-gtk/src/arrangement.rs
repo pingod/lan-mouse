@@ -1,938 +1,1498 @@
 //! Visual arrangement of the screens lan-mouse can cross to.
 //!
-//! The daemon models a peer as sitting on exactly one edge of the local
-//! screen ([`Position`]), so the editor draws this screen in the middle and the
-//! peers around it, the way a commercial KVM lays its machines out: real screen
-//! rectangles, a link between the two facing edges, and drag and drop to move a
-//! peer to another edge. Peers that share an edge are stacked along it, which
-//! is also how `position_map` handles them (the first peer in the list that
-//! owns the edge takes the pointer).
+//! The canvas is a map of the local screen with the peers attached to its edges,
+//! drawn to scale: a laptop beside a 4K panel is visibly smaller, and a peer is as
+//! long along the shared edge as the segment of it it is reached through. That is
+//! the point - the picture and the daemon's barriers come out of the same
+//! [`layout`] functions, so a stretch of edge the canvas shows as a wall is a
+//! stretch where a crossing reaches nobody.
 //!
-//! Everything is painted with cairo on a single [`gtk::DrawingArea`]: the grid
-//! has to line up with the links and the cards, which is much easier to keep
-//! consistent in one layout pass than with a nest of styled boxes.
+//! Dragging a screen changes its link: the overlap of the two facing edges becomes
+//! the pair of ranges the daemon routes by, because [`layout::snap`] is the inverse
+//! of [`layout::place`]. The handles on the local edge move one end of a peer's
+//! coverage, which is how a range is set precisely - dragging a whole card across a
+//! long edge is not.
+//!
+//! Everything is painted with cairo on a single [`gtk::DrawingArea`]: the layout,
+//! the links, the walls and the handles share one coordinate system, which is one
+//! layout pass rather than a nest of styled boxes.
+
+mod draw;
+pub mod layout;
+mod paint;
 
 use std::cell::RefCell;
-use std::f64::consts::PI;
 use std::rc::Rc;
 
-use gtk::{cairo, prelude::*};
-use lan_mouse_ipc::{ClientHandle, Position};
+use gtk::{glib, prelude::*};
+use lan_mouse_ipc::{ClientHandle, EdgeRange, Position, SwitchOptions};
+
+use self::layout::{Placement, Screen};
+use self::paint::Palette;
 
 /// One peer that can be dragged around the local screen.
+#[derive(Clone, Debug)]
 pub(super) struct Machine {
     pub handle: ClientHandle,
     pub hostname: String,
     pub position: Position,
     pub active: bool,
+    /// segment of the local edge the pointer crosses to reach it
+    pub edge: EdgeRange,
+    /// segment of the peer's facing edge the cursor lands in
+    pub peer_edge: EdgeRange,
+    /// what the peer reported about its screen, in pixels
+    pub peer_size: Option<(f64, f64)>,
 }
 
-type OnMove = Rc<dyn Fn(ClientHandle, Position)>;
-
-const CARD_WIDTH: f64 = 190.0;
-/// 16:9, so the cards read as screens rather than as buttons.
-const CARD_HEIGHT: f64 = 107.0;
-const CARD_RADIUS: f64 = 8.0;
-/// Space between the local screen and the peers, wide enough for the link.
-const GAP: f64 = 26.0;
-const SPACING: f64 = 14.0;
-const GRID_STEP: f64 = 24.0;
-const MAX_SCALE: f64 = 1.2;
-const CANVAS_HEIGHT: i32 = 440;
-
-#[derive(Clone, Copy, Debug, Default)]
-struct Rect {
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
+/// What the canvas asks the window to do.
+///
+/// The canvas never talks to the daemon itself: it reports the intent, so the same
+/// canvas works for a page that only shows the layout and one that edits it.
+#[derive(Clone, Debug)]
+pub(super) enum MachineRequest {
+    /// move to another edge, and/or change the ranges of the link it has
+    Move {
+        handle: ClientHandle,
+        position: Position,
+        edge: EdgeRange,
+        peer_edge: EdgeRange,
+    },
+    /// give every peer of an edge an equal, adjacent stretch of it
+    AutoArrange(Vec<(ClientHandle, Position, EdgeRange, EdgeRange)>),
 }
 
-impl Rect {
-    fn center(self) -> (f64, f64) {
-        (self.x + self.w / 2.0, self.y + self.h / 2.0)
-    }
+/// The space between a card and the local screen, in layout units.
+///
+/// Generous, because the link is drawn inside it and because two screens touching
+/// exactly would read as one.
+const GAP: f64 = 60.0;
+/// The canvas height the page asks for before the window grows it.
+const CANVAS_HEIGHT: i32 = 460;
+/// Half the side of a handle's grab area, in **canvas** units.
+///
+/// Canvas units, not layout units: a handle that is a fixed number of pixels of
+/// the screen it sits on becomes ungrabbable on a 4K panel and invisible when the
+/// canvas is zoomed out, while a constant on-screen size is what the pointer needs.
+const HANDLE_HALF: f64 = 9.0;
+/// Range ends are quantized to this many permille: 2% of the edge.
+const RANGE_STEP: u16 = 20;
 
-    fn union(self, other: Rect) -> Rect {
-        let x = self.x.min(other.x);
-        let y = self.y.min(other.y);
-        let right = (self.x + self.w).max(other.x + other.w);
-        let bottom = (self.y + self.h).max(other.y + other.h);
-        Rect {
-            x,
-            y,
-            w: right - x,
-            h: bottom - y,
-        }
-    }
-
-    fn contains(self, x: f64, y: f64) -> bool {
-        x >= self.x && x <= self.x + self.w && y >= self.y && y <= self.y + self.h
-    }
-
-    /// The point on the edge `position` that lines up with the centre of
-    /// `other`, so bridges between several peers do not cross.
-    fn point_at(self, position: Position, other: Rect) -> (f64, f64) {
-        let (ox, oy) = other.center();
-        let clamp = |value: f64| value.clamp(0.08, 0.92);
-        match position {
-            Position::Left => (
-                self.x,
-                self.y + self.h * clamp((oy - self.y) / self.h.max(1.0)),
-            ),
-            Position::Right => (
-                self.x + self.w,
-                self.y + self.h * clamp((oy - self.y) / self.h.max(1.0)),
-            ),
-            Position::Top => (
-                self.x + self.w * clamp((ox - self.x) / self.w.max(1.0)),
-                self.y,
-            ),
-            Position::Bottom => (
-                self.x + self.w * clamp((ox - self.x) / self.w.max(1.0)),
-                self.y + self.h,
-            ),
-        }
-    }
-
-    /// Midpoint of the edge that faces `position`.
-    fn edge_mid(self, position: Position) -> (f64, f64) {
-        let (cx, cy) = self.center();
-        match position {
-            Position::Left => (self.x, cy),
-            Position::Right => (self.x + self.w, cy),
-            Position::Top => (cx, self.y),
-            Position::Bottom => (cx, self.y + self.h),
-        }
-    }
+/// All four edges, in the order the daemon resolves them in.
+fn positions() -> [Position; 4] {
+    [
+        Position::Left,
+        Position::Right,
+        Position::Top,
+        Position::Bottom,
+    ]
 }
 
-/// Colours resolved once per draw call.
-struct Palette {
-    foreground: (f64, f64, f64),
-    accent: (f64, f64, f64),
-    success: (f64, f64, f64),
+/// What the last draw produced, so the gestures can hit test without recomputing.
+#[derive(Clone, Default)]
+struct Geometry {
+    /// the local screen, in layout units
+    local: Screen,
+    /// scale from layout units to canvas units
+    scale: f64,
+    /// translation applied to the scaled layout
+    offset: (f64, f64),
+    /// where each peer ended up
+    peers: Vec<(ClientHandle, Screen)>,
+    /// the grab areas of the range handles
+    handles: Vec<Handle>,
 }
 
-/// A peer card that is currently being dragged.
+/// One end of one peer's coverage of the local edge.
+#[derive(Clone, Copy, Debug)]
+struct Handle {
+    handle: ClientHandle,
+    /// `false` = the low end, `true` = the high end of the coverage
+    high: bool,
+    rect: Screen,
+}
+
+/// A peer being dragged.
 struct Drag {
     handle: ClientHandle,
-    /// Top left corner of the card when the drag started.
-    origin: (f64, f64),
-    /// Top left corner under the pointer, updated while dragging.
-    corner: (f64, f64),
-    /// Edge the card snaps to when the drag ends.
-    target: Position,
+    /// the card as it was when the drag started, in layout units
+    original: Screen,
+    /// where the pointer currently puts it
+    current: Screen,
+    /// what the drop would configure
+    placement: Placement,
 }
 
-/// State shared by the draw function and the gestures.
+/// A range end being dragged.
+struct Resize {
+    handle: ClientHandle,
+    high: bool,
+    /// where the press landed, in canvas units: the gesture reports offsets from it
+    origin: (f64, f64),
+    /// the ranges at the start of the drag, for the no-op check
+    start: (EdgeRange, EdgeRange),
+    /// the ranges the pointer currently implies
+    current: (EdgeRange, EdgeRange),
+}
+
 struct State {
     local_hostname: String,
+    /// size of the local screen in pixels, `None` when no backend reported one
+    screen_size: Option<(f64, f64)>,
     machines: Vec<Machine>,
-    on_move: OnMove,
-    /// Peer rectangles from the last layout pass, for hit testing.
-    layout: Vec<(ClientHandle, Rect)>,
-    local: Rect,
+    switch_options: SwitchOptions,
+    on_request: Rc<dyn Fn(MachineRequest)>,
+    geometry: Geometry,
     drag: Option<Drag>,
+    resize: Option<Resize>,
+    /// the card the pointer is over, which is also the keyboard-selected one
     hover: Option<ClientHandle>,
-    /// Scale applied to the whole layout so it always fits the canvas.
-    scale: f64,
-    /// Translation of the scaled layout inside the canvas.
-    origin: (f64, f64),
+    /// zoom applied on top of the automatic fit
+    zoom: f64,
+    /// pan applied on top of the automatic centring, in canvas units
+    pan: (f64, f64),
+    /// the last canvas size, needed to place the grid and the empty-state text
+    canvas: (f64, f64),
+    show_grid: bool,
 }
 
 impl State {
     fn machine(&self, handle: ClientHandle) -> Option<&Machine> {
-        self.machines
-            .iter()
-            .find(|machine| machine.handle == handle)
+        self.machines.iter().find(|m| m.handle == handle)
     }
 
-    fn machine_mut(&mut self, handle: ClientHandle) -> Option<&mut Machine> {
-        self.machines
-            .iter_mut()
-            .find(|machine| machine.handle == handle)
-    }
-
-    /// Lay the cards out for a canvas of `width` x `height`.
+    /// The local screen in layout units.
     ///
-    /// The local screen sits in the middle and every peer is attached to the
-    /// edge it is configured on, stacked along that edge so several peers on
-    /// the same edge stay apart.
-    fn relayout(&mut self, width: f64, height: f64) {
-        let local = Rect {
-            x: (width - CARD_WIDTH) / 2.0,
-            y: (height - CARD_HEIGHT) / 2.0,
-            w: CARD_WIDTH,
-            h: CARD_HEIGHT,
-        };
-        self.local = local;
-
-        let (cx, cy) = local.center();
-        let mut layout = Vec::with_capacity(self.machines.len());
-        for position in [
-            Position::Left,
-            Position::Right,
-            Position::Top,
-            Position::Bottom,
-        ] {
-            let peers = self
-                .machines
-                .iter()
-                .filter(|machine| machine.position == position)
-                .map(|machine| machine.handle)
-                .collect::<Vec<_>>();
-            let count = peers.len() as f64;
-            for (index, handle) in peers.into_iter().enumerate() {
-                let index = index as f64;
-                let rect = match position {
-                    Position::Left | Position::Right => {
-                        let step = CARD_HEIGHT + SPACING;
-                        Rect {
-                            x: if position == Position::Left {
-                                local.x - GAP - CARD_WIDTH
-                            } else {
-                                local.x + CARD_WIDTH + GAP
-                            },
-                            y: cy - (count * step - SPACING) / 2.0 + index * step,
-                            w: CARD_WIDTH,
-                            h: CARD_HEIGHT,
-                        }
-                    }
-                    Position::Top | Position::Bottom => {
-                        let step = CARD_WIDTH + SPACING;
-                        Rect {
-                            x: cx - (count * step - SPACING) / 2.0 + index * step,
-                            y: if position == Position::Top {
-                                local.y - GAP - CARD_HEIGHT
-                            } else {
-                                local.y + CARD_HEIGHT + GAP
-                            },
-                            w: CARD_WIDTH,
-                            h: CARD_HEIGHT,
-                        }
-                    }
-                };
-                layout.push((handle, rect));
-            }
-        }
-        self.layout = layout;
-        self.fit(width, height);
+    /// Without a reported size the canvas falls back to 16:9 and says so on the
+    /// card: an edge range means nothing visually if the screen it is a range of
+    /// has no size, but the layout is still worth drawing.
+    fn local_screen(&self) -> Screen {
+        let (w, h) = self.screen_size.unwrap_or((1920.0, 1080.0));
+        Screen::new(0.0, 0.0, w, h)
     }
 
-    /// Scale and centre the laid out cards so they always fit the canvas, no
-    /// matter how many peers sit on an edge.
-    fn fit(&mut self, width: f64, height: f64) {
-        let mut bounds: Option<Rect> = None;
-        for rect in std::iter::once(self.local).chain(self.layout.iter().map(|(_, r)| *r)) {
-            bounds = Some(match bounds {
-                None => rect,
-                Some(current) => current.union(rect),
-            });
+    fn placement_of(&self, machine: &Machine, local: Screen) -> Placement {
+        Placement {
+            position: machine.position,
+            edge: machine.edge,
+            peer_edge: machine.peer_edge,
+            size: layout::peer_size(
+                local,
+                machine.position,
+                machine.edge,
+                machine.peer_edge,
+                machine.peer_size,
+            ),
         }
-        let Some(bounds) = bounds else {
-            self.scale = 1.0;
-            self.origin = (0.0, 0.0);
-            return;
-        };
-        /* Leave room for the canvas border and a little breathing space. */
-        let padding = 28.0;
-        let available_w = (width - 2.0 * padding).max(80.0);
-        let available_h = (height - 2.0 * padding).max(60.0);
-        let scale = (available_w / bounds.w)
-            .min(available_h / bounds.h)
-            .clamp(0.25, MAX_SCALE);
-        self.scale = scale;
-        self.origin = (
-            (width - bounds.w * scale) / 2.0 - bounds.x * scale,
-            (height - bounds.h * scale) / 2.0 - bounds.y * scale,
-        );
     }
 
-    /// Canvas coordinates to layout coordinates.
+    /// The peers placed around the local screen, in layout units.
+    fn placements(&self) -> Vec<(ClientHandle, Screen)> {
+        let local = self.local_screen();
+        let placements = self
+            .machines
+            .iter()
+            .filter(|machine| machine.active)
+            .map(|machine| (machine.handle, self.placement_of(machine, local)))
+            .collect::<Vec<_>>();
+        /* `place_all` rather than `place`: two peers whose cards overlap along the
+         * edge have to be drawn in successive lanes, or one hides the other and
+         * the canvas looks like a layout that cannot exist */
+        layout::place_all(local, &placements)
+    }
+
+    /// Map canvas coordinates to layout coordinates.
     fn to_layout(&self, x: f64, y: f64) -> (f64, f64) {
+        let scale = self.geometry.scale.max(f64::EPSILON);
         (
-            (x - self.origin.0) / self.scale,
-            (y - self.origin.1) / self.scale,
+            (x - self.geometry.offset.0) / scale,
+            (y - self.geometry.offset.1) / scale,
         )
     }
 
-    fn rect_of(&self, handle: ClientHandle) -> Option<Rect> {
-        if let Some(drag) = self.drag.as_ref().filter(|drag| drag.handle == handle) {
-            return Some(Rect {
-                x: drag.corner.0,
-                y: drag.corner.1,
-                w: CARD_WIDTH,
-                h: CARD_HEIGHT,
-            });
+    /// Map a layout rectangle to canvas coordinates.
+    fn to_canvas(&self, rect: Screen) -> Screen {
+        let scale = self.geometry.scale;
+        let (ox, oy) = self.geometry.offset;
+        Screen::new(
+            rect.x * scale + ox,
+            rect.y * scale + oy,
+            rect.w * scale,
+            rect.h * scale,
+        )
+    }
+
+    /// The card of `handle`, with a drag taking precedence over the layout.
+    fn rect_of(&self, handle: ClientHandle) -> Option<Screen> {
+        if let Some(drag) = self.drag.as_ref().filter(|d| d.handle == handle) {
+            return Some(drag.current);
         }
-        self.layout
+        self.geometry
+            .peers
             .iter()
             .find(|(other, _)| *other == handle)
             .map(|(_, rect)| *rect)
     }
 
+    /// The topmost card under a canvas point.
     fn hit(&self, x: f64, y: f64) -> Option<ClientHandle> {
         let (x, y) = self.to_layout(x, y);
-        self.layout
+        // the dragged card is drawn last, so it is tested first
+        if let Some(drag) = self.drag.as_ref() {
+            if drag.current.contains(x, y) {
+                return Some(drag.handle);
+            }
+        }
+        self.geometry
+            .peers
             .iter()
+            .rev()
             .find(|(_, rect)| rect.contains(x, y))
             .map(|(handle, _)| *handle)
     }
 
-    /// The edge of the local screen a card is closest to.
-    fn nearest_edge(&self, rect: Rect) -> Position {
-        let (cx, cy) = rect.center();
-        let (lx, ly) = self.local.center();
-        let (dx, dy) = (cx - lx, cy - ly);
-        if dx.abs() >= dy.abs() {
-            if dx < 0.0 {
-                Position::Left
-            } else {
-                Position::Right
+    fn handle_at(&self, x: f64, y: f64) -> Option<Handle> {
+        let (x, y) = self.to_layout(x, y);
+        self.geometry
+            .handles
+            .iter()
+            .copied()
+            .find(|handle| handle.rect.contains(x, y))
+    }
+
+    /// Recompute the layout for a canvas of `width` x `height`.
+    ///
+    /// A pure function of the machines and the view, so it is redone on every draw
+    /// and a window resize needs nothing but a redraw.
+    fn relayout(&mut self, width: f64, height: f64) {
+        self.canvas = (width, height);
+        let local = self.local_screen();
+        let peers = self.placements();
+        let mut bounds = local;
+        for (_, rect) in &peers {
+            bounds = bounds.merged(*rect);
+        }
+        // room for the border, the handles and the text drawn outside the cards
+        const PADDING: f64 = 28.0;
+        let available_w = (width - 2.0 * PADDING).max(1.0);
+        let available_h = (height - 2.0 * PADDING).max(1.0);
+        let fit = (available_w / bounds.w.max(1.0))
+            .min(available_h / bounds.h.max(1.0))
+            .clamp(0.01, 4.0);
+        let scale = fit * self.zoom;
+        let offset = (
+            (width - bounds.w * scale) / 2.0 - bounds.x * scale + self.pan.0,
+            (height - bounds.h * scale) / 2.0 - bounds.y * scale + self.pan.1,
+        );
+        let handles = self.handles(&local, &peers, scale);
+        self.geometry = Geometry {
+            local,
+            scale,
+            offset,
+            peers,
+            handles,
+        };
+    }
+
+    /// The grab areas of the range handles: on the local edge, at both ends of
+    /// every peer's coverage of it.
+    fn handles(&self, local: &Screen, peers: &[(ClientHandle, Screen)], scale: f64) -> Vec<Handle> {
+        let mut out = Vec::new();
+        for machine in self.machines.iter().filter(|m| m.active) {
+            if !peers.iter().any(|(other, _)| *other == machine.handle) {
+                continue;
             }
-        } else if dy < 0.0 {
-            Position::Top
+            let edge_len = local.extent_along(machine.position);
+            if edge_len <= 0.0 {
+                continue;
+            }
+            let low = local.edge_start(machine.position);
+            for (high, permille) in [(false, machine.edge.start()), (true, machine.edge.end())] {
+                let at = low + permille as f64 / 1000.0 * edge_len;
+                out.push(Handle {
+                    handle: machine.handle,
+                    high,
+                    rect: handle_rect(*local, machine.position, at, scale),
+                });
+            }
+        }
+        out
+    }
+
+    /// The ranges implied by dragging a handle to `point` along the local edge.
+    fn resized(&self, machine: &Machine, high: bool, point: f64) -> (EdgeRange, EdgeRange) {
+        let local = self.geometry.local;
+        let edge_len = local.extent_along(machine.position);
+        if edge_len <= 0.0 {
+            return (machine.edge, machine.peer_edge);
+        }
+        let origin = local.edge_start(machine.position);
+        let permille = |value: f64| -> u16 {
+            let raw = ((value - origin) / edge_len * 1000.0).clamp(0.0, 1000.0);
+            ((raw / RANGE_STEP as f64).round() * RANGE_STEP as f64) as u16
+        };
+        let (mut start, mut stop) = (machine.edge.start(), machine.edge.end());
+        if high {
+            stop = permille(point);
+            if stop <= start {
+                stop = (start + RANGE_STEP).min(1000);
+            }
         } else {
-            Position::Bottom
+            start = permille(point);
+            if start >= stop {
+                start = stop.saturating_sub(RANGE_STEP);
+            }
+        }
+        let edge = EdgeRange::new(start.min(999), stop.clamp(1, 1000)).unwrap_or(machine.edge);
+        /* The peer's own range does not follow a local handle: the two ends of a
+         * link are set independently - Synergy writes both - and sliding the local
+         * stretch keeps the mapping onto the peer's edge as it was configured.
+         * Dragging the card itself is what changes both at once. */
+        (edge, machine.peer_edge)
+    }
+
+    /// Reset the zoom and pan.
+    fn reset_view(&mut self) {
+        self.zoom = 1.0;
+        self.pan = (0.0, 0.0);
+    }
+
+    /// The peers that do not get the whole stretch of edge they asked for.
+    fn unreachable(&self) -> Vec<ClientHandle> {
+        let mut out = Vec::new();
+        for position in positions() {
+            let on_edge = self
+                .machines
+                .iter()
+                .filter(|m| m.position == position && m.active)
+                .collect::<Vec<_>>();
+            if on_edge.len() < 2 {
+                continue;
+            }
+            let requested = on_edge.iter().map(|m| m.edge).collect::<Vec<_>>();
+            for (machine, effective) in on_edge.into_iter().zip(EdgeRange::resolve(&requested)) {
+                if effective != Some(machine.edge) {
+                    out.push(machine.handle);
+                }
+            }
+        }
+        out
+    }
+
+    /// Commit a drag or a resize: report what the pointer decided.
+    fn commit(&mut self) {
+        if let Some(drag) = self.drag.take() {
+            let placement = drag.placement;
+            let changed = self.machine(drag.handle).is_some_and(|machine| {
+                machine.position != placement.position
+                    || machine.edge != placement.edge
+                    || machine.peer_edge != placement.peer_edge
+            });
+            if changed {
+                (self.on_request)(MachineRequest::Move {
+                    handle: drag.handle,
+                    position: placement.position,
+                    edge: placement.edge,
+                    peer_edge: placement.peer_edge,
+                });
+            }
+        }
+        if let Some(resize) = self.resize.take() {
+            let position = self.machine(resize.handle).map(|m| m.position);
+            if resize.current != resize.start {
+                if let Some(position) = position {
+                    (self.on_request)(MachineRequest::Move {
+                        handle: resize.handle,
+                        position,
+                        edge: resize.current.0,
+                        peer_edge: resize.current.1,
+                    });
+                }
+            }
         }
     }
 }
 
-/// Replace the content of `container` with the visual arrangement.
-pub(super) fn rebuild(
-    container: &gtk::Box,
-    local_hostname: &str,
-    machines: &[Machine],
-    on_move: impl Fn(ClientHandle, Position) + 'static,
-) {
-    while let Some(child) = container.first_child() {
-        container.remove(&child);
+/// The grab rectangle of the handle at `at` along `position`'s edge.
+///
+/// Straddles the local edge - half on the screen, half in the gap - so it reads as
+/// the end of a coverage of that edge rather than as part of a card. `scale` turns
+/// the constant on-screen size back into layout units.
+fn handle_rect(local: Screen, position: Position, at: f64, scale: f64) -> Screen {
+    let half = HANDLE_HALF / scale.max(f64::EPSILON);
+    let size = half * 2.0;
+    match position {
+        Position::Left => Screen::new(local.x - half, at - half, size, size),
+        Position::Right => Screen::new(local.right() - half, at - half, size, size),
+        Position::Top => Screen::new(at - half, local.y - half, size, size),
+        Position::Bottom => Screen::new(at - half, local.bottom() - half, size, size),
+    }
+}
+
+/// The canvas, kept alive between updates so a drag is never interrupted.
+pub(super) struct Canvas {
+    area: gtk::DrawingArea,
+    state: Rc<RefCell<State>>,
+    /// The bar that appears when two machines claim the same stretch of an edge.
+    warning: gtk::Box,
+    warning_label: gtk::Label,
+    /// The label under the canvas, refreshed with the thresholds.
+    hint: gtk::Label,
+}
+
+impl Canvas {
+    /// Build the canvas inside `container` and wire its gestures.
+    pub(super) fn build(
+        container: &gtk::Box,
+        on_request: impl Fn(MachineRequest) + 'static,
+    ) -> Self {
+        while let Some(child) = container.first_child() {
+            container.remove(&child);
+        }
+
+        let state = Rc::new(RefCell::new(State {
+            local_hostname: String::new(),
+            screen_size: None,
+            machines: Vec::new(),
+            switch_options: SwitchOptions::default(),
+            on_request: Rc::new(on_request),
+            geometry: Geometry::default(),
+            drag: None,
+            resize: None,
+            hover: None,
+            zoom: 1.0,
+            pan: (0.0, 0.0),
+            canvas: (1.0, 1.0),
+            show_grid: true,
+        }));
+
+        /* Two machines claiming the same stretch is legal - the daemon gives the
+         * earlier one what it asked for and narrows the other - but it is never
+         * what the user meant, and the canvas is where it is visible. A plain box
+         * rather than `GtkInfoBar`, which is deprecated since GTK 4.10.
+         */
+        let warning = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        warning.add_css_class("warning");
+        warning.add_css_class("card");
+        warning.set_margin_bottom(6);
+        warning.set_visible(false);
+        let warning_label = gtk::Label::builder()
+            .wrap(true)
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
+        warning.append(&warning_label);
+        let fix = gtk::Button::builder().label("Auto arrange").build();
+        {
+            let state = Rc::clone(&state);
+            let warning = warning.clone();
+            fix.connect_clicked(move |_| {
+                warning.set_visible(false);
+                auto_arrange(&state);
+            });
+        }
+        warning.append(&fix);
+
+        let area = gtk::DrawingArea::builder()
+            .content_height(CANVAS_HEIGHT)
+            .content_width(600)
+            .hexpand(true)
+            .vexpand(true)
+            .build();
+        area.set_cursor_from_name(Some("default"));
+        area.set_can_focus(true);
+        area.set_tooltip_text(Some(
+            "Drag a screen so the edges that should connect touch; drag the handles on this screen's edge to set how far a machine reaches along it",
+        ));
+        let toolbar = toolbar(&state, &area);
+
+        {
+            let state = Rc::clone(&state);
+            area.set_draw_func(move |_area, cr, width, height| {
+                let mut state = state.borrow_mut();
+                state.relayout(width as f64, height as f64);
+                let palette = Palette::resolve(adw::StyleManager::default().is_dark());
+                draw::draw(cr, width as f64, height as f64, &state, &palette);
+            });
+        }
+
+        add_gestures(&area, &state);
+
+        let hint = hint(&state.borrow());
+        container.append(&warning);
+        container.append(&toolbar);
+        container.append(&area);
+        container.append(&hint);
+
+        Self {
+            area,
+            state,
+            warning,
+            warning_label,
+            hint,
+        }
     }
 
-    let state = Rc::new(RefCell::new(State {
-        local_hostname: local_hostname.to_string(),
-        machines: machines
-            .iter()
-            .map(|machine| Machine {
-                handle: machine.handle,
-                hostname: machine.hostname.clone(),
-                position: machine.position,
-                active: machine.active,
-            })
-            .collect(),
-        on_move: Rc::new(on_move),
-        layout: Vec::new(),
-        local: Rect::default(),
-        drag: None,
-        hover: None,
-        scale: 1.0,
-        origin: (0.0, 0.0),
-    }));
-
-    let area = gtk::DrawingArea::builder()
-        .content_height(CANVAS_HEIGHT)
-        .hexpand(true)
-        .vexpand(true)
-        .build();
-    area.set_cursor_from_name(Some("default"));
-    area.set_tooltip_text(Some(
-        "Drag a screen to the edge it should be reached through, use its menu to pick the edge",
-    ));
-
-    {
-        let state = Rc::clone(&state);
-        area.set_draw_func(move |area, cr, width, height| {
-            let mut state = state.borrow_mut();
-            state.relayout(width as f64, height as f64);
-            draw(area, cr, width as f64, height as f64, &state);
-        });
+    /// Replace what the canvas shows, without rebuilding it.
+    ///
+    /// Rebuilding the widget was the bug that made the canvas unusable while
+    /// dragging: every state broadcast from the daemon - which happens whenever a
+    /// peer connects, is activated or merely answers a ping - destroyed the widget
+    /// the pointer was pressed into, so the drag died mid-gesture and the zoom and
+    /// pan were reset underneath the user.
+    pub(super) fn update(
+        &self,
+        local_hostname: &str,
+        machines: &[Machine],
+        screen_size: Option<(f64, f64)>,
+        switch_options: &SwitchOptions,
+    ) {
+        {
+            let mut state = self.state.borrow_mut();
+            /* a daemon answer must not yank a card out from under the pointer: the
+             * drag owns the machine it started on until it ends */
+            if state.drag.is_none() && state.resize.is_none() {
+                state.local_hostname = local_hostname.to_string();
+                state.screen_size = screen_size;
+                state.switch_options = switch_options.clone();
+                state.machines = machines.to_vec();
+            }
+        }
+        self.hint
+            .set_text(&describe(&self.state.borrow().switch_options));
+        let names = {
+            let state = self.state.borrow();
+            state
+                .unreachable()
+                .into_iter()
+                .filter_map(|handle| state.machine(handle).map(|m| m.hostname.clone()))
+                .collect::<Vec<_>>()
+        };
+        self.warning.set_visible(!names.is_empty());
+        if !names.is_empty() {
+            self.warning_label.set_text(&format!(
+                "{} do not get the whole stretch of the edge they were put on. Drag the handles to give each one a stretch of its own, or use Auto arrange.",
+                paint::list_names(&names)
+            ));
+        }
+        self.area.queue_draw();
     }
+}
 
-    let motion = gtk::EventControllerMotion::new();
-    {
-        let state = Rc::clone(&state);
-        let weak_area = area.downgrade();
-        motion.connect_motion(move |_motion, x, y| {
-            let mut state = state.borrow_mut();
-            let hover = state.hit(x, y);
-            if state.hover != hover {
-                state.hover = hover;
-                if let Some(area) = weak_area.upgrade() {
-                    area.set_cursor_from_name(Some(if hover.is_some() {
-                        "grab"
-                    } else {
-                        "default"
-                    }));
-                    area.queue_draw();
+/// The row of buttons above the canvas.
+///
+/// The area is passed in rather than reached through the state: the closures that
+/// change the view are held by the buttons, and the widget they redraw owns the
+/// state they mutate.
+fn toolbar(state: &Rc<RefCell<State>>, area: &gtk::DrawingArea) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    row.set_halign(gtk::Align::End);
+
+    let add = |label: &str, tooltip: &str, action: fn(&Rc<RefCell<State>>, &gtk::DrawingArea)| {
+        let button = gtk::Button::builder()
+            .label(label)
+            .tooltip_text(tooltip)
+            .css_classes(["flat"])
+            .build();
+        let state = Rc::clone(state);
+        let area = area.clone();
+        button.connect_clicked(move |_| action(&state, &area));
+        row.append(&button);
+    };
+
+    add(
+        "Auto arrange",
+        "Give every machine on an edge an equal, adjacent stretch of it",
+        |state, area| {
+            auto_arrange(state);
+            area.queue_draw();
+        },
+    );
+    add("−", "Zoom out", |state, area| {
+        let mut state = state.borrow_mut();
+        state.zoom = (state.zoom / 1.25).max(0.2);
+        area.queue_draw();
+    });
+    add("+", "Zoom in", |state, area| {
+        let mut state = state.borrow_mut();
+        state.zoom = (state.zoom * 1.25).min(4.0);
+        area.queue_draw();
+    });
+    add(
+        "Fit",
+        "Scale and centre the whole layout again",
+        |state, area| {
+            state.borrow_mut().reset_view();
+            area.queue_draw();
+        },
+    );
+    add("Grid", "Show or hide the background grid", |state, area| {
+        let mut state = state.borrow_mut();
+        state.show_grid = !state.show_grid;
+        area.queue_draw();
+    });
+    row
+}
+
+/// Hand every edge's peers an equal share of it.
+fn auto_arrange(state: &Rc<RefCell<State>>) {
+    let requests = {
+        let state = state.borrow();
+        let mut requests = Vec::new();
+        for position in positions() {
+            let on_edge = state
+                .machines
+                .iter()
+                .filter(|machine| machine.position == position && machine.active)
+                .collect::<Vec<_>>();
+            if on_edge.len() < 2 {
+                continue;
+            }
+            let shares = layout::auto_arrange(on_edge.len());
+            for (machine, (edge, peer_edge)) in on_edge.into_iter().zip(shares) {
+                if machine.edge != edge || machine.peer_edge != peer_edge {
+                    requests.push((machine.handle, position, edge, peer_edge));
                 }
             }
-        });
+        }
+        requests
+    };
+    if !requests.is_empty() {
+        (state.borrow().on_request)(MachineRequest::AutoArrange(requests));
     }
+}
+
+/// The label under the canvas.
+fn hint(state: &State) -> gtk::Label {
+    let label = gtk::Label::builder()
+        .halign(gtk::Align::Center)
+        .wrap(true)
+        .build();
+    label.add_css_class("dim-label");
+    label.add_css_class("caption");
+    label.set_text(&describe(&state.switch_options));
+    label
+}
+
+/// How to use the canvas, plus the thresholds that change what a crossing means.
+///
+/// The thresholds belong here because they change what the picture promises: an
+/// edge that needs a second hit, or whose corners are blocked, is not reachable the
+/// way the bridges alone suggest.
+fn describe(options: &SwitchOptions) -> String {
+    let mut parts = vec![
+        "Drag a screen so the edges that should connect touch".to_owned(),
+        "drag the handles on this screen's edge to set how far a machine reaches along it"
+            .to_owned(),
+    ];
+    if options.double_tap_ms > 0 {
+        parts.push(format!(
+            "an edge has to be hit twice within {} ms",
+            options.double_tap_ms
+        ));
+    }
+    if options.corner_size > 0 && !options.corners.is_empty() {
+        parts.push(format!(
+            "{} px of the corners ({}) are blocked",
+            options.corner_size,
+            options
+                .corners
+                .iter()
+                .map(|corner| corner.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    parts.join("; ")
+}
+
+/// Wire the pointer gestures.
+///
+/// The order is the substance: the handle controller runs in the capture phase and
+/// claims a press that lands on a handle, so the same press never starts a card
+/// drag. Everything else falls through to the drag; the middle button pans.
+fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
+    /* hover: the cursor changes over a card or a handle, and the card lights up */
+    let motion = gtk::EventControllerMotion::new();
     {
-        let state = Rc::clone(&state);
-        let weak_area = area.downgrade();
-        motion.connect_leave(move |_motion| {
+        let state = Rc::clone(state);
+        let area = area.clone();
+        motion.connect_motion(move |_motion, x, y| {
             let mut state = state.borrow_mut();
-            if state.hover.take().is_some() {
-                if let Some(area) = weak_area.upgrade() {
-                    area.set_cursor_from_name(Some("default"));
-                    area.queue_draw();
-                }
+            let handle = state.handle_at(x, y);
+            let hover = handle.map(|handle| handle.handle).or(state.hit(x, y));
+            if state.hover != hover {
+                state.hover = hover;
+                let cursor = if handle.is_some() {
+                    "ew-resize"
+                } else if hover.is_some() {
+                    "grab"
+                } else {
+                    "default"
+                };
+                area.set_cursor_from_name(Some(cursor));
+                area.queue_draw();
             }
         });
     }
     area.add_controller(motion);
 
-    let gesture = gtk::GestureDrag::new();
+    /* range handles: capture phase, so a press on one never drags a card */
+    let resize_gesture = gtk::GestureDrag::new();
+    resize_gesture.set_button(1);
+    resize_gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
     {
-        let state = Rc::clone(&state);
-        let weak_area = area.downgrade();
-        gesture.connect_drag_begin(move |_gesture, x, y| {
+        let state = Rc::clone(state);
+        let area = area.clone();
+        resize_gesture.connect_drag_begin(move |_gesture, x, y| {
             let mut state = state.borrow_mut();
+            let Some(found) = state.handle_at(x, y) else {
+                return;
+            };
+            let Some(machine) = state.machine(found.handle) else {
+                return;
+            };
+            let start = (machine.edge, machine.peer_edge);
+            state.resize = Some(Resize {
+                handle: found.handle,
+                high: found.high,
+                origin: (x, y),
+                start,
+                current: start,
+            });
+            area.queue_draw();
+        });
+    }
+    {
+        let state = Rc::clone(state);
+        let area = area.clone();
+        resize_gesture.connect_drag_update(move |_gesture, dx, dy| {
+            let mut state = state.borrow_mut();
+            let Some(resize) = state.resize.as_ref() else {
+                return;
+            };
+            let (handle, high) = (resize.handle, resize.high);
+            let origin = resize.origin;
+            let Some(machine) = state.machine(handle).cloned() else {
+                return;
+            };
+            let (x, y) = state.to_layout(origin.0 + dx, origin.1 + dy);
+            let point = match machine.position {
+                Position::Left | Position::Right => y,
+                Position::Top | Position::Bottom => x,
+            };
+            let current = state.resized(&machine, high, point);
+            if let Some(resize) = state.resize.as_mut() {
+                resize.current = current;
+            }
+            /* preview the new stretch: the card slides as the range changes, which
+             * is the feedback that makes a handle worth grabbing */
+            if let Some(machine) = state.machines.iter_mut().find(|m| m.handle == handle) {
+                machine.edge = current.0;
+                machine.peer_edge = current.1;
+            }
+            area.queue_draw();
+        });
+    }
+    {
+        let state = Rc::clone(state);
+        let area = area.clone();
+        resize_gesture.connect_drag_end(move |_gesture, _dx, _dy| {
+            state.borrow_mut().commit();
+            area.queue_draw();
+        });
+    }
+    area.add_controller(resize_gesture);
+
+    /* drag a card */
+    let drag = gtk::GestureDrag::new();
+    drag.set_button(1);
+    {
+        let state = Rc::clone(state);
+        let area = area.clone();
+        drag.connect_drag_begin(move |_gesture, x, y| {
+            let mut state = state.borrow_mut();
+            if state.resize.is_some() || state.handle_at(x, y).is_some() {
+                return;
+            }
             let Some(handle) = state.hit(x, y) else {
                 return;
             };
             let Some(rect) = state.rect_of(handle) else {
                 return;
             };
+            let Some(machine) = state.machine(handle).cloned() else {
+                return;
+            };
             state.drag = Some(Drag {
                 handle,
-                origin: (rect.x, rect.y),
-                corner: (rect.x, rect.y),
-                target: state.nearest_edge(rect),
+                original: rect,
+                current: rect,
+                placement: Placement {
+                    position: machine.position,
+                    edge: machine.edge,
+                    peer_edge: machine.peer_edge,
+                    size: (rect.w, rect.h),
+                },
             });
-            state.hover = None;
-            if let Some(area) = weak_area.upgrade() {
-                area.set_cursor_from_name(Some("grabbing"));
-                area.queue_draw();
-            }
+            area.set_cursor_from_name(Some("grabbing"));
+            area.queue_draw();
         });
     }
     {
-        let state = Rc::clone(&state);
-        let weak_area = area.downgrade();
-        gesture.connect_drag_update(move |_gesture, offset_x, offset_y| {
+        let state = Rc::clone(state);
+        let area = area.clone();
+        drag.connect_drag_update(move |_gesture, dx, dy| {
             let mut state = state.borrow_mut();
-            let scale = state.scale;
-            let Some(drag) = state.drag.as_mut() else {
+            let scale = state.geometry.scale.max(f64::EPSILON);
+            let local = state.geometry.local;
+            /* read the card's start position before writing to it: the drag lives
+             * inside the state the geometry was taken from */
+            let Some(original) = state.drag.as_ref().map(|drag| drag.original) else {
                 return;
             };
-            drag.corner = (
-                drag.origin.0 + offset_x / scale,
-                drag.origin.1 + offset_y / scale,
+            let current = Screen::new(
+                original.x + dx / scale,
+                original.y + dy / scale,
+                original.w,
+                original.h,
             );
-            let candidate = Rect {
-                x: drag.corner.0,
-                y: drag.corner.1,
-                w: CARD_WIDTH,
-                h: CARD_HEIGHT,
-            };
-            let target = state.nearest_edge(candidate);
+            let placement = layout::snap(local, current);
             if let Some(drag) = state.drag.as_mut() {
-                drag.target = target;
+                drag.current = current;
+                drag.placement = placement;
             }
-            if let Some(area) = weak_area.upgrade() {
-                area.queue_draw();
-            }
+            area.queue_draw();
         });
     }
     {
-        let state = Rc::clone(&state);
-        let weak_area = area.downgrade();
-        gesture.connect_drag_end(move |_gesture, _offset_x, _offset_y| {
+        let state = Rc::clone(state);
+        let area = area.clone();
+        drag.connect_drag_end(move |_gesture, _dx, _dy| {
             let mut state = state.borrow_mut();
-            let Some(drag) = state.drag.take() else {
-                return;
-            };
-            let current = state.machine(drag.handle).map(|machine| machine.position);
-            if current != Some(drag.target) {
-                (state.on_move)(drag.handle, drag.target);
-                /* Move the card right away so it does not jump back while the
-                 * daemon is still answering; `rebuild` redraws the final
-                 * layout from the client store either way. */
-                if let Some(machine) = state.machine_mut(drag.handle) {
-                    machine.position = drag.target;
+            /* move the card right away: the daemon answers asynchronously and a card
+             * that jumped back while it thought looked broken */
+            let placement = state
+                .drag
+                .as_ref()
+                .map(|drag| (drag.handle, drag.placement));
+            if let Some((handle, placement)) = placement {
+                if let Some(machine) = state.machines.iter_mut().find(|m| m.handle == handle) {
+                    machine.position = placement.position;
+                    machine.edge = placement.edge;
+                    machine.peer_edge = placement.peer_edge;
                 }
             }
-            if let Some(area) = weak_area.upgrade() {
-                area.set_cursor_from_name(Some("default"));
-                area.queue_draw();
-            }
+            state.commit();
+            area.set_cursor_from_name(Some("default"));
+            area.queue_draw();
         });
     }
-    area.add_controller(gesture);
+    area.add_controller(drag);
 
-    /* The menu behind the three dots: pick the edge by hand when dragging is not
-     * precise enough. */
-    let menu_handle = Rc::new(RefCell::new(None::<ClientHandle>));
-    let popover = gtk::Popover::builder().has_arrow(true).build();
-    popover.set_parent(&area);
+    /* pan: middle button, so a left drag on a card still reaches the drag above */
+    let pan = gtk::GestureDrag::new();
+    pan.set_button(2);
     {
-        let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        for (label, position) in [
-            ("Move to the left", Position::Left),
-            ("Move to the right", Position::Right),
-            ("Move to the top", Position::Top),
-            ("Move to the bottom", Position::Bottom),
-        ] {
-            let button = gtk::Button::with_label(label);
-            button.add_css_class("flat");
-            button.set_halign(gtk::Align::Fill);
-            let state = Rc::clone(&state);
-            let menu_handle = Rc::clone(&menu_handle);
-            let popover = popover.clone();
-            button.connect_clicked(move |_button| {
-                if let Some(handle) = *menu_handle.borrow() {
-                    let mut state = state.borrow_mut();
-                    if state.machine(handle).map(|machine| machine.position) != Some(position) {
-                        (state.on_move)(handle, position);
-                        if let Some(machine) = state.machine_mut(handle) {
-                            machine.position = position;
+        let state = Rc::clone(state);
+        let area = area.clone();
+        pan.connect_drag_update(move |_gesture, dx, dy| {
+            let mut state = state.borrow_mut();
+            state.pan = (state.pan.0 + dx, state.pan.1 + dy);
+            area.queue_draw();
+        });
+    }
+    area.add_controller(pan);
+
+    /* ctrl + wheel zooms, plain wheel pans */
+    let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+    scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+    {
+        let state = Rc::clone(state);
+        let area = area.clone();
+        scroll.connect_scroll(move |controller, dx, dy| {
+            let ctrl = controller.current_event().is_some_and(|event| {
+                event
+                    .modifier_state()
+                    .contains(gtk::gdk::ModifierType::CONTROL_MASK)
+            });
+            let mut state = state.borrow_mut();
+            if ctrl {
+                let factor = if dy > 0.0 { 1.1 } else { 1.0 / 1.1 };
+                state.zoom = (state.zoom * factor).clamp(0.2, 4.0);
+            } else {
+                state.pan = (state.pan.0 - dx * 40.0, state.pan.1 - dy * 40.0);
+            }
+            area.queue_draw();
+            glib::Propagation::Stop
+        });
+    }
+    area.add_controller(scroll);
+
+    /* keyboard: the arrows move the card the pointer is over */
+    let keys = gtk::EventControllerKey::new();
+    {
+        let state = Rc::clone(state);
+        let area = area.clone();
+        keys.connect_key_pressed(move |_controller, key, _code, _modifiers| {
+            let mut state = state.borrow_mut();
+            let moved = match key {
+                gtk::gdk::Key::plus | gtk::gdk::Key::KP_Add => {
+                    state.zoom = (state.zoom * 1.25).min(4.0);
+                    true
+                }
+                gtk::gdk::Key::minus | gtk::gdk::Key::KP_Subtract => {
+                    state.zoom = (state.zoom / 1.25).max(0.2);
+                    true
+                }
+                gtk::gdk::Key::_0 | gtk::gdk::Key::KP_0 => {
+                    state.reset_view();
+                    true
+                }
+                gtk::gdk::Key::Left
+                | gtk::gdk::Key::Right
+                | gtk::gdk::Key::Up
+                | gtk::gdk::Key::Down => {
+                    let position = match key {
+                        gtk::gdk::Key::Left => Position::Left,
+                        gtk::gdk::Key::Right => Position::Right,
+                        gtk::gdk::Key::Up => Position::Top,
+                        _ => Position::Bottom,
+                    };
+                    /* the keyboard moves a card by whole edges: the ranges come from
+                     * where the card is, so a card nudged to a new side keeps the
+                     * stretch it had */
+                    if let Some(handle) = state.hover {
+                        if let Some(machine) = state.machine(handle) {
+                            let (edge, peer_edge) = (machine.edge, machine.peer_edge);
+                            (state.on_request)(MachineRequest::Move {
+                                handle,
+                                position,
+                                edge,
+                                peer_edge,
+                            });
                         }
                     }
+                    true
                 }
-                popover.popdown();
-            });
-            list.append(&button);
-        }
-        popover.set_child(Some(&list));
-    }
-    /* GTK refuses to finalise a widget that still has children, and this
-     * popover belongs to this page, so detach it as soon as it is hidden and
-     * re-parent it on demand. */
-    popover.connect_hide(|popover| popover.unparent());
-
-    /* Capture phase: the dots are claimed before the drag gesture sees the
-     * press, a press anywhere else on a card falls through to the drag. */
-    let click = gtk::GestureClick::new();
-    click.set_button(0);
-    click.set_propagation_phase(gtk::PropagationPhase::Capture);
-    {
-        let state = Rc::clone(&state);
-        let menu_handle = Rc::clone(&menu_handle);
-        let popover = popover.clone();
-        let area = area.clone();
-        click.connect_pressed(move |click, _n, x, y| {
-            /* Only the dots in the card corner open the menu, a press anywhere
-             * else on a card is part of a drag. The borrow is released before the
-             * popover is shown: popping it up moves the pointer focus and runs
-             * the motion handlers, which borrow the same state. */
-            let Some((handle, bounds)) = ({
-                let state = state.borrow();
-                let handle = state.hit(x, y);
-                let rect = handle.and_then(|handle| state.rect_of(handle));
-                match (handle, rect) {
-                    (Some(handle), Some(rect)) => {
-                        let (lx, ly) = state.to_layout(x, y);
-                        let dots = Rect {
-                            x: rect.x + rect.w - 34.0,
-                            y: rect.y + 4.0,
-                            w: 30.0,
-                            h: 24.0,
-                        };
-                        dots.contains(lx, ly).then(|| {
-                            (
-                                handle,
-                                gtk::gdk::Rectangle::new(
-                                    (rect.x * state.scale + state.origin.0) as i32,
-                                    (rect.y * state.scale + state.origin.1) as i32,
-                                    (rect.w * state.scale) as i32,
-                                    (rect.h * state.scale) as i32,
-                                ),
-                            )
-                        })
-                    }
-                    _ => None,
-                }
-            }) else {
-                return;
+                _ => false,
             };
-            click.set_state(gtk::EventSequenceState::Claimed);
-            *menu_handle.borrow_mut() = Some(handle);
-            if popover.parent().is_none() {
-                popover.set_parent(&area);
+            if moved {
+                area.queue_draw();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
             }
-            popover.set_pointing_to(Some(&bounds));
-            popover.popup();
         });
     }
-    area.add_controller(click);
-
-    container.append(&area);
-
-    let hint = gtk::Label::builder()
-        .label("Drag a screen to change the edge the pointer crosses to reach it")
-        .halign(gtk::Align::Center)
-        .build();
-    hint.add_css_class("dim-label");
-    hint.add_css_class("caption");
-    container.append(&hint);
+    area.add_controller(keys);
 }
 
-fn set_source(cr: &cairo::Context, color: (f64, f64, f64), alpha: f64) {
-    cr.set_source_rgba(color.0, color.1, color.2, alpha);
+#[cfg(test)]
+mod tests {
+    use super::draw::{blocked_ends, reachable_stretches};
+    use super::*;
+
+    fn machine(handle: ClientHandle, position: Position, edge: (f64, f64)) -> Machine {
+        Machine {
+            handle,
+            hostname: format!("host{handle}"),
+            position,
+            active: true,
+            edge: EdgeRange::from_fractions(edge.0, edge.1).expect("range"),
+            peer_edge: EdgeRange::FULL,
+            peer_size: None,
+        }
+    }
+
+    fn state(machines: Vec<Machine>) -> State {
+        State {
+            local_hostname: "local".to_owned(),
+            screen_size: Some((1920.0, 1080.0)),
+            machines,
+            switch_options: SwitchOptions::default(),
+            on_request: Rc::new(|_| {}),
+            geometry: Geometry::default(),
+            drag: None,
+            resize: None,
+            hover: None,
+            zoom: 1.0,
+            pan: (0.0, 0.0),
+            canvas: (800.0, 460.0),
+            show_grid: true,
+        }
+    }
+
+    #[test]
+    fn two_peers_on_one_edge_are_drawn_side_by_side() {
+        let mut state = state(vec![
+            machine(0, Position::Right, (0.0, 0.5)),
+            machine(1, Position::Right, (0.5, 1.0)),
+        ]);
+        state.relayout(800.0, 460.0);
+        assert_eq!(state.geometry.peers.len(), 2);
+        let (first, second) = (
+            state.rect_of(0).expect("first"),
+            state.rect_of(1).expect("second"),
+        );
+        // stacked along the edge, not on top of each other
+        assert!(first.bottom() <= second.y + 1.0, "{first:?} {second:?}");
+    }
+
+    #[test]
+    fn a_disabled_peer_is_not_placed_or_hit() {
+        let mut peer = machine(0, Position::Right, (0.0, 1.0));
+        peer.active = false;
+        let mut state = state(vec![peer]);
+        state.relayout(800.0, 460.0);
+        assert!(state.geometry.peers.is_empty());
+        assert_eq!(state.hit(700.0, 200.0), None);
+    }
+
+    #[test]
+    fn handles_sit_at_both_ends_of_every_coverage() {
+        let mut state = state(vec![machine(0, Position::Right, (0.25, 0.75))]);
+        state.relayout(800.0, 460.0);
+        assert_eq!(state.geometry.handles.len(), 2);
+        let (low, high) = (state.geometry.handles[0], state.geometry.handles[1]);
+        assert!(!low.high && high.high);
+        // the low end is above the high end on the canvas
+        assert!(low.rect.y < high.rect.y);
+        // and both straddle the local screen's right edge
+        let local = state.geometry.local;
+        for handle in [low, high] {
+            let centre = (handle.rect.x + handle.rect.w / 2.0 - local.right()).abs();
+            assert!(centre < 1.0, "handle not on the edge: {handle:?}");
+        }
+    }
+
+    #[test]
+    fn dragging_a_handle_moves_only_the_end_it_grabbed() {
+        let mut state = state(vec![machine(0, Position::Right, (0.2, 0.8))]);
+        state.relayout(800.0, 460.0);
+        let machine = state.machine(0).cloned().expect("machine");
+        // grab the low end and drag it to 60% of the edge
+        let point = local_edge_point(&state, Position::Right, 0.6);
+        let (edge, peer_edge) = state.resized(&machine, false, point);
+        assert_eq!(edge.fractions(), [0.6, 0.8]);
+        assert_eq!(peer_edge, EdgeRange::FULL);
+    }
+
+    #[test]
+    fn a_handle_cannot_cross_the_other_end() {
+        let mut state = state(vec![machine(0, Position::Right, (0.2, 0.4))]);
+        state.relayout(800.0, 460.0);
+        let machine = state.machine(0).cloned().expect("machine");
+        let point = local_edge_point(&state, Position::Right, 0.9);
+        let (edge, _) = state.resized(&machine, false, point);
+        assert!(edge.start() < edge.end(), "{edge}");
+        assert_eq!(edge.end(), 400);
+    }
+
+    #[test]
+    fn a_hit_is_reported_in_canvas_coordinates() {
+        let mut state = state(vec![machine(0, Position::Right, (0.0, 1.0))]);
+        state.relayout(800.0, 460.0);
+        let rect = state.rect_of(0).expect("rect");
+        let centre = state.to_canvas(rect).center();
+        assert_eq!(state.hit(centre.0, centre.1), Some(0));
+        assert_eq!(state.hit(4.0, 4.0), None);
+    }
+
+    #[test]
+    fn overlapping_claims_are_reported_and_do_not_include_the_lucky_one() {
+        let state = state(vec![
+            machine(0, Position::Right, (0.0, 1.0)),
+            machine(1, Position::Right, (0.0, 0.5)),
+        ]);
+        let squeezed = state.unreachable();
+        assert_eq!(squeezed, vec![1]);
+    }
+
+    #[test]
+    fn disjoint_claims_are_not_reported() {
+        let state = state(vec![
+            machine(0, Position::Right, (0.0, 0.5)),
+            machine(1, Position::Right, (0.5, 1.0)),
+        ]);
+        assert!(state.unreachable().is_empty());
+    }
+
+    #[test]
+    fn claims_on_different_edges_never_conflict() {
+        let state = state(vec![
+            machine(0, Position::Right, (0.0, 1.0)),
+            machine(1, Position::Left, (0.0, 1.0)),
+        ]);
+        assert!(state.unreachable().is_empty());
+    }
+
+    #[test]
+    fn the_layout_fits_and_reacts_to_zoom() {
+        let mut state = state(vec![machine(0, Position::Right, (0.0, 1.0))]);
+        state.relayout(800.0, 460.0);
+        let base = state.geometry.scale;
+        state.zoom = 2.0;
+        state.relayout(800.0, 460.0);
+        assert!(state.geometry.scale > base, "zoom did not take effect");
+        state.reset_view();
+        state.relayout(800.0, 460.0);
+        assert!((state.geometry.scale - base).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_local_screen_of_unknown_size_still_lays_out() {
+        let mut state = state(vec![machine(0, Position::Right, (0.0, 1.0))]);
+        state.screen_size = None;
+        state.relayout(800.0, 460.0);
+        assert!(state.geometry.scale > 0.0);
+        assert_eq!(state.geometry.peers.len(), 1);
+    }
+
+    #[test]
+    fn the_hint_lists_the_thresholds_that_change_a_crossing() {
+        let plain = describe(&SwitchOptions::default());
+        assert!(!plain.contains("ms"), "{plain}");
+        let options = SwitchOptions {
+            double_tap_ms: 250,
+            corner_size: 40,
+            corners: vec![lan_mouse_ipc::SwitchCorner::TopLeft],
+        };
+        let text = describe(&options);
+        assert!(text.contains("250 ms"), "{text}");
+        assert!(text.contains("top-left"), "{text}");
+    }
+
+    #[test]
+    fn a_blocked_corner_eats_the_end_of_the_edge_it_touches() {
+        /* 40 px of a 1080 px edge is 37.04 permille, rounded up to 38: the daemon
+         * blocks the whole 40 px, so the canvas may not claim a sliver of it. */
+        let corners = [lan_mouse_ipc::SwitchCorner::TopRight];
+        let (low, high) = blocked_ends(Position::Right, &corners, 1080.0, 40);
+        assert_eq!(low, 38);
+        assert_eq!(high, 0);
+        // the same corner is the right end of the top edge, over a wider screen
+        let (low, high) = blocked_ends(Position::Top, &corners, 1920.0, 40);
+        assert_eq!(low, 0);
+        assert_eq!(high, 21);
+    }
+
+    #[test]
+    fn corners_do_not_block_an_edge_they_are_not_on() {
+        let corners = [lan_mouse_ipc::SwitchCorner::TopLeft];
+        assert_eq!(blocked_ends(Position::Bottom, &corners, 1920.0, 40), (0, 0));
+        assert_eq!(blocked_ends(Position::Right, &corners, 1080.0, 40), (0, 0));
+    }
+
+    #[test]
+    fn a_blocked_corner_takes_its_share_of_a_peer_claim() {
+        let mut state = state(vec![machine(0, Position::Right, (0.0, 1.0))]);
+        state.switch_options = SwitchOptions {
+            double_tap_ms: 0,
+            corner_size: 108, // 10% of a 1080 px edge
+            corners: vec![lan_mouse_ipc::SwitchCorner::TopRight],
+        };
+        state.relayout(800.0, 460.0);
+        let reachable = reachable_stretches(&state, state.geometry.local);
+        assert_eq!(reachable.len(), 1);
+        assert_eq!(reachable[0].1.fractions(), [0.1, 1.0]);
+    }
+
+    #[test]
+    fn a_peer_whose_whole_claim_is_a_blocked_corner_reaches_nobody() {
+        let mut state = state(vec![machine(0, Position::Right, (0.0, 0.05))]);
+        state.switch_options = SwitchOptions {
+            double_tap_ms: 0,
+            corner_size: 108,
+            corners: vec![lan_mouse_ipc::SwitchCorner::TopRight],
+        };
+        state.relayout(800.0, 460.0);
+        assert!(reachable_stretches(&state, state.geometry.local).is_empty());
+    }
+
+    #[test]
+    fn no_corners_means_the_whole_claim_is_reachable() {
+        let state = state(vec![machine(0, Position::Right, (0.2, 0.8))]);
+        let reachable = reachable_stretches(&state, state.geometry.local);
+        assert_eq!(reachable.len(), 1);
+        assert_eq!(
+            reachable[0].1,
+            EdgeRange::from_fractions(0.2, 0.8).expect("range")
+        );
+    }
+
+    #[test]
+    fn a_corner_larger_than_the_edge_blocks_all_of_it() {
+        let (low, high) = blocked_ends(
+            Position::Right,
+            &[lan_mouse_ipc::SwitchCorner::TopRight],
+            100.0,
+            1000,
+        );
+        assert_eq!((low, high), (1000, 0));
+    }
+
+    /// The canvas point that is `fraction` along `position`'s edge.
+    fn local_edge_point(state: &State, position: Position, fraction: f64) -> f64 {
+        let local = state.geometry.local;
+        let low = local.edge_start(position);
+        low + fraction * local.extent_along(position)
+    }
 }
 
-fn rounded_rect(cr: &cairo::Context, rect: Rect, radius: f64) {
-    let r = radius.min(rect.h / 2.0).min(rect.w / 2.0);
-    cr.new_sub_path();
-    cr.arc(rect.x + rect.w - r, rect.y + r, r, -PI / 2.0, 0.0);
-    cr.arc(rect.x + rect.w - r, rect.y + rect.h - r, r, 0.0, PI / 2.0);
-    cr.arc(rect.x + r, rect.y + rect.h - r, r, PI / 2.0, PI);
-    cr.arc(rect.x + r, rect.y + r, r, PI, 3.0 * PI / 2.0);
-    cr.close_path();
-}
+/// Render the canvas off screen.
+///
+/// The drawing code takes a cairo context and a palette, so the whole picture can
+/// be produced without a compositor - which is how it gets tested, and how a
+/// screenshot can be looked at in a headless session.
+#[cfg(test)]
+mod render {
+    use super::*;
 
-/// Draw the text centred on (`cx`, `cy`), shortened with an ellipsis when it
-/// does not fit into `max_width`.
-fn draw_text(cr: &cairo::Context, text: &str, cx: f64, cy: f64, max_width: f64, size: f64) {
-    cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
-    cr.set_font_size(size);
+    fn machine(
+        handle: ClientHandle,
+        position: Position,
+        edge: (f64, f64),
+        active: bool,
+    ) -> Machine {
+        Machine {
+            handle,
+            hostname: format!("host{handle}"),
+            position,
+            active,
+            edge: EdgeRange::from_fractions(edge.0, edge.1).expect("range"),
+            peer_edge: EdgeRange::FULL,
+            peer_size: None,
+        }
+    }
 
-    let fits = |candidate: &str| {
-        cr.text_extents(candidate)
-            .map(|extents| extents.width() <= max_width)
-            .unwrap_or(true)
-    };
+    fn state(machines: Vec<Machine>) -> State {
+        State {
+            local_hostname: "workstation".to_owned(),
+            screen_size: Some((1920.0, 1080.0)),
+            machines,
+            switch_options: SwitchOptions::default(),
+            on_request: Rc::new(|_| {}),
+            geometry: Geometry::default(),
+            drag: None,
+            resize: None,
+            hover: None,
+            zoom: 1.0,
+            pan: (0.0, 0.0),
+            canvas: (1.0, 1.0),
+            show_grid: true,
+        }
+    }
 
-    let mut label = text.to_string();
-    if !fits(&label) {
-        while !label.is_empty() {
-            label.pop();
-            let candidate = format!("{label}…");
-            if fits(&candidate) {
-                label = candidate;
-                break;
+    /// Paint `state` onto an ARGB surface and return it.
+    ///
+    /// The light palette is fixed rather than read from the theme: a test has to
+    /// compare against colours it knows. The surface is primed with the window
+    /// background because everything the canvas draws is alpha blended - on a
+    /// transparent surface the pixels would come out premultiplied and no colour
+    /// would match what was asked for.
+    fn render(state: &mut State, width: i32, height: i32) -> cairo::ImageSurface {
+        let surface =
+            cairo::ImageSurface::create(cairo::Format::ARgb32, width, height).expect("surface");
+        let cr = cairo::Context::new(&surface).expect("context");
+        cr.set_source_rgb(1.0, 1.0, 1.0);
+        let _ = cr.paint();
+        state.relayout(width as f64, height as f64);
+        draw::draw(
+            &cr,
+            width as f64,
+            height as f64,
+            state,
+            &Palette::resolve(false),
+        );
+        /* a surface cannot be read while a context still draws into it: drop the
+         * context, flush, then hand the pixels out */
+        drop(cr);
+        surface.flush();
+        surface
+    }
+
+    /// The colour of one pixel, as (red, green, blue) in 0..=255.
+    fn pixel(surface: &mut cairo::ImageSurface, x: i32, y: i32) -> (u8, u8, u8) {
+        let stride = surface.stride() as usize;
+        let data = surface.data().expect("surface data");
+        let offset = y as usize * stride + x as usize * 4;
+        // ARGB32 is native-endian premultiplied: on little-endian that is B, G, R, A
+        (data[offset + 2], data[offset + 1], data[offset])
+    }
+
+    /// How many pixels are closer to `color` at `alpha` over the background than
+    /// to any of `others` at their own alpha.
+    ///
+    /// The canvas paints with alpha, so what lands in the surface is the blend, not
+    /// the palette entry; comparing against the raw colour would find nothing and
+    /// the test would only prove that the palette is opaque.
+    fn count_closest(
+        surface: &mut cairo::ImageSurface,
+        color: (f64, f64, f64),
+        alpha: f64,
+        others: &[((f64, f64, f64), f64)],
+    ) -> usize {
+        let target = blend(color, alpha);
+        let others = others
+            .iter()
+            .map(|(c, a)| blend(*c, *a))
+            .collect::<Vec<_>>();
+        let mut hits = 0;
+        for y in 0..surface.height() {
+            for x in 0..surface.width() {
+                let (r, g, b) = pixel(surface, x, y);
+                let here = (r as i32, g as i32, b as i32);
+                let distance = |c: &(i32, i32, i32)| {
+                    (c.0 - here.0).abs() + (c.1 - here.1).abs() + (c.2 - here.2).abs()
+                };
+                let best = distance(&target);
+                if best < 40 && others.iter().all(|c| distance(c) > best) {
+                    hits += 1;
+                }
             }
         }
+        hits
     }
 
-    let Ok(extents) = cr.text_extents(&label) else {
-        return;
-    };
-    let x = cx - (extents.width() / 2.0 + extents.x_bearing());
-    let y = cy - (extents.height() / 2.0 + extents.y_bearing());
-    cr.move_to(x, y);
-    let _ = cr.show_text(&label);
-}
-
-fn draw(_area: &gtk::DrawingArea, cr: &cairo::Context, width: f64, height: f64, state: &State) {
-    /* The colours are derived from the dark/light preference instead of being
-     * looked up in the style context: `gtk_style_context_lookup_color` is
-     * deprecated, and these values read well on both themes. */
-    let dark = adw::StyleManager::default().is_dark();
-    let foreground = if dark {
-        (0.92, 0.92, 0.94)
-    } else {
-        (0.11, 0.11, 0.13)
-    };
-    let palette = Palette {
-        foreground,
-        accent: if dark {
-            (0.36, 0.62, 0.95)
-        } else {
-            (0.20, 0.47, 0.85)
-        },
-        success: if dark {
-            (0.35, 0.82, 0.47)
-        } else {
-            (0.15, 0.65, 0.32)
-        },
-    };
-
-    /* Canvas: a soft panel with a dot grid, so the empty space still reads as
-     * a layout editor. */
-    cr.set_operator(cairo::Operator::Source);
-    cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
-    let _ = cr.paint();
-    cr.set_operator(cairo::Operator::Over);
-
-    let canvas = Rect {
-        x: 0.5,
-        y: 0.5,
-        w: width - 1.0,
-        h: height - 1.0,
-    };
-    rounded_rect(cr, canvas, 14.0);
-    set_source(cr, palette.foreground, 0.04);
-    let _ = cr.fill_preserve();
-    set_source(cr, palette.foreground, 0.12);
-    cr.set_line_width(1.0);
-    let _ = cr.stroke();
-
-    let mut y = GRID_STEP;
-    while y < height {
-        let mut x = GRID_STEP;
-        while x < width {
-            cr.new_sub_path();
-            cr.arc(x, y, 1.2, 0.0, 2.0 * PI);
-            set_source(cr, palette.foreground, 0.12);
-            let _ = cr.fill();
-            x += GRID_STEP;
-        }
-        y += GRID_STEP;
+    /// The colour that `color` at `alpha` becomes over the white background.
+    fn blend(color: (f64, f64, f64), alpha: f64) -> (i32, i32, i32) {
+        let channel = |value: f64| (value * alpha + 1.0 * (1.0 - alpha)) * 255.0;
+        (
+            channel(color.0) as i32,
+            channel(color.1) as i32,
+            channel(color.2) as i32,
+        )
     }
 
-    /* Everything below is laid out in layout coordinates; scale and centre it so
-     * a wide arrangement still fits into the panel. */
-    let _ = cr.save();
-    cr.translate(state.origin.0, state.origin.1);
-    cr.scale(state.scale, state.scale);
+    #[test]
+    fn the_local_screen_is_drawn_bigger_than_a_laptop_peer() {
+        /* The point of drawing to scale: a 1366x768 laptop next to a 1920x1080
+         * screen has to look smaller. A canvas that drew equal cards would make
+         * an edge range meaningless. */
+        let mut small = machine(0, Position::Right, (0.0, 1.0), true);
+        small.peer_size = Some((1366.0, 768.0));
+        let mut state = state(vec![small]);
+        let mut surface = render(&mut state, 900, 500);
 
-    /* Links first, they run underneath the cards. */
-    for machine in &state.machines {
-        let Some(peer) = state.rect_of(machine.handle) else {
-            continue;
-        };
-        /* Anchor both ends at the peer's own offset along the edge, otherwise
-         * several peers on one edge all converge on the middle and the bridges
-         * cross each other. */
-        let from = state.local.point_at(machine.position, peer);
-        let to = peer.edge_mid(machine.position.opposite());
-        let (color, alpha) = if machine.active {
-            (palette.success, 0.95)
-        } else {
-            (palette.foreground, 0.28)
-        };
-        /* A thick bridge between the two facing edges, the way Synergy draws a
-         * link: the machines touch each other through it. */
-        set_source(cr, color, alpha);
-        cr.set_line_cap(cairo::LineCap::Round);
-        cr.set_line_width(9.0);
-        cr.move_to(from.0, from.1);
-        cr.line_to(to.0, to.1);
-        let _ = cr.stroke();
-        cr.set_line_cap(cairo::LineCap::Butt);
-
-        /* Louder when the peer holds the pointer. */
-        if machine.active {
-            set_source(cr, palette.success, 0.35);
-            cr.set_line_width(3.0);
-            cr.move_to(from.0, from.1);
-            cr.line_to(to.0, to.1);
-            let _ = cr.stroke();
-        }
-    }
-
-    /* Highlight the edge the dragged card is going to snap to. */
-    if let Some(drag) = state.drag.as_ref() {
-        let local = state.local;
-        let (x0, y0, x1, y1) = match drag.target {
-            Position::Left => (local.x, local.y, local.x, local.y + local.h),
-            Position::Right => (
-                local.x + local.w,
-                local.y,
-                local.x + local.w,
-                local.y + local.h,
-            ),
-            Position::Top => (local.x, local.y, local.x + local.w, local.y),
-            Position::Bottom => (
-                local.x,
-                local.y + local.h,
-                local.x + local.w,
-                local.y + local.h,
-            ),
-        };
-        set_source(cr, palette.accent, 0.9);
-        cr.set_line_width(4.0);
-        cr.move_to(x0, y0);
-        cr.line_to(x1, y1);
-        let _ = cr.stroke();
-    }
-
-    /* The local screen. */
-    let local = state.local;
-    rounded_rect(cr, local, CARD_RADIUS);
-    set_source(cr, palette.accent, 0.16);
-    let _ = cr.fill_preserve();
-    set_source(cr, palette.accent, 0.85);
-    cr.set_line_width(2.0);
-    let _ = cr.stroke();
-    draw_card_contents(
-        cr,
-        local,
-        &state.local_hostname,
-        "this screen",
-        palette.foreground,
-        palette.accent,
-    );
-
-    /* Peer screens, the dragged one on top. */
-    let mut order = state
-        .machines
-        .iter()
-        .map(|machine| machine.handle)
-        .collect::<Vec<_>>();
-    if let Some(drag) = state.drag.as_ref() {
-        order.retain(|handle| *handle != drag.handle);
-        order.push(drag.handle);
-    }
-    for handle in order {
-        let Some(machine) = state.machine(handle) else {
-            continue;
-        };
-        let Some(rect) = state.rect_of(handle) else {
-            continue;
-        };
-        let dragging = state
-            .drag
-            .as_ref()
-            .is_some_and(|drag| drag.handle == handle);
-        let hovered = state.hover == Some(handle);
-
-        if dragging {
-            /* Lift the card off the canvas with a soft shadow. */
-            let shadow = Rect {
-                x: rect.x + 1.5,
-                y: rect.y + 3.0,
-                w: rect.w,
-                h: rect.h,
-            };
-            rounded_rect(cr, shadow, CARD_RADIUS);
-            cr.set_source_rgba(0.0, 0.0, 0.0, 0.22);
-            let _ = cr.fill();
-        }
-
-        rounded_rect(cr, rect, CARD_RADIUS);
-        set_source(cr, palette.foreground, if dragging { 0.10 } else { 0.06 });
-        let _ = cr.fill_preserve();
-        if machine.active {
-            set_source(cr, palette.success, 0.9);
-        } else if hovered || dragging {
-            set_source(cr, palette.accent, 0.9);
-        } else {
-            set_source(cr, palette.foreground, 0.28);
-        }
-        cr.set_line_width(if hovered || dragging { 2.0 } else { 1.5 });
-        let _ = cr.stroke();
-
-        draw_card_contents(
-            cr,
-            rect,
-            &machine.hostname,
-            edge_label(machine.position),
-            palette.foreground,
-            if machine.active {
-                palette.success
-            } else {
-                palette.accent
-            },
+        let local = state.to_canvas(state.geometry.local);
+        let peer = state.to_canvas(state.rect_of(0).expect("peer"));
+        assert!(
+            local.h > peer.h,
+            "the local screen should tower over a laptop: {local:?} vs {peer:?}"
         );
-
-        /* Status dot in the top right corner, filled while the peer holds the
-         * pointer. */
-        cr.new_sub_path();
-        cr.arc(rect.x + rect.w - 12.0, rect.y + 12.0, 3.5, 0.0, 2.0 * PI);
-        if machine.active {
-            let _ = cr.fill();
-        } else {
-            cr.set_line_width(1.2);
-            let _ = cr.stroke();
-        }
+        // and the cards are actually painted: green outline pixels exist
+        let palette = Palette::resolve(false);
+        let green = count_closest(
+            &mut surface,
+            palette.success,
+            0.6,
+            &[(palette.accent, 0.9), (palette.danger, 0.95)],
+        );
+        assert!(green > 50, "no peer card was drawn ({green} green pixels)");
     }
 
-    let _ = cr.restore();
+    #[test]
+    fn two_peers_on_one_edge_are_drawn_one_above_the_other() {
+        let mut state = state(vec![
+            machine(0, Position::Right, (0.0, 0.5), true),
+            machine(1, Position::Right, (0.5, 1.0), true),
+        ]);
+        let mut surface = render(&mut state, 900, 500);
+        let first = state.rect_of(0).expect("first");
+        let second = state.rect_of(1).expect("second");
+        let (first, second) = (state.to_canvas(first), state.to_canvas(second));
+        // both are inside the canvas and stacked, not side by side
+        assert!(first.bottom() <= second.y + 1.0);
+        assert!(
+            second.bottom() <= 500.0,
+            "the layout overflowed: {second:?}"
+        );
+        // the local screen's blue border is drawn
+        let palette = Palette::resolve(false);
+        let blue = count_closest(
+            &mut surface,
+            palette.accent,
+            0.9,
+            &[(palette.success, 0.6), (palette.danger, 0.95)],
+        );
+        assert!(blue > 100, "the local screen is missing ({blue} pixels)");
+    }
 
-    if state.machines.is_empty() {
-        set_source(cr, palette.foreground, 0.55);
-        draw_text(
-            cr,
-            "No machines yet - add one on the Devices page",
-            width / 2.0,
-            height - 28.0,
-            width - 40.0,
-            12.0,
+    #[test]
+    fn a_wall_is_painted_where_nothing_is_reachable() {
+        // 0-40% and 60-100%: the 40-60% stretch reaches nobody and must show as blocked
+        let mut state = state(vec![
+            machine(0, Position::Right, (0.0, 0.4), true),
+            machine(1, Position::Right, (0.6, 1.0), true),
+        ]);
+        let mut surface = render(&mut state, 900, 500);
+        let palette = Palette::resolve(false);
+        let blocked = count_closest(
+            &mut surface,
+            palette.warning,
+            0.55,
+            &[(palette.success, 0.5), (palette.accent, 0.9)],
+        );
+        assert!(
+            blocked > 20,
+            "the gap between 40% and 60% was not drawn as a wall ({blocked} pixels)"
         );
     }
-}
 
-fn draw_card_contents(
-    cr: &cairo::Context,
-    rect: Rect,
-    name: &str,
-    subtitle: &str,
-    foreground: (f64, f64, f64),
-    accent: (f64, f64, f64),
-) {
-    /* A small monitor glyph in the top left corner, drawn instead of loading an
-     * icon so the cards stay crisp while they are dragged around. */
-    let glyph = Rect {
-        x: rect.x + 14.0,
-        y: rect.y + 14.0,
-        w: 20.0,
-        h: 12.0,
-    };
-    rounded_rect(cr, glyph, 2.0);
-    set_source(cr, accent, 0.8);
-    cr.set_line_width(1.4);
-    let _ = cr.stroke();
-    cr.move_to(rect.x + 20.0, glyph.y + glyph.h + 3.0);
-    cr.line_to(rect.x + 28.0, glyph.y + glyph.h + 3.0);
-    let _ = cr.stroke();
-
-    /* The three dot menu in the top right corner, matching the Synergy cards. */
-    set_source(cr, foreground, 0.45);
-    for i in 0..3 {
-        cr.new_sub_path();
-        cr.arc(
-            rect.x + rect.w - 22.0 + i as f64 * 4.0,
-            rect.y + 16.0,
-            1.1,
-            0.0,
-            2.0 * PI,
+    #[test]
+    fn a_disabled_peer_is_not_painted() {
+        let mut state = state(vec![machine(0, Position::Right, (0.0, 1.0), false)]);
+        let mut surface = render(&mut state, 900, 500);
+        let palette = Palette::resolve(false);
+        let green = count_closest(
+            &mut surface,
+            palette.success,
+            0.6,
+            &[(palette.accent, 0.9), (palette.danger, 0.95)],
         );
-        let _ = cr.fill();
+        assert_eq!(green, 0, "a disabled peer was drawn as reachable");
     }
 
-    set_source(cr, foreground, 0.95);
-    draw_text(
-        cr,
-        name,
-        rect.x + rect.w / 2.0,
-        rect.y + rect.h / 2.0 + 8.0,
-        rect.w - 28.0,
-        13.5,
-    );
-
-    /* The edge this screen is reached through, shown as a pill so it does not
-     * read as part of the hostname. */
-    let (text_width, _) = measure(cr, subtitle, 10.0);
-    let pill = Rect {
-        x: rect.x + rect.w / 2.0 - text_width / 2.0 - 7.0,
-        y: rect.y + rect.h - 25.0,
-        w: text_width + 14.0,
-        h: 16.0,
-    };
-    rounded_rect(cr, pill, 8.0);
-    set_source(cr, accent, 0.16);
-    let _ = cr.fill();
-    set_source(cr, accent, 0.9);
-    draw_text(
-        cr,
-        subtitle,
-        pill.x + pill.w / 2.0,
-        pill.y + pill.h / 2.0,
-        pill.w - 4.0,
-        10.0,
-    );
-}
-
-/// Width and height of `text` at `size`, for laying out the pills.
-fn measure(cr: &cairo::Context, text: &str, size: f64) -> (f64, f64) {
-    cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
-    cr.set_font_size(size);
-    match cr.text_extents(text) {
-        Ok(extents) => (extents.width(), extents.height()),
-        Err(_) => (size * text.chars().count() as f64 * 0.6, size),
+    #[test]
+    fn an_unreachable_claim_is_marked_on_the_card() {
+        let mut state = state(vec![
+            machine(0, Position::Right, (0.0, 1.0), true),
+            machine(1, Position::Right, (0.0, 0.5), true),
+        ]);
+        let mut surface = render(&mut state, 900, 500);
+        let palette = Palette::resolve(false);
+        let red = count_closest(
+            &mut surface,
+            palette.danger,
+            0.95,
+            &[(palette.success, 0.6), (palette.accent, 0.9)],
+        );
+        assert!(red > 20, "the squeezed peer was not flagged ({red} pixels)");
     }
-}
 
-fn edge_label(position: Position) -> &'static str {
-    match position {
-        Position::Left => "left",
-        Position::Right => "right",
-        Position::Top => "top",
-        Position::Bottom => "bottom",
+    /// Write a PNG of a representative layout so the picture can be looked at.
+    ///
+    /// Only with `LAN_MOUSE_RENDER_DEMO=/path`: a test that writes files
+    /// unconditionally is a test that fails on a read-only checkout.
+    #[test]
+    fn write_a_demo_image_when_asked() {
+        let Some(path) = std::env::var_os("LAN_MOUSE_RENDER_DEMO") else {
+            return;
+        };
+        let mut first = machine(0, Position::Right, (0.0, 0.55), true);
+        first.hostname = "thinkpad".to_owned();
+        first.peer_size = Some((1920.0, 1080.0));
+        let mut second = machine(1, Position::Right, (0.55, 1.0), true);
+        second.hostname = "nas-服务器".to_owned();
+        second.peer_size = Some((1280.0, 1024.0));
+        let third = machine(2, Position::Top, (0.2, 0.8), true);
+        let mut state = state(vec![first, second, third]);
+        let surface = render(&mut state, 1000, 620);
+        let mut file =
+            std::io::BufWriter::new(std::fs::File::create(path).expect("create the demo image"));
+        surface
+            .write_to_png(&mut file)
+            .expect("write the demo image");
     }
 }

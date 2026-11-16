@@ -55,6 +55,19 @@ pub struct Window {
     pub remap_placeholder_row: TemplateChild<ActionRow>,
     #[template_child]
     pub arrangement_box: TemplateChild<gtk::Box>,
+    /// edge-crossing thresholds, shown on the Screens page
+    pub switch_options: RefCell<lan_mouse_ipc::SwitchOptions>,
+    /// the size of the reachable screen area, as reported by the daemon
+    pub screen_size: RefCell<Option<(f64, f64)>>,
+    /// The arrangement canvas.
+    ///
+    /// Built on the first refresh and then only updated: rebuilding it on every
+    /// state broadcast interrupted whatever the user was doing in it.
+    #[expect(
+        private_interfaces,
+        reason = "the canvas type and this struct are both crate-internal"
+    )]
+    pub canvas: RefCell<Option<crate::arrangement::Canvas>>,
     #[template_child]
     pub release_bind_entry: TemplateChild<gtk::Entry>,
     #[template_child]

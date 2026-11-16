@@ -333,7 +333,7 @@
                         <child>
                           <object class="AdwPreferencesGroup">
                             <property name="title" translatable="yes">Arrangement</property>
-                            <property name="description" translatable="yes">Drag a machine onto an edge of this screen, or use its menu to pick the edge. The pointer crosses the edge you choose, and machines sharing an edge release the pointer in list order.</property>
+                            <property name="description" translatable="yes">Drag a machine so the edges that should connect touch, and use the handles on this screen's edge to set the stretch it is reached through. Machines sharing an edge each own a part of it: where none is drawn, the pointer stops.</property>
                             <child>
                               <object class="GtkBox" id="arrangement_box">
                                 <property name="orientation">vertical</property>

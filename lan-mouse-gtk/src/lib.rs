@@ -411,6 +411,15 @@ fn build_ui(app: &Application) {
                     FrontendEvent::Autostart(enabled) => window.set_autostart(enabled),
                     FrontendEvent::Paused(paused) => window.set_paused(paused),
                     FrontendEvent::RestartInterval(secs) => window.set_restart_interval(secs),
+                    /* The daemon narrowed an edge range because two machines
+                     * claim the same part of an edge. A toast is enough for
+                     * now: the arrangement canvas that shows the coverage
+                     * surfaces the same conflict in place.
+                     */
+                    FrontendEvent::EdgeConflict(msg) => window.show_toast(msg.as_str()),
+                    FrontendEvent::SwitchOptions(options) => {
+                        window.set_switch_options(&options);
+                    }
                     FrontendEvent::LogLevel(level) => window.set_log_level(&level),
                     FrontendEvent::Logs(lines) => window.set_logs(lines),
                     FrontendEvent::LogAppended(lines) => window.append_logs(lines),
