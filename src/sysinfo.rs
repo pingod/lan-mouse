@@ -99,7 +99,20 @@ fn build(
     info.set_displays(&displays(layout));
     /* the picture both machines draw, sent by whichever last edited it */
     if let Some(arrangement) = arrangement {
-        info.set_world(&arrangement.encode());
+        let encoded = arrangement.encode();
+        /* A record is fixed width, so an oversized picture is cut - and a cut
+         * picture still decodes, as a desk with fewer screens. Worth saying out
+         * loud, because the symptom is a screen missing on the other machine and
+         * nothing here looks wrong. */
+        let room = lan_mouse_proto::WORLD_SLOTS * (lan_mouse_proto::PEER_INFO_FIELD - 1);
+        if encoded.len() > room {
+            log::warn!(
+                "the arrangement needs {} bytes but only {} fit; screens will be missing on the peer",
+                encoded.len(),
+                room
+            );
+        }
+        info.set_world(&encoded);
     }
     info
 }

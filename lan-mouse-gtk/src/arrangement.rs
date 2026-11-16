@@ -47,6 +47,12 @@ pub(super) struct Machine {
     pub peer_edge: EdgeRange,
     /// what the peer reported about its screen, in pixels
     pub peer_size: Option<(f64, f64)>,
+    /// the picture the peer says both machines are drawing, if it sent one
+    ///
+    /// The two windows have to show the same desk, and two derivations from two
+    /// configs cannot guarantee that. The peer publishes the picture it is drawing;
+    /// the higher `(revision, author)` wins, and the loser adopts it.
+    pub peer_picture: Option<input_event::Arrangement>,
     /// the peer's monitors, normalised so the group's origin is (0,0)
     ///
     /// Drawn as individual screens rather than one box, for the same reason the
@@ -69,6 +75,8 @@ pub(super) enum MachineRequest {
         edge: EdgeRange,
         peer_edge: EdgeRange,
     },
+    /// hand the shared picture to the daemon, which puts it in the report it sends
+    Publish(String),
     /// give every peer of an edge an equal, adjacent stretch of it
     AutoArrange(Vec<(ClientHandle, Position, Option<String>, EdgeRange, EdgeRange)>),
 }
@@ -117,6 +125,121 @@ pub fn peer_monitors(displays: &str) -> Vec<layout::Monitor> {
             monitor.rect.x -= min_x;
             monitor.rect.y -= min_y;
             monitor
+        })
+        .collect()
+}
+
+/// The parts of a machine's link that a change in means an edit happened.
+type ConfigSignature = (
+    ClientHandle,
+    lan_mouse_ipc::Position,
+    Option<String>,
+    EdgeRange,
+    EdgeRange,
+    bool,
+);
+
+fn config_signature(machines: &[Machine]) -> Vec<ConfigSignature> {
+    machines
+        .iter()
+        .map(|machine| {
+            (
+                machine.handle,
+                machine.position,
+                machine.display.clone(),
+                machine.edge,
+                machine.peer_edge,
+                machine.active,
+            )
+        })
+        .collect()
+}
+
+/// Milliseconds since the epoch, used as the revision of an edit.
+///
+/// A clock rather than a counter because the two machines each keep their own
+/// counter and a counter cannot order edits made on different machines.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// A screen rectangle as the wire type.
+fn screen_rect(rect: Screen) -> input_event::ScreenRect {
+    input_event::ScreenRect {
+        x: rect.x as i32,
+        y: rect.y as i32,
+        width: rect.w.max(1.0) as u32,
+        height: rect.h.max(1.0) as u32,
+    }
+}
+
+/// The reverse of [`screen_rect`].
+fn screen_from(rect: input_event::ScreenRect) -> Screen {
+    Screen::new(
+        rect.x as f64,
+        rect.y as f64,
+        rect.width as f64,
+        rect.height as f64,
+    )
+}
+
+/// A display entry that occupies exactly this rectangle.
+///
+/// The picture carries rectangles, not panels and rotations: it describes where the
+/// screens ended up, which is the whole point of it, so there is nothing left to
+/// rotate.
+fn display_of(rect: &input_event::ScreenRect) -> input_event::DisplayInfo {
+    input_event::DisplayInfo {
+        name: String::new(),
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+        rotation: input_event::Rotation::Normal,
+        enabled: true,
+    }
+}
+
+/// The bounding box of a set of rectangles.
+fn union_of(rects: &[input_event::ScreenRect]) -> Option<input_event::ScreenRect> {
+    let mut screens = rects.iter();
+    let first = *screens.next()?;
+    Some(screens.fold(first, |acc, rect| {
+        let x = acc.x.min(rect.x);
+        let y = acc.y.min(rect.y);
+        let right = (acc.x + acc.width as i32).max(rect.x + rect.width as i32);
+        let bottom = (acc.y + acc.height as i32).max(rect.y + rect.height as i32);
+        input_event::ScreenRect {
+            x,
+            y,
+            width: (right - x) as u32,
+            height: (bottom - y) as u32,
+        }
+    }))
+}
+
+/// Rectangles as monitors normalised to their own corner, so a group can be drawn
+/// wherever it was placed.
+fn normalise_monitors(rects: &[input_event::ScreenRect]) -> Vec<layout::Monitor> {
+    let Some(bounds) = union_of(rects) else {
+        return Vec::new();
+    };
+    rects
+        .iter()
+        .map(|rect| {
+            let screen = screen_from(*rect);
+            layout::Monitor::new(
+                "",
+                Screen::new(
+                    screen.x - bounds.x as f64,
+                    screen.y - bounds.y as f64,
+                    screen.w,
+                    screen.h,
+                ),
+            )
         })
         .collect()
 }
@@ -209,6 +332,20 @@ struct State {
     hover: Option<ClientHandle>,
     /// the view's pan when a pan began, while the local screen is being dragged
     panning: Option<(f64, f64)>,
+    /// when this side last changed the layout, in milliseconds
+    ///
+    /// It is the tie-breaker in the shared picture and it must only move on an
+    /// edit: a value that also moved when the picture was merely recomputed would
+    /// always win, and the two machines would never settle on one picture.
+    local_revision: u64,
+    /// the last picture handed to the daemon, so an unchanged one is not resent
+    published: String,
+    /// the link configuration the daemon last reported, before any adoption
+    ///
+    /// Kept separately because `machines` is overwritten by an adopted picture:
+    /// comparing against that would make every report look like a change, bump the
+    /// revision on every tick, and the two machines would never settle.
+    last_signature: Vec<ConfigSignature>,
     /// zoom applied on top of the automatic fit
     zoom: f64,
     /// pan applied on top of the automatic centring, in canvas units
@@ -255,6 +392,107 @@ impl State {
 
     fn local_bounds(&self) -> Option<input_event::ScreenRect> {
         self.local_layout()?.bounds()
+    }
+
+    /// The picture this side would draw, from its own geometry.
+    ///
+    /// Published so the other machine can draw exactly this rather than deriving
+    /// its own - two derivations from two configs can disagree, and did.
+    fn local_picture(&self) -> input_event::Arrangement {
+        let mut picture =
+            input_event::Arrangement::new(self.local_revision, self.local_hostname.clone());
+        let mine = self
+            .local_monitors()
+            .iter()
+            .map(|monitor| screen_rect(monitor.rect))
+            .collect::<Vec<_>>();
+        picture.machines.push(input_event::ArrangedMachine {
+            hostname: self.local_hostname.clone(),
+            screens: mine,
+        });
+        for machine in &self.machines {
+            if !machine.active {
+                continue;
+            }
+            let screens = if machine.peer_monitors.is_empty() {
+                self.rect_of(machine.handle)
+                    .map(|rect| vec![screen_rect(rect)])
+                    .unwrap_or_default()
+            } else {
+                self.screens_of(machine.handle)
+                    .iter()
+                    .map(|rect| screen_rect(*rect))
+                    .collect()
+            };
+            if screens.is_empty() {
+                continue;
+            }
+            picture.machines.push(input_event::ArrangedMachine {
+                hostname: machine.hostname.clone(),
+                screens,
+            });
+        }
+        picture
+    }
+
+    /// The peer's picture, when it is newer than this side's own.
+    ///
+    /// Both machines run this with the same inputs, so both reach the same answer
+    /// without a round trip: the revision decides, and the author breaks a tie
+    /// because two sides can each reach the same revision without having seen the
+    /// other's edit.
+    fn newer_peer_picture(&self) -> Option<input_event::Arrangement> {
+        let local = input_event::Arrangement::new(self.local_revision, self.local_hostname.clone());
+        self.machines
+            .iter()
+            .filter_map(|machine| machine.peer_picture.clone())
+            .filter(|picture| picture.supersedes(&local))
+            .max_by(|a, b| (a.revision, a.author.clone()).cmp(&(b.revision, b.author.clone())))
+    }
+
+    /// Draw `picture` instead of deriving one.
+    ///
+    /// The geometry is replaced rather than layered on top: every drawing and
+    /// hit-testing path reads `local_displays`, `machines[].position` and the peers'
+    /// monitors, so putting the picture there is what makes the whole canvas agree
+    /// with it - including the handles, which have to stay on the edge the picture
+    /// says the link is on.
+    fn adopt(&mut self, picture: &input_event::Arrangement) {
+        let mine = picture.screens_of(&self.local_hostname).to_vec();
+        if mine.is_empty() {
+            /* the peer's picture does not describe this machine - drawing nothing
+             * would be worse than drawing this side's own derivation */
+            return;
+        }
+        self.local_displays = mine.iter().map(display_of).collect();
+        let local = self.local_screen();
+        let monitors = self.local_monitors();
+        for machine in &mut self.machines {
+            let theirs = picture.screens_of(&machine.hostname).to_vec();
+            if theirs.is_empty() {
+                continue;
+            }
+            let Some(bounds) = union_of(&theirs) else {
+                continue;
+            };
+            let candidate = Screen::new(
+                bounds.x as f64,
+                bounds.y as f64,
+                bounds.width as f64,
+                bounds.height as f64,
+            );
+            /* The picture gives absolute rectangles; the canvas places a peer group
+             * from a link. Inverting the placement here means the rest of the canvas
+             * keeps working unchanged, and both machines invert the same picture the
+             * same way, so they still draw the same desk. */
+            let placement = layout::snap(local, &monitors, candidate);
+            machine.position = placement.position;
+            machine.display = placement.display;
+            machine.edge = placement.edge;
+            machine.peer_edge = placement.peer_edge;
+            machine.peer_monitors = normalise_monitors(&theirs);
+            machine.peer_size = Some((candidate.w, candidate.h));
+        }
     }
 
     /// The individual monitors, in layout units, with their names.
@@ -458,6 +696,18 @@ impl State {
             peers,
             handles,
         };
+        /* Hand the picture this canvas is drawing to the daemon, which puts it in
+         * the report it sends peers - that is what makes the other window show this
+         * desk instead of deriving its own. Skipped while a peer's picture is being
+         * drawn, otherwise each side would republish the other's and the revision
+         * would only ever go up. */
+        if self.newer_peer_picture().is_none() {
+            let encoded = self.local_picture().encode();
+            if encoded != self.published {
+                self.published = encoded.clone();
+                (self.on_request)(MachineRequest::Publish(encoded));
+            }
+        }
     }
 
     /// The grab areas of the range handles: on the local edge, at both ends of
@@ -632,6 +882,9 @@ impl Canvas {
             resize: None,
             hover: None,
             panning: None,
+            local_revision: 0,
+            published: String::new(),
+            last_signature: Vec::new(),
             zoom: 1.0,
             pan: (0.0, 0.0),
             canvas: (1.0, 1.0),
@@ -729,7 +982,20 @@ impl Canvas {
                     .map(|l| l.displays)
                     .unwrap_or_default();
                 state.switch_options = switch_options.clone();
+                /* A link that changed here is this side's edit, so its picture
+                 * becomes the current one and the peer will adopt it. Detected from
+                 * the report rather than from the gesture so a change made with
+                 * `cli set-edge` counts too. */
+                let signature = config_signature(machines);
+                if signature != state.last_signature {
+                    state.last_signature = signature;
+                    state.local_revision = now_millis();
+                    state.published.clear();
+                }
                 state.machines = machines.to_vec();
+                if let Some(picture) = state.newer_peer_picture() {
+                    state.adopt(&picture);
+                }
             }
         }
         self.hint
@@ -1213,6 +1479,7 @@ mod tests {
     fn machine(handle: ClientHandle, position: Position, edge: (f64, f64)) -> Machine {
         Machine {
             handle,
+            peer_picture: None,
             peer_monitors: Vec::new(),
             display: None,
             hostname: format!("host{handle}"),
@@ -1243,6 +1510,9 @@ mod tests {
             resize: None,
             hover: None,
             panning: None,
+            local_revision: 0,
+            published: String::new(),
+            last_signature: Vec::new(),
             zoom: 1.0,
             pan: (0.0, 0.0),
             canvas: (800.0, 460.0),
@@ -1484,6 +1754,7 @@ mod render {
     ) -> Machine {
         Machine {
             handle,
+            peer_picture: None,
             peer_monitors: Vec::new(),
             display: None,
             hostname: format!("host{handle}"),
@@ -1514,6 +1785,9 @@ mod render {
             resize: None,
             hover: None,
             panning: None,
+            local_revision: 0,
+            published: String::new(),
+            last_signature: Vec::new(),
             zoom: 1.0,
             pan: (0.0, 0.0),
             canvas: (1.0, 1.0),
@@ -1803,6 +2077,108 @@ mod render {
         /* a report that says nothing is one box, which is all that is known */
         assert!(peer_monitors("").is_empty());
         assert!(peer_monitors("2560x1440").is_empty());
+    }
+
+    /// Two machines with mirrored configurations end up drawing the same desk.
+    ///
+    /// This is the whole point of the shared picture. Side A is this desk: two
+    /// monitors, with the peer above the lower one. Side B is a laptop below it,
+    /// which on its own would draw A as one box under itself. After A publishes and
+    /// B adopts, B draws A's two monitors in the same places A does.
+    #[test]
+    fn both_machines_draw_the_same_desk_after_adopting_the_picture() {
+        let mut a = state(vec![]);
+        a.local_hostname = "desk".to_owned();
+        a.local_displays = vec![
+            input_event::DisplayInfo {
+                name: "DP-2".to_owned(),
+                x: 2560,
+                y: 0,
+                width: 1440,
+                height: 2560,
+                rotation: input_event::Rotation::Normal,
+                enabled: true,
+            },
+            input_event::DisplayInfo {
+                name: "DP-3".to_owned(),
+                x: 0,
+                y: 1120,
+                width: 2560,
+                height: 1440,
+                rotation: input_event::Rotation::Normal,
+                enabled: true,
+            },
+        ];
+        let mut laptop = machine(4, Position::Top, (0.0, 1.0), true);
+        laptop.hostname = "laptop".to_owned();
+        laptop.display = Some("DP-3".to_owned());
+        laptop.peer_size = Some((1920.0, 1080.0));
+        a.machines = vec![laptop];
+        /* the desk edited more recently than the laptop */
+        a.local_revision = 100;
+        a.relayout(1000.0, 620.0);
+
+        let published = a.local_picture();
+        assert_eq!(published.author, "desk");
+        assert_eq!(published.screens_of("desk").len(), 2);
+        assert_eq!(published.screens_of("laptop").len(), 1);
+
+        /* the laptop's own view: one screen, the desk below it, no monitor names */
+        let mut b = state(vec![]);
+        b.local_hostname = "laptop".to_owned();
+        b.local_displays = vec![input_event::DisplayInfo {
+            name: "eDP-1".to_owned(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            rotation: input_event::Rotation::Normal,
+            enabled: true,
+        }];
+        let mut desk = machine(4, Position::Bottom, (0.0, 1.0), true);
+        desk.hostname = "desk".to_owned();
+        desk.peer_size = Some((4000.0, 2560.0));
+        b.machines = vec![desk];
+        b.local_revision = 50;
+        b.relayout(1000.0, 620.0);
+        /* before adopting, it draws the desk as one 4000x2560 box */
+        assert_eq!(b.screens_of(4).len(), 1);
+
+        b.machines[0].peer_picture = Some(published.clone());
+        let winner = b.newer_peer_picture().expect("the peer is newer");
+        b.adopt(&winner);
+        b.relayout(1000.0, 620.0);
+
+        /* now it draws the desk's two monitors, in the same relative places */
+        let theirs = b.screens_of(4);
+        let mine = a
+            .local_monitors()
+            .iter()
+            .map(|monitor| monitor.rect)
+            .collect::<Vec<_>>();
+        assert_eq!(theirs.len(), mine.len(), "{theirs:?} vs {mine:?}");
+        let sorted = |screens: &[Screen]| {
+            let mut out = screens.to_vec();
+            out.sort_by(|a, b| a.y.total_cmp(&b.y).then(a.x.total_cmp(&b.x)));
+            out
+        };
+        let (theirs, mine) = (sorted(&theirs), sorted(&mine));
+        /* the two windows frame the desk from different corners, so what has to
+         * match is the arrangement, not the absolute origin */
+        let (ax, ay) = (theirs[0].x, theirs[0].y);
+        let (bx, by) = (mine[0].x, mine[0].y);
+        for (theirs, mine) in theirs.iter().zip(&mine) {
+            assert_eq!(
+                (theirs.w, theirs.h),
+                (mine.w, mine.h),
+                "{theirs:?} vs {mine:?}"
+            );
+            assert!(
+                ((theirs.x - ax) - (mine.x - bx)).abs() < 2.0
+                    && ((theirs.y - ay) - (mine.y - by)).abs() < 2.0,
+                "the two machines disagree: {theirs:?} vs {mine:?}"
+            );
+        }
     }
 
     /// The local monitors are drawn where the compositor put them.

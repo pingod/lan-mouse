@@ -54,6 +54,9 @@ pub struct Service {
     resolver: DnsResolver,
     /// frontend listener
     frontend_listener: AsyncFrontendListener,
+    /// the connections to the peers, kept so a report that changed here can be
+    /// pushed instead of waiting for the next handshake
+    conn: LanMouseConnection,
     /// authorized public key sha256 fingerprints
     authorized_keys: Arc<RwLock<HashMap<String, String>>>,
     /// (outgoing) client information
@@ -87,6 +90,8 @@ pub struct Service {
     should_exit: bool,
     /// pause state requested over IPC, applied by the main loop
     pending_pause: Option<bool>,
+    /// a report has to be resent because what it carries changed
+    resend_report: bool,
     /// the client the pointer is currently handed to, tracked from the
     /// capture event stream rather than inferred from connection state
     active_capture: Option<ClientHandle>,
@@ -164,6 +169,9 @@ impl Service {
         // receive side, so handing the clone to the capture task would panic on
         // its first `recv()`.
         let switch_options = config.switch_options();
+        /* kept for pushing a report when what it carries changes; the capture task
+         * takes the original, which is the one with a receive side */
+        let report_conn = conn.clone();
         let capture = Capture::new(
             capture_backend,
             conn,
@@ -189,6 +197,7 @@ impl Service {
             authorized_keys,
             public_key_fingerprint,
             client_manager,
+            conn: report_conn,
             frontend_event_pending: Default::default(),
             port,
             pending_frontend_events: Default::default(),
@@ -203,6 +212,7 @@ impl Service {
             last_restart: Instant::now(),
             should_exit: false,
             pending_pause: None,
+            resend_report: false,
             active_capture: None,
             driving_peer: None,
             pending_peer_info: Default::default(),
@@ -250,6 +260,10 @@ impl Service {
                     }
                 }
                 _ = self.frontend_event_pending.notified() => self.handle_frontend_pending().await,
+                _ = std::future::ready(()), if self.resend_report => {
+                    self.resend_report = false;
+                    self.push_report().await;
+                },
                 event = self.emulation.event() => match event {
                     Some(event) => self.handle_emulation_event(event),
                     None => {
@@ -568,8 +582,10 @@ impl Service {
                  * the next handshake or when it asks for a refresh; there is no push
                  * on change yet, which is what makes this a picture that agrees
                  * rather than one that updates live. */
+                /* the peer is drawing a picture that is no longer true, so the
+                 * report has to go out now rather than on the next handshake */
                 if crate::sysinfo::set_arrangement(parsed) {
-                    log::debug!("arrangement published");
+                    self.resend_report = true;
                 }
             }
             FrontendRequest::RefreshPeerInfo(handle) => {
@@ -951,6 +967,23 @@ impl Service {
             self.emulation.request_port_change(port);
         }
         self.sync_frontend();
+    }
+
+    /// Send the report again to every peer that can receive it.
+    ///
+    /// The shared picture travels in it, so a change here is only drawn there after
+    /// this. Per client rather than broadcast because the connection is addressed
+    /// per handle; a peer that is not connected gets it with its next handshake.
+    async fn push_report(&mut self) {
+        let chunks = crate::sysinfo::chunks(&crate::sysinfo::local());
+        for handle in self.client_manager.active_clients() {
+            for chunk in &chunks {
+                if let Err(e) = self.conn.send(*chunk, handle).await {
+                    log::debug!("could not push the report to client {handle}: {e}");
+                    break;
+                }
+            }
+        }
     }
 
     async fn handle_frontend_pending(&mut self) {

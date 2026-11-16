@@ -34,6 +34,8 @@ pub struct ClientObject {
     /// the peer's own display report, verbatim: `WxH` or the older
     /// `N displays, WxH`. The arrangement canvas reads the size out of it.
     #[property(name = "peer-displays", get, set, type = String, member = peer_displays)]
+    /// the arrangement the peer is drawing, verbatim; empty when it sent none
+    #[property(name = "peer-arrangement", get, set, type = String, member = peer_arrangement)]
     pub data: RefCell<ClientData>,
 }
 

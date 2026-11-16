@@ -11,6 +11,7 @@ glib::wrapper! {
 
 impl ClientObject {
     pub fn new(handle: ClientHandle, client: ClientConfig, state: ClientState) -> Self {
+        let peer_arrangement = state.peer_arrangement.clone();
         Object::builder()
             .property("handle", handle)
             .property("hostname", client.hostname)
@@ -32,6 +33,7 @@ impl ClientObject {
             .property("last-seen", state.last_seen.unwrap_or(0))
             .property("forwarded", state.forwarded)
             .property("received", state.received)
+            .property("peer-arrangement", peer_arrangement)
             .property("display", client.display.clone().unwrap_or_default())
             .property("edge-start", client.edge.start() as u32)
             .property("edge-end", client.edge.end() as u32)
@@ -71,6 +73,8 @@ pub struct ClientData {
     pub last_seen: u64,
     pub forwarded: u64,
     pub received: u64,
+    /// the picture the peer published, empty when it has not sent one
+    pub peer_arrangement: String,
     /// the local monitor this link is attached to, empty when machine-level
     pub display: String,
     /// segment of the local edge this client is reached through, in permille

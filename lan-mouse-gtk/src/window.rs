@@ -315,6 +315,7 @@ impl Window {
                     (data.edge(), data.peer_edge(), data.peer_size());
                 Machine {
                     handle: client.handle(),
+                    peer_picture: input_event::Arrangement::decode(&data.peer_arrangement),
                     peer_monitors: arrangement::peer_monitors(&data.peer_displays),
                     display: (!data.display.is_empty()).then(|| data.display.clone()),
                     hostname: data
@@ -377,6 +378,9 @@ impl Window {
     /// between.
     fn handle_arrangement_request(&self, request: MachineRequest) {
         match request {
+            MachineRequest::Publish(arrangement) => {
+                self.request(FrontendRequest::PublishArrangement { arrangement });
+            }
             MachineRequest::Move {
                 handle,
                 position,
@@ -1057,8 +1061,17 @@ impl Window {
         );
         /* the peer's screen size, which the canvas draws its card to */
         client_object.set_property("peer-displays", state.peer_displays);
+        /* The picture the peer publishes is the one this window may have to draw
+         * instead of its own, so a change in it is a change in the canvas - not just
+         * in a row on the Devices page. */
+        let arrangement_changed =
+            client_object.property::<String>("peer-arrangement") != state.peer_arrangement;
+        client_object.set_property("peer-arrangement", state.peer_arrangement);
         row.refresh_version_status();
         self.update_active_device_row();
+        if arrangement_changed {
+            self.refresh_arrangement();
+        }
     }
 
     fn client_object_for_handle(&self, handle: ClientHandle) -> Option<ClientObject> {
