@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::{collections::HashSet, io, time::Duration};
 use thiserror::Error;
 use toml;
-use toml_edit::{self, DocumentMut};
+use toml_edit::{self, DocumentMut, Item};
 
 use lan_mouse_cli::CliArgs;
 use lan_mouse_ipc::{DEFAULT_PORT, Position};
@@ -294,7 +294,64 @@ impl Display for EmulationBackend {
     }
 }
 
-#[derive(Debug)]
+/// Replace the managed keys of `new_config` in the file at `path`.
+///
+/// Comments, key order and every key this program does not know about are
+/// kept: the file is parsed into a document, the new values are inserted into
+/// it, and the result is serialized again. If the existing file cannot be read
+/// or parsed, the new configuration is written as is, so a broken file never
+/// blocks saving.
+fn merge_config(path: &Path, new_config: &str) -> String {
+    let (Ok(existing), Ok(replacement)) =
+        (fs::read_to_string(path), new_config.parse::<DocumentMut>())
+    else {
+        return new_config.to_string();
+    };
+    let Ok(mut doc) = existing.parse::<DocumentMut>() else {
+        log::warn!("could not parse {path:?}, rewriting it");
+        return new_config.to_string();
+    };
+    for (key, candidate) in replacement.iter() {
+        let mut item = candidate.clone();
+        let Some((_, existing)) = doc.get_key_value_mut(key) else {
+            /* a new key: just add it */
+            doc.insert(key, item);
+            continue;
+        };
+        /* the decor of a value or of the first table of an array of tables
+         * holds the comments the user wrote around it
+         */
+        match (&*existing, &item) {
+            (Item::Value(previous), Item::Value(_)) => {
+                let decor = previous.decor().clone();
+                if let Item::Value(value) = &mut item {
+                    *value.decor_mut() = decor;
+                }
+            }
+            (Item::Table(previous), Item::Table(_)) => {
+                let decor = previous.decor().clone();
+                if let Item::Table(table) = &mut item {
+                    *table.decor_mut() = decor;
+                }
+            }
+            (Item::ArrayOfTables(previous), Item::ArrayOfTables(_)) => {
+                if let Some(previous) = previous.iter().next() {
+                    let decor = previous.decor().clone();
+                    if let Some(current) = item
+                        .as_array_of_tables_mut()
+                        .and_then(|tables| tables.iter_mut().next())
+                    {
+                        *current.decor_mut() = decor;
+                    }
+                }
+            }
+            _ => {}
+        }
+        *existing = item;
+    }
+    doc.to_string()
+}
+
 pub struct Config {
     /// command line arguments
     args: Args,
@@ -713,15 +770,10 @@ impl Config {
         /* the new config */
         let new_config = self.config_toml.clone().unwrap_or_default();
         let new_config = toml_edit::ser::to_string_pretty(&new_config).expect("config");
-
-        /*
-         * TODO merge with current config file to preserve comments
-         * => eventually we might want to split this up into clients configured
-         * via the config file and clients managed through the GUI / frontend.
-         * The latter should be saved to $XDG_DATA_HOME instead of $XDG_CONFIG_HOME,
-         * and clients configured through .config could be made permanent.
-         * For now we just override the config file.
+        /* keep the comments and the unknown keys the user wrote: only the
+         * values this program manages are replaced
          */
+        let new_config = merge_config(self.config_path(), &new_config);
 
         let _ = self.unwatch();
         /* write new config to file */
@@ -743,6 +795,48 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_keeps_comments_and_unknown_keys() {
+        let dir = std::env::temp_dir().join(format!("lan-mouse-merge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "# leading comment\nport = 1234 # inline comment\n\n# a clients comment\n[[clients]]\nhostname = \"1.2.3.4\"\nport = 4242\nposition = \"top\"\n",
+        )
+        .expect("write config");
+
+        let merged = merge_config(
+            &path,
+            "port = 4321\n[[clients]]\nhostname = \"1.2.3.4\"\nport = 4242\nposition = \"top\"\n",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(merged.contains("# leading comment"), "{merged}");
+        assert!(merged.contains("# inline comment"), "{merged}");
+        assert!(merged.contains("# a clients comment"), "{merged}");
+        assert!(merged.contains("port = 4321"), "{merged}");
+        /* the value is replaced, not duplicated */
+        assert_eq!(merged.matches("port = ").count(), 2, "{merged}");
+    }
+
+    #[test]
+    fn merge_keeps_unknown_keys() {
+        let dir =
+            std::env::temp_dir().join(format!("lan-mouse-merge-unknown-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "# keep me\nport = 1234\ncustom = \"value\"\n")
+            .expect("write config");
+
+        let merged = merge_config(&path, "port = 4321\n");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(merged.contains("custom = \"value\""), "{merged}");
+        assert!(merged.contains("# keep me"), "{merged}");
+        assert!(merged.contains("port = 4321"), "{merged}");
+    }
 
     #[test]
     fn remap_rules_are_parsed_from_toml() {

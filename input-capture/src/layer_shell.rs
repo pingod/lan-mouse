@@ -1027,7 +1027,12 @@ impl Dispatch<ZxdgOutputV1, u32> for State {
                 output.pending_info.description = description;
                 output.has_xdg_info = true;
             }
-            _ => todo!(),
+            event => {
+                /* newer protocol versions can add events; panicking here would
+                 * take the whole capture backend down
+                 */
+                log::debug!("unhandled xdg_output event: {event:?}");
+            }
         }
     }
 }
