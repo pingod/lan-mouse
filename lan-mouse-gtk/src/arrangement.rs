@@ -140,6 +140,13 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// The bounding box of a set of monitors, in layout units.
+fn union_screen(monitors: &[layout::Monitor]) -> Option<Screen> {
+    let mut rects = monitors.iter().map(|monitor| monitor.rect);
+    let first = rects.next()?;
+    Some(rects.fold(first, |acc, rect| acc.merged(rect)))
+}
+
 /// A screen rectangle as the wire type.
 fn screen_rect(rect: Screen) -> input_event::ScreenRect {
     input_event::ScreenRect {
@@ -392,8 +399,13 @@ impl State {
     fn local_picture(&self) -> input_event::Arrangement {
         let mut picture =
             input_event::Arrangement::new(self.local_revision, self.local_hostname.clone());
+        /* `drawn_monitors`, not `local_monitors`: dragging this machine's own screens
+         * moves them, and that move has to reach the picture. Using the compositor
+         * positions ignored the drag, so a user dragging this machine - the only way to
+         * say "this screen sits above that one" from this side - published an unchanged
+         * picture and nothing happened anywhere. */
         let mine = self
-            .local_monitors()
+            .drawn_monitors()
             .iter()
             .map(|monitor| screen_rect(monitor.rect))
             .collect::<Vec<_>>();
@@ -520,7 +532,11 @@ impl State {
     fn reanchor_after_moving_local(
         &self,
     ) -> Vec<(ClientHandle, Position, Option<String>, EdgeRange, EdgeRange)> {
-        let local = self.local_screen();
+        /* The *drawn* bounds, not the compositor ones: the whole point of the drag is
+         * that this machine has moved, and judging the drop against where the screens
+         * used to be made every drag compute the arrangement it already had. That is why
+         * a screen could not be put above another one on either machine. */
+        let local = union_screen(&self.drawn_monitors()).unwrap_or_else(|| self.local_screen());
         let monitors = self.drawn_monitors();
         let mut out = Vec::new();
         for machine in self.machines.iter().filter(|machine| machine.active) {
@@ -2362,6 +2378,60 @@ mod render {
         /* a gesture does */
         state.mark_edited();
         assert!(state.local_revision > 0);
+    }
+
+    /// Dragging this machine changes the arrangement, so a drag can put a peer
+    /// anywhere - including above a screen it was not above before.
+    ///
+    /// Reported on macOS as "屏幕无法放到下方横屏的正上方". The drop was judged against
+    /// the compositor positions, which a drag does not change, so every drag computed
+    /// the arrangement that was already configured and the result was always a no-op.
+    #[test]
+    fn dragging_this_machine_moves_the_peers_relative_to_it() {
+        let mut state = state(vec![]);
+        /* one screen at the origin */
+        state.local_displays = vec![input_event::DisplayInfo {
+            name: "eDP-1".to_owned(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            rotation: input_event::Rotation::Normal,
+            enabled: true,
+        }];
+        let mut peer = machine(3, Position::Bottom, (0.0, 1.0), true);
+        peer.hostname = "desk".to_owned();
+        peer.peer_size = Some((2560.0, 1440.0));
+        state.machines = vec![peer];
+        state.relayout(900.0, 600.0);
+
+        /* no drag at all: the geometry already implies the configured link, so nothing
+         * needs rewriting (whatever the placement is, it must not churn) */
+        let before = state.reanchor_after_moving_local();
+        for (handle, position, display, edge, peer_edge) in &before {
+            let machine = state.machine(*handle).expect("the peer");
+            assert!(
+                !(machine.position == *position
+                    && machine.display == *display
+                    && machine.edge == *edge
+                    && machine.peer_edge == *peer_edge),
+                "a no-op drag must not produce a request"
+            );
+        }
+
+        /* drag this machine *up* by more than the peer's height: now the peer is below
+         * the machine, and dropping it there must rewrite the link */
+        state.local_offset = (0.0, -3000.0);
+        let requests = state.reanchor_after_moving_local();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].1, Position::Bottom);
+
+        /* drag this machine *down*: the peer ends up above it, which is the case that
+         * could not be expressed before */
+        state.local_offset = (0.0, 3000.0);
+        let requests = state.reanchor_after_moving_local();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].1, Position::Top);
     }
 
     /// A window that has not edited anything adopts any picture it is offered.
