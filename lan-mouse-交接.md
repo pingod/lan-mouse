@@ -193,3 +193,22 @@ Leave，所以即使重建失败也不会永久卡死。
 - 滚到精确底部由 `scroll_logs_to_end` 负责：先 `scroll_to_iter`，再在 idle 里把
   adjustment 顶到 `upper - page_size`（`scroll_to_iter` 只保证可见，长行换行后最后一行
   可能被切掉半行）。
+
+## 协议与后端：绝对定位 / 滚动停止 / 平台热键（2026-11-16）
+
+- **libei 模拟后端的绝对定位**：绑定 `ei_pointer_absolute`，用 `ei_device.dimensions`
+  报出的逻辑尺寸把 `ScreenEdge` + 比例换算成绝对坐标后调 `motion_absolute`，因此
+  Hyprland 上的跨屏落点/切换落点是精确的（wlroots 的虚拟指针会被指针加速曲线影响，
+  只能近似；portal 后端拿不到 stream 几何，保持空实现）。
+- **惯性滚动停止**：``ProtoEvent::PointerAxisStop`` / `PointerAxisCancel` 新增，
+  EIS 的 `scroll_stop` / `scroll_cancel` 现在能传到接收端，wlroots 后端转发为
+  `wl_pointer.axis_stop`，libei 后端转发为 `ei_scroll.scroll_stop`。
+- **Windows 全局热键**：`WH_KEYBOARD_LL` 被动钩子（始终 `CallNextHookEx`），
+  扫描码经 `scancode::Windows → Linux` 后走与 Linux/macOS 相同的匹配逻辑；
+  `LLKHF_INJECTED` 的事件会被跳过，避免两台机器互发热键。
+- **日志时间戳**改为本地时区（Unix `localtime_r`，Windows
+  `FileTimeToSystemTime` + `SystemTimeToTzSpecificLocalTime`），并缓存每秒的渲染结果。
+- **前端广播**改为并发写（`FuturesUnordered`），单个卡住的 GUI 不再拖慢其它连接。
+- 触摸屏仍不支持（`#17`），X11 原生捕获仍是桩（`#18`）——两者都在 issue 里写了
+  实现方案；wlroots 的虚拟指针协议本身没有触摸注入，所以触摸只在 libei/portal
+  后端上有意义。
