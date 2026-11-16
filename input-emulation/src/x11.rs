@@ -109,7 +109,7 @@ impl Drop for X11Emulation {
 
 #[async_trait]
 impl Emulation for X11Emulation {
-    async fn enter(&mut self, x: f64, y: f64) {
+    async fn enter(&mut self, _handle: EmulationHandle, x: f64, y: f64) {
         /*
          * Place the cursor at the point the peer crossed its edge instead of
          * letting it continue from wherever it was parked on this screen.

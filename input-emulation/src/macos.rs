@@ -509,7 +509,7 @@ fn clamp_to_screen_space(
 
 #[async_trait]
 impl Emulation for MacOSEmulation {
-    async fn enter(&mut self, x: f64, y: f64) {
+    async fn enter(&mut self, _handle: EmulationHandle, x: f64, y: f64) {
         /*
          * Synthesized motion is relative, so without this the pointer would
          * continue from wherever it was on this screen — which looks like the

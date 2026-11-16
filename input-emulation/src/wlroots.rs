@@ -208,7 +208,11 @@ impl Emulation for WlrootsEmulation {
         Ok(())
     }
 
-    async fn enter(&mut self, x: f64, y: f64) {
+    async fn enter(&mut self, handle: EmulationHandle, x: f64, y: f64) {
+        let Some(input) = self.state.input_for_client.get(&handle) else {
+            log::debug!("no virtual pointer for handle {handle}, not placing the cursor");
+            return;
+        };
         /*
          * The pointer continues from wherever it was on this machine, which
          * looks like the cursor teleported when the user left the peer at the
@@ -217,10 +221,6 @@ impl Emulation for WlrootsEmulation {
          * current position; the extent is arbitrary as long as it matches the
          * coordinates (`1000` therefore means the whole layout).
          */
-        let Some(input) = self.state.input_for_client.values().next() else {
-            log::debug!("no virtual pointer yet, cannot position the cursor");
-            return;
-        };
         static START: OnceLock<Instant> = OnceLock::new();
         let now: u32 = START
             .get_or_init(Instant::now)

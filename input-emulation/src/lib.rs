@@ -155,8 +155,8 @@ impl InputEmulation {
 
     /// Place the cursor at the point a peer crossed its edge, given as a
     /// fraction of this screen (`0..=1` each). See [`Emulation::enter`].
-    pub async fn enter(&mut self, x: f64, y: f64) {
-        self.emulation.enter(x, y).await;
+    pub async fn enter(&mut self, handle: EmulationHandle, x: f64, y: f64) {
+        self.emulation.enter(handle, x, y).await;
     }
 
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
@@ -290,6 +290,9 @@ trait Emulation: Send {
     ///
     /// Backends without absolute pointer positioning keep the cursor where it
     /// is, which is what they did before.
-    async fn enter(&mut self, _x: f64, _y: f64) {}
+    /// Place the cursor on this device at the given fraction of the screen
+    /// (0..=1 along each axis). Backends that cannot position the pointer
+    /// absolutely keep the default, which does nothing.
+    async fn enter(&mut self, _handle: EmulationHandle, _x: f64, _y: f64) {}
     async fn terminate(&mut self);
 }

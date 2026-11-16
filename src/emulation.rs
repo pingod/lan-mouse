@@ -508,7 +508,21 @@ impl EmulationTask {
                     },
                     Some(ProxyRequest::Enter(addr, x, y)) => {
                         self.left.remove(&addr);
-                        emulation.enter(x, y).await;
+                        // The pointer just crossed into this device. Make sure
+                        // the peer has a virtual input to place the cursor
+                        // with: input from an unknown peer creates one lazily,
+                        // but the first crossing arrives before any input.
+                        let handle = match self.handles.get(&addr) {
+                            Some(&handle) => handle,
+                            None => {
+                                let handle = self.next_id;
+                                self.next_id += 1;
+                                emulation.create(handle).await;
+                                self.handles.insert(addr, handle);
+                                handle
+                            }
+                        };
+                        emulation.enter(handle, x, y).await;
                     }
                     Some(ProxyRequest::Remove(addr)) => {
                         self.left.insert(addr, Instant::now());
