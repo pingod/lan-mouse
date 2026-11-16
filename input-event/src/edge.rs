@@ -99,6 +99,37 @@ impl EdgeRange {
         ]
     }
 
+    /// Pull a range that is a hair short of an end onto that end.
+    ///
+    /// A card dragged to cover a whole screen lands a pixel short as often as not,
+    /// and a fraction of a permille is below what this type can store: `0-99.9%`
+    /// leaves a sliver where the pointer hits a wall that the user never asked for
+    /// and cannot close. One rule, applied both when a range is derived from a drag
+    /// and when a stored config is read, so an existing file is repaired rather than
+    /// left subtly wrong.
+    ///
+    /// The tolerance is deliberately short of anything a person would aim for: a
+    /// range covering half the edge is unchanged.
+    pub const SNAP_PERMILLE: u16 = 2;
+
+    /// See [`EdgeRange::SNAP_PERMILLE`].
+    pub fn snapped_to_ends(self) -> EdgeRange {
+        let start = if self.start <= Self::SNAP_PERMILLE {
+            0
+        } else {
+            self.start
+        };
+        let end = if self.end >= EDGE_PERMILLE - Self::SNAP_PERMILLE {
+            EDGE_PERMILLE
+        } else {
+            self.end
+        };
+        if start >= end {
+            return self;
+        }
+        EdgeRange { start, end }
+    }
+
     /// First permille of the range.
     pub fn start(self) -> u16 {
         self.start
@@ -620,6 +651,22 @@ mod tests {
                 assert_eq!(pair[0].end(), pair[1].start());
             }
         }
+    }
+
+    #[test]
+    fn a_range_a_hair_short_of_an_end_is_pulled_onto_it() {
+        /* the two shapes a drag actually produces when a card is pushed against the
+         * edge of a screen */
+        let short = EdgeRange::from_fractions(0.0, 0.999).expect("range");
+        assert_eq!(short.snapped_to_ends(), EdgeRange::FULL);
+        let both = EdgeRange::from_fractions(0.001, 0.999).expect("range");
+        assert_eq!(both.snapped_to_ends(), EdgeRange::FULL);
+
+        /* a range that means something is left alone */
+        let half = EdgeRange::from_fractions(0.0, 0.5).expect("range");
+        assert_eq!(half.snapped_to_ends(), half);
+        let middle = EdgeRange::from_fractions(0.25, 0.75).expect("range");
+        assert_eq!(middle.snapped_to_ends(), middle);
     }
 
     #[test]

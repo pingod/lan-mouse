@@ -300,23 +300,17 @@ pub fn snap(local: Screen, monitors: &[Monitor], candidate: Screen) -> Placement
         if total <= 0.0 {
             return EdgeRange::FULL;
         }
-        /* Snap to the ends of the edge. A card dragged to cover a whole screen lands
-         * a pixel short as often as not, and a permille of it left over is a sliver
-         * where the pointer hits a wall - the canvas would show a gap that nobody
-         * asked for and the user cannot close. */
-        const SNAP: f64 = 0.002;
-        let mut start = (lo - origin) / total;
-        let mut end = (hi - origin) / total;
-        if start.abs() < SNAP {
-            start = 0.0;
-        }
-        if (1.0 - end).abs() < SNAP {
-            end = 1.0;
-        }
+        let start = (lo - origin) / total;
+        let end = (hi - origin) / total;
         EdgeRange::from_fractions(start, end)
             // two positions a few pixels apart can round to the same permille;
             // widen by one step rather than dropping the peer's range entirely
             .or_else(|_| EdgeRange::from_fractions((start - 0.001).max(0.0), end.clamp(0.001, 1.0)))
+            /* a card dragged to cover a whole screen lands a pixel short as often as
+             * not, and the sliver left over is a wall nobody asked for - the same
+             * rule the config applies when it is read, so a value does not depend on
+             * whether it came from a drag or from a file */
+            .map(EdgeRange::snapped_to_ends)
             .unwrap_or(EdgeRange::FULL)
     };
 

@@ -428,8 +428,10 @@ impl From<TomlClient> for ConfigClient {
             enter_hook,
             leave_hook,
             display: toml.display,
-            edge: toml.edge.unwrap_or(EdgeRange::FULL),
-            peer_edge: toml.peer_edge.unwrap_or(EdgeRange::FULL),
+            /* repaired on the way in: a range saved a permille short of an end is
+             * a wall the user never asked for, and it would stay there forever */
+            edge: toml.edge.unwrap_or(EdgeRange::FULL).snapped_to_ends(),
+            peer_edge: toml.peer_edge.unwrap_or(EdgeRange::FULL).snapped_to_ends(),
         }
     }
 }
