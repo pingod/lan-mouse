@@ -148,6 +148,8 @@ struct State {
     resize: Option<Resize>,
     /// the card the pointer is over, which is also the keyboard-selected one
     hover: Option<ClientHandle>,
+    /// where a pan started, when the local screen is being dragged
+    panning: Option<(f64, f64)>,
     /// zoom applied on top of the automatic fit
     zoom: f64,
     /// pan applied on top of the automatic centring, in canvas units
@@ -505,6 +507,7 @@ impl Canvas {
             drag: None,
             resize: None,
             hover: None,
+            panning: None,
             zoom: 1.0,
             pan: (0.0, 0.0),
             canvas: (1.0, 1.0),
@@ -862,6 +865,20 @@ fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
             if state.resize.is_some() || state.handle_at(x, y).is_some() {
                 return;
             }
+            /* A press on the local screen is a pan, not a drag: this machine's
+             * monitors are the origin of the coordinate space, so moving them
+             * would have to move every peer with them - which is what panning the
+             * view does. The local screen becomes grabbable instead of inert. */
+            let (lx, ly) = state.to_layout(x, y);
+            if state
+                .local_monitors()
+                .iter()
+                .any(|rect| rect.contains(lx, ly))
+            {
+                state.panning = Some((x, y));
+                area.set_cursor_from_name(Some("grabbing"));
+                return;
+            }
             let Some(handle) = state.hit(x, y) else {
                 return;
             };
@@ -891,6 +908,11 @@ fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
         let area = area.clone();
         drag.connect_drag_update(move |_gesture, dx, dy| {
             let mut state = state.borrow_mut();
+            if state.panning.is_some() {
+                state.pan = (state.pan.0 + dx, state.pan.1 + dy);
+                area.queue_draw();
+                return;
+            }
             let scale = state.geometry.scale.max(f64::EPSILON);
             let local = state.geometry.local;
             /* read the card's start position before writing to it: the drag lives
@@ -917,6 +939,11 @@ fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
         let area = area.clone();
         drag.connect_drag_end(move |_gesture, _dx, _dy| {
             let mut state = state.borrow_mut();
+            if state.panning.take().is_some() {
+                area.set_cursor_from_name(Some("default"));
+                area.queue_draw();
+                return;
+            }
             /* move the card right away: the daemon answers asynchronously and a card
              * that jumped back while it thought looked broken */
             let placement = state
@@ -1070,6 +1097,7 @@ mod tests {
             drag: None,
             resize: None,
             hover: None,
+            panning: None,
             zoom: 1.0,
             pan: (0.0, 0.0),
             canvas: (800.0, 460.0),
@@ -1338,6 +1366,7 @@ mod render {
             drag: None,
             resize: None,
             hover: None,
+            panning: None,
             zoom: 1.0,
             pan: (0.0, 0.0),
             canvas: (1.0, 1.0),
