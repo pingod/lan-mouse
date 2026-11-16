@@ -268,6 +268,16 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                             println!(
                                 "id {handle}: {host}:{port} ({placement}) active: {active}, {health}, ips: {ips:?}"
                             );
+                            /* The picture the peer published, which is what this
+                             * side is supposed to be drawing. Printed rather than
+                             * summarised because whether it arrived at all is the
+                             * question a mismatched pair of windows asks. */
+                            if !state.peer_arrangement.is_empty() {
+                                println!("    peer arrangement: {}", state.peer_arrangement);
+                            }
+                            if !state.peer_displays.is_empty() {
+                                println!("    peer displays: {}", state.peer_displays);
+                            }
                         }
                         break;
                     }

@@ -575,13 +575,14 @@ impl Service {
             },
             FrontendRequest::PublishArrangement { arrangement } => {
                 let parsed = input_event::Arrangement::decode(&arrangement);
-                if parsed.is_none() {
-                    log::warn!("the frontend published an arrangement that does not parse");
+                match &parsed {
+                    Some(arrangement) => log::info!(
+                        "the canvas published its arrangement: {} machine(s), revision {}",
+                        arrangement.machines.len(),
+                        arrangement.revision
+                    ),
+                    None => log::warn!("the frontend published an arrangement that does not parse"),
                 }
-                /* Stored in the report this machine sends. The peer receives it on
-                 * the next handshake or when it asks for a refresh; there is no push
-                 * on change yet, which is what makes this a picture that agrees
-                 * rather than one that updates live. */
                 /* the peer is drawing a picture that is no longer true, so the
                  * report has to go out now rather than on the next handshake */
                 if crate::sysinfo::set_arrangement(parsed) {
@@ -976,7 +977,9 @@ impl Service {
     /// per handle; a peer that is not connected gets it with its next handshake.
     async fn push_report(&mut self) {
         let chunks = crate::sysinfo::chunks(&crate::sysinfo::local());
-        for handle in self.client_manager.active_clients() {
+        let peers = self.client_manager.active_clients();
+        log::info!("pushing the report to {} peer(s)", peers.len());
+        for handle in peers {
             for chunk in &chunks {
                 if let Err(e) = self.conn.send(*chunk, handle).await {
                     log::debug!("could not push the report to client {handle}: {e}");
