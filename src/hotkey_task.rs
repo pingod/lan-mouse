@@ -502,7 +502,10 @@ mod imp_macos {
         };
 
         match CGEventTap::new(
-            CGEventTapLocation::HID,
+            // `Session` is the level the capture backend listens at; a HID
+            // level tap is created but never delivers here, which is why this
+            // listener stayed silent.
+            CGEventTapLocation::Session,
             CGEventTapPlacement::HeadInsertEventTap,
             CGEventTapOptions::ListenOnly,
             events_of_interest,
@@ -526,7 +529,6 @@ mod imp_macos {
                 }
                 // The port is needed by the callback to undo a timeout disable.
                 let _ = tap_port.set(tap.mach_port().as_concrete_TypeRef() as usize);
-                tap.enable();
                 log::info!("hotkeys: listening on the macOS event tap");
                 // `tap` must outlive the loop: dropping it invalidates the port.
                 CFRunLoop::run_current();
