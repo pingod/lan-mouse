@@ -1085,9 +1085,20 @@ impl Canvas {
                 let signature = config_signature(machines);
                 let signature_changed = signature != state.last_signature;
                 if signature_changed {
+                    let first_observation = state.last_signature.is_empty();
                     state.last_signature = signature;
-                    state.local_revision = now_millis();
-                    state.published.clear();
+                    /* The first report is not an edit: it is this window finding out
+                     * what the configuration already is. Stamping it with the clock
+                     * made the local revision always newer than the peer's, so the peer's
+                     * picture could never win and the canvas never adopted one - the
+                     * window looked frozen while the data was arriving fine.
+                     *
+                     * A revision of zero means "this side has not edited anything", and
+                     * any picture from a side that has will win. */
+                    if !first_observation {
+                        state.local_revision = now_millis();
+                        state.published.clear();
+                    }
                 }
                 state.machines = machines.to_vec();
                 if let Some(path) = std::env::var_os("LAN_MOUSE_CANVAS_TRACE") {
@@ -2349,6 +2360,71 @@ mod render {
                 "the two machines disagree: {theirs:?} vs {mine:?}"
             );
         }
+    }
+
+    /// A window that has not edited anything adopts any picture it is offered.
+    ///
+    /// The local revision starts at zero and only moves when this side changes a link.
+    /// Stamping it on the first report - which is this window merely learning what the
+    /// configuration already is - made it always newer than the peer's, so the peer's
+    /// picture could never win and the canvas never changed: the reported "拖了也一动不动"
+    /// while every layer underneath was working.
+    #[test]
+    fn a_fresh_window_adopts_the_peers_picture() {
+        let mut state = state(vec![]);
+        state.local_hostname = "laptop".to_owned();
+        state.local_displays = vec![input_event::DisplayInfo {
+            name: "eDP-1".to_owned(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            rotation: input_event::Rotation::Normal,
+            enabled: true,
+        }];
+        let mut desk = machine(4, Position::Bottom, (0.0, 1.0), true);
+        desk.hostname = "desk".to_owned();
+        desk.peer_size = Some((4000.0, 2560.0));
+        state.machines = vec![desk];
+
+        /* nothing has been edited on this side */
+        assert_eq!(state.local_revision, 0);
+
+        let mut picture = input_event::Arrangement::new(1, "desk");
+        picture.machines.push(input_event::ArrangedMachine {
+            hostname: "desk".to_owned(),
+            authored: true,
+            screens: vec![
+                input_event::ScreenRect {
+                    x: 0,
+                    y: 1120,
+                    width: 2560,
+                    height: 1440,
+                },
+                input_event::ScreenRect {
+                    x: 2560,
+                    y: 0,
+                    width: 1440,
+                    height: 2560,
+                },
+            ],
+        });
+        picture.machines.push(input_event::ArrangedMachine {
+            hostname: "laptop".to_owned(),
+            authored: false,
+            screens: vec![input_event::ScreenRect {
+                x: 0,
+                y: -1080,
+                width: 1920,
+                height: 1080,
+            }],
+        });
+        state.machines[0].peer_picture = Some(picture);
+
+        assert!(
+            state.newer_peer_picture().is_some(),
+            "a window that has not edited must adopt"
+        );
     }
 
     /// Dragging this machine's own screens moves the peers' links, not the peers.
