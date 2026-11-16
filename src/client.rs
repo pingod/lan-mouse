@@ -371,6 +371,7 @@ impl ClientManager {
             s.peer_app_version = info.get(info_slot::APP_VERSION).to_owned();
             s.peer_commit_short = info.get(info_slot::COMMIT).to_owned();
             s.peer_displays = info.displays();
+            s.peer_arrangement = info.world();
         }
     }
 

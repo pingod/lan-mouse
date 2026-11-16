@@ -268,6 +268,13 @@ pub struct ClientState {
     pub peer_app_version: String,
     pub peer_commit_short: String,
     pub peer_displays: String,
+    /// the arrangement the peer is drawing, as it serialised it
+    ///
+    /// Both machines show one picture. Whichever side last edited it serialises the
+    /// screen rectangles and ships them here, so the canvas on this side draws those
+    /// rather than deriving its own - two derivations can always disagree.
+    #[serde(default)]
+    pub peer_arrangement: String,
     /// input events forwarded to this client since the connection started
     pub forwarded: u64,
     /// input events received from this client since the connection started
@@ -512,6 +519,15 @@ pub enum FrontendRequest {
     SubscribeLogs(Option<usize>),
     /// re-ask a peer for its machine details
     RefreshPeerInfo(ClientHandle),
+    /// Publish the arrangement this frontend is drawing.
+    ///
+    /// The canvas owns the geometry, so it produces the picture; the daemon only
+    /// carries it in the report it sends peers. Without this each machine drew its
+    /// own derivation of the desk, and two derivations can always disagree.
+    PublishArrangement {
+        /// the serialised arrangement, see `input_event::Arrangement`
+        arrangement: String,
+    },
 }
 
 /// How close to an edge the pointer has to behave before it may cross.

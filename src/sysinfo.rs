@@ -20,7 +20,12 @@ pub fn local() -> PeerInfo {
 }
 
 thread_local! {
-    static LOCAL: RefCell<PeerInfo> = RefCell::new(build(None));
+    static LOCAL: RefCell<PeerInfo> = RefCell::new(build(None, None));
+    /* the last geometry the capture backend reported, so a later rebuild of the
+     * report does not have to ask for it again */
+    static LAYOUT: RefCell<Option<input_event::Layout>> = const { RefCell::new(None) };
+    /* the picture this machine is drawing */
+    static ARRANGEMENT: RefCell<Option<input_event::Arrangement>> = const { RefCell::new(None) };
 }
 
 /// Record the size of the area the pointer can reach and put it in the report.
@@ -29,15 +34,51 @@ thread_local! {
 /// edge range from a decoration into something both ends agree on. `None` keeps
 /// whatever the platform probe found.
 pub fn set_layout(layout: Option<input_event::Layout>) {
+    LAYOUT.with(|slot| *slot.borrow_mut() = layout.clone());
+    rebuild();
+}
+
+/// Publish the arrangement this machine is showing so the peer can draw the same
+/// one, and report whether it changed - a report is only worth resending when it
+/// did.
+///
+/// The revision is assigned here rather than by the caller: it has to increase on
+/// every edit *and* stay tied to the machine that made it, otherwise the two sides
+/// cannot agree on which of two pictures is current.
+pub fn set_arrangement(arrangement: Option<input_event::Arrangement>) -> bool {
+    let changed = ARRANGEMENT.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let Some(arrangement) = arrangement else {
+            return cell.take().is_some();
+        };
+        if cell.as_ref() == Some(&arrangement) {
+            return false;
+        }
+        *cell = Some(arrangement);
+        true
+    });
+    if changed {
+        rebuild();
+    }
+    changed
+}
+
+/// Re-assemble the report from the parts that change.
+fn rebuild() {
+    let layout = LAYOUT.with(|slot| slot.borrow().clone());
+    let arrangement = ARRANGEMENT.with(|cell| cell.borrow().clone());
     LOCAL.with(|local| {
-        let updated = build(layout);
+        let updated = build(layout, arrangement);
         if *local.borrow() != updated {
             *local.borrow_mut() = updated;
         }
     });
 }
 
-fn build(layout: Option<input_event::Layout>) -> PeerInfo {
+fn build(
+    layout: Option<input_event::Layout>,
+    arrangement: Option<input_event::Arrangement>,
+) -> PeerInfo {
     // `PeerInfo::new` takes `&str`; the owned values live until the call
     // returns, so bind them first.
     let os_version = os_version();
@@ -56,6 +97,10 @@ fn build(layout: Option<input_event::Layout>) -> PeerInfo {
     /* the display list does not fit in one slot: two monitors already run past it,
      * and a list cut there still decodes as a valid list of one monitor */
     info.set_displays(&displays(layout));
+    /* the picture both machines draw, sent by whichever last edited it */
+    if let Some(arrangement) = arrangement {
+        info.set_world(&arrangement.encode());
+    }
     info
 }
 

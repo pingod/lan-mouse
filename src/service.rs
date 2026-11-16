@@ -559,6 +559,19 @@ impl Service {
                     log::debug!("log streaming disabled");
                 }
             },
+            FrontendRequest::PublishArrangement { arrangement } => {
+                let parsed = input_event::Arrangement::decode(&arrangement);
+                if parsed.is_none() {
+                    log::warn!("the frontend published an arrangement that does not parse");
+                }
+                /* Stored in the report this machine sends. The peer receives it on
+                 * the next handshake or when it asks for a refresh; there is no push
+                 * on change yet, which is what makes this a picture that agrees
+                 * rather than one that updates live. */
+                if crate::sysinfo::set_arrangement(parsed) {
+                    log::debug!("arrangement published");
+                }
+            }
             FrontendRequest::RefreshPeerInfo(handle) => {
                 log::info!("refreshing machine details for client {handle}");
                 self.capture.request_peer_info(handle);

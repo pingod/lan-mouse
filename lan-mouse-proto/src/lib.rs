@@ -27,7 +27,7 @@ pub const PEER_INFO_FIELD: usize = 32;
 /// somewhere and it does not fit in one slot: two monitors are around 60 bytes
 /// and `PEER_INFO_FIELD` is 32. It spans `DISPLAYS..PEER_INFO_FIELDS` and is
 /// reassembled on the other side.
-pub const PEER_INFO_FIELDS: usize = 12;
+pub const PEER_INFO_FIELDS: usize = 16;
 
 /// Bytes of a [`ProtoEvent::PeerInfo`] carried per chunk.
 ///
@@ -172,6 +172,8 @@ pub mod info_slot {
     pub const APP_VERSION: usize = 5;
     pub const COMMIT: usize = 6;
     pub const DISPLAYS: usize = 7;
+    /// first slot of the arrangement, see [`super::WORLD_SLOTS`]
+    pub const WORLD: usize = 12;
 }
 
 /// The slots the display list may occupy.
@@ -181,7 +183,16 @@ pub mod info_slot {
 /// desk and far more than the one slot it used to have, which truncated every
 /// report past the first monitor and is why two machines drew each other as a
 /// single screen.
-pub const DISPLAY_SLOTS: usize = PEER_INFO_FIELDS - info_slot::DISPLAYS;
+pub const DISPLAY_SLOTS: usize = info_slot::WORLD - info_slot::DISPLAYS;
+
+/// The slot where the arrangement starts, and how many it spans.
+///
+/// The arrangement is one picture shared by both machines: whichever side last
+/// edited it serialises the screen rectangles and sends them, so the other side
+/// draws those rectangles rather than deriving its own from its own config. Two
+/// derivations can always disagree; one shipped picture cannot.
+pub const WORLD_START: usize = info_slot::WORLD;
+pub const WORLD_SLOTS: usize = PEER_INFO_FIELDS - info_slot::WORLD;
 
 impl PeerInfo {
     /// Build from the fixed properties, truncating anything too long.
@@ -205,13 +216,52 @@ impl PeerInfo {
         std::str::from_utf8(&slot[..end]).unwrap_or("")
     }
 
+    /// Write the arrangement across the slots reserved for it.
+    pub fn set_world(&mut self, world: &str) {
+        self.write_span(info_slot::WORLD, world);
+    }
+
+    /// The arrangement the peer is drawing, or `""`.
+    pub fn world(&self) -> String {
+        self.read_span(info_slot::WORLD)
+    }
+
+    /// Write a string across every slot from `start` to the end.
+    fn write_span(&mut self, start: usize, value: &str) {
+        let per_slot = PEER_INFO_FIELD - 1;
+        for (index, slot) in self.fields[start..].iter_mut().enumerate() {
+            let begin = index * per_slot;
+            let end = (begin + per_slot).min(value.len());
+            *slot = [0; PEER_INFO_FIELD];
+            if begin < value.len() {
+                slot[..end - begin].copy_from_slice(&value.as_bytes()[begin..end]);
+            }
+        }
+    }
+
+    /// Read a string written by [`PeerInfo::write_span`].
+    fn read_span(&self, start: usize) -> String {
+        let mut out = String::new();
+        for slot in &self.fields[start..] {
+            let end = slot.iter().position(|b| *b == 0).unwrap_or(slot.len());
+            out.push_str(std::str::from_utf8(&slot[..end]).unwrap_or(""));
+        }
+        out
+    }
+
     /// Write the display list across the slots reserved for it.
     ///
     /// Every slot keeps one NUL so it stays a valid string when read on its own,
     /// which is what the chunking and the debug output assume.
     pub fn set_displays(&mut self, displays: &str) {
         let per_slot = PEER_INFO_FIELD - 1;
-        for (index, slot) in self.fields[info_slot::DISPLAYS..].iter_mut().enumerate() {
+        for (index, slot) in self
+            .fields
+            .iter_mut()
+            .take(info_slot::WORLD)
+            .skip(info_slot::DISPLAYS)
+            .enumerate()
+        {
             let start = index * per_slot;
             let end = (start + per_slot).min(displays.len());
             *slot = [0; PEER_INFO_FIELD];
@@ -228,7 +278,12 @@ impl PeerInfo {
     /// from here because a truncated list is still a valid list of one monitor.
     pub fn displays(&self) -> String {
         let mut out = String::new();
-        for slot in &self.fields[info_slot::DISPLAYS..] {
+        for slot in self
+            .fields
+            .iter()
+            .take(info_slot::WORLD)
+            .skip(info_slot::DISPLAYS)
+        {
             let end = slot.iter().position(|b| *b == 0).unwrap_or(slot.len());
             out.push_str(std::str::from_utf8(&slot[..end]).unwrap_or(""));
         }
