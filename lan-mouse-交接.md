@@ -212,3 +212,17 @@ Leave，所以即使重建失败也不会永久卡死。
 - 触摸屏仍不支持（`#17`），X11 原生捕获仍是桩（`#18`）——两者都在 issue 里写了
   实现方案；wlroots 的虚拟指针协议本身没有触摸注入，所以触摸只在 libei/portal
   后端上有意义。
+
+## GUI：Key remapping 与 enter/leave hook 编辑（2026-11-16）
+
+- 协议：`FrontendRequest::{UpdateHooks, EnumerateRemap, AddRemap, UpdateRemap, RemoveRemap}`、
+  `FrontendEvent::Remap`。`UpdateHooks` 一次性替换两条命令——分两次发 `UpdateEnterHook` /
+  `UpdateLeaveHook` 会让守护进程广播中间态，GUI 可能短暂显示"只改了一半"的状态。
+- 服务端：`update_hooks` / `add_remap` / `update_remap` / `remove_remap` / `apply_remap`
+  （写 config → 推 capture task → 刷新前端）；非法键名走 `remap_error`：报错并重播未变的
+  快照。`sync_frontend` 现在也会补发 remap 快照，否则晚连上的前端只能看到空列表。
+- 配置：`Config::set_remap_rules` 在列表清空时把 `remap` 置 `None`（写 `remap = []` 会让
+  默认规则在下次重载时复活）。
+- GUI：客户端行新增 hooks 行与 "Edit hooks" 对话框（`sh -c` 提示、留空即清除）；
+  Settings 页新增 "Key remapping" 组（加/改/删）；热键与 remap 共用同一个录音对话框
+  （`open_chord_dialog` + `ChordTarget::{Hotkey, Remap}`），避免两份重复的录音逻辑。
