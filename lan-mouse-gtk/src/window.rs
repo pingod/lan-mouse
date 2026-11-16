@@ -338,7 +338,10 @@ impl Window {
         /* The one line that says whether the canvas has the numbers it needs. A
          * peer that never reported a size is drawn at a derived one, which looks
          * like a layout bug until you can see that the size was `None`. */
-        log::debug!(
+        /* info, not debug: whether the canvas laid itself out at all is the first
+         * question a window that never changes asks, and the default level is info -
+         * so a debug line here was invisible in exactly the case it was needed. */
+        log::info!(
             "arrangement: local {:?} at {:?}, {} machine(s): {}",
             local_hostname,
             displays,
@@ -464,6 +467,12 @@ impl Window {
                 self.new_client(handle, client, state);
             }
         }
+        /* `Enumerate` is the snapshot a window starts from, and the per-client
+         * updates above only refresh the canvas when a *field* changed. A window that
+         * opened while the peer's picture was already stored therefore drew nothing:
+         * no field changed afterwards, so nothing ever asked the canvas to lay itself
+         * out. */
+        self.refresh_arrangement();
     }
 
     /// Render the daemon's hotkey rules.
