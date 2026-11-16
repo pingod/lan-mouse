@@ -59,6 +59,8 @@ pub(crate) struct MacOSEmulation {
     /// the sub-step remainder of each axis, so a touchpad's fractions are not
     /// dropped by the integer macOS event
     scroll_residual: [f64; 2],
+    /// when user activity was last declared, to keep it off the hot path
+    last_activity: Instant,
 }
 
 /* `CGEventSource` and `CFString` are plain reference-counted Core Foundation
@@ -112,6 +114,10 @@ impl MacOSEmulation {
                 "com.apple.swipescrolldirection",
             )),
             scroll_residual: [0.0; 2],
+            /* already elapsed, so the first injected event declares activity */
+            last_activity: Instant::now()
+                .checked_sub(USER_ACTIVITY_INTERVAL)
+                .unwrap_or_else(Instant::now),
         })
     }
 
@@ -284,6 +290,13 @@ fn is_arrow_key(key: u16) -> bool {
     )
 }
 
+/// How often to tell the system a person is present.
+///
+/// The call is a system round trip and pointer motion arrives at the input rate, so it is
+/// not made per event. A second is well below the idle timer that puts a display to sleep,
+/// and the display only has to be woken once.
+const USER_ACTIVITY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Marker written into `kCGEventSourceUserData` on every synthesized event.
 ///
 /// `input-capture` skips events carrying it, so injected input is never fed
@@ -300,6 +313,61 @@ pub const INJECTED_EVENT_TAG: i64 = 0x6c616e6d; // "lanm"
 fn post_synthesized(event: &CGEvent) {
     event.set_integer_value_field(EventField::EVENT_SOURCE_USER_DATA, INJECTED_EVENT_TAG);
     event.post(CGEventTapLocation::HID);
+}
+
+/// Tell the system a person is here, which is what wakes a sleeping display.
+///
+/// A posted `CGEvent` does *not* count as user activity: the window server delivers it
+/// to the focused application while the display stays asleep, so a machine whose screen
+/// went dark could be driven by the pointer without anything becoming visible. This is
+/// the documented way to say "a human is present", and it is what a real mouse does
+/// implicitly through the HID stack.
+///
+/// `kIOPMAssertionLevelOn` with a zero timeout only *declares* the activity; it does not
+/// keep the display awake, which is what a user wants - the screen still sleeps when the
+/// desk is empty.
+fn declare_user_activity() {
+    use core_foundation_sys::string::CFStringRef;
+    use std::ffi::c_void;
+
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IOPMAssertionDeclareUserActivity(
+            assertion_name: CFStringRef,
+            user_id: u32,
+            assertion_id: *mut u32,
+        ) -> i32;
+    }
+
+    /* kIOPMUserActiveLocal: the activity is local, not a remote session - which is
+     * exactly what an injected event from a peer is. */
+    const K_IOPM_USER_ACTIVE_LOCAL: u32 = 0;
+    const K_IO_PM_ASSERTION_LEVEL_ON: i32 = 255;
+
+    let mut id: u32 = 0;
+    let name = core_foundation::string::CFString::new("Lan Mouse input");
+    let result = unsafe {
+        IOPMAssertionDeclareUserActivity(
+            name.as_concrete_TypeRef(),
+            K_IOPM_USER_ACTIVE_LOCAL,
+            &mut id,
+        )
+    };
+    if result != 0 {
+        log::debug!("could not declare user activity: 0x{result:x}");
+    }
+    /* Release the assertion immediately: it was only meant to wake the display, and
+     * holding it would keep the screen on for as long as the process lives. */
+    if id != 0 {
+        #[link(name = "IOKit", kind = "framework")]
+        unsafe extern "C" {
+            fn IOPMAssertionRelease(assertion_id: u32) -> i32;
+        }
+        let _ = K_IO_PM_ASSERTION_LEVEL_ON;
+        unsafe {
+            IOPMAssertionRelease(id);
+        }
+    }
 }
 
 /// `NX_KEYTYPE_*` identifiers of the "system defined" events macOS uses for the
@@ -599,6 +667,14 @@ impl Emulation for MacOSEmulation {
         _handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
         log::trace!("{event:?}");
+        /* Before anything is injected: a sleeping display does not wake up because an
+         * event was posted to the window server, so the pointer could drive this machine
+         * with the screen dark. Throttled, because it is a system call and a motion event
+         * arrives at the input rate. */
+        if self.last_activity.elapsed() >= USER_ACTIVITY_INTERVAL {
+            self.last_activity = Instant::now();
+            declare_user_activity();
+        }
         match event {
             Event::Pointer(pointer_event) => {
                 match pointer_event {

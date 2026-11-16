@@ -1142,9 +1142,17 @@ impl CaptureTask {
                                 self.center_cursor = true;
                             }
                             Err(e) => {
-                                log::warn!("cannot hand the pointer to client {handle}: {e}");
-                                let message =
-                                    format!("cannot hand the pointer to client {handle}: {e}");
+                                /* Not a fault: `layer-shell` has no way to take the
+                                 * pointer on request, so this is the backend saying what
+                                 * it cannot do. Logged at info because the user asked for
+                                 * it and gets told why, and a warn here made a normal
+                                 * refusal look like a failure in every log review. */
+                                log::info!("cannot hand the pointer to client {handle}: {e}");
+                                let message = format!(
+                                    "this backend cannot take the pointer on request ({e}). \
+                                     Move the mouse across the edge instead, or switch the \
+                                     capture backend to input-capture-portal."
+                                );
                                 if self.event_tx.send(ICaptureEvent::Error(message)).is_err() {
                                     log::debug!("capture event channel is closed");
                                 }
@@ -1178,7 +1186,10 @@ impl CaptureTask {
         // so release rather than waiting for a release-bind that will never be
         // delivered (issues #545, #512).
         if event == CaptureEvent::Interrupted {
-            log::warn!("releasing capture: input stream interrupted by the compositor");
+            /* Normal end of a gesture: the compositor takes the pointer back when the
+             * user stops driving it. Logged at info so a healthy session does not fill
+             * the log with warnings that look like faults. */
+            log::info!("releasing capture: input stream interrupted by the compositor");
             return self.release_capture(capture).await;
         }
 

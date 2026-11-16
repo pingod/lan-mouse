@@ -814,6 +814,14 @@ impl State {
             });
             if changed {
                 self.mark_edited();
+                /* The picture this side adopted is now out of date: the user just moved
+                 * this machine's link, so the placement is the truth and the stale
+                 * rectangles would drag the card back to where it used to be. That is
+                 * why a drop needed several drags to land - each one moved the link and
+                 * the card sprang back to the adopted position. */
+                if let Some(machine) = self.machines.iter_mut().find(|m| m.handle == drag.handle) {
+                    machine.peer_rect = None;
+                }
                 (self.on_request)(MachineRequest::Move {
                     handle: drag.handle,
                     position: placement.position,
@@ -1285,7 +1293,13 @@ fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
                 original.w,
                 original.h,
             );
-            let placement = layout::snap(local, &state.local_monitors(), current);
+            /* The monitors as *drawn*, so a machine the user has dragged out of the way
+             * is judged where it now is rather than where the compositor has it. */
+            let placement = layout::snap(local, &state.drawn_monitors(), current);
+            /* Show where the drop would land while the card is still moving: the link
+             * preview and the card's own position come from the same `placement`, so a
+             * user can see the answer before letting go instead of discovering it after
+             * a drop that needed repeating. */
             if let Some(drag) = state.drag.as_mut() {
                 drag.current = current;
                 drag.placement = placement;

@@ -97,6 +97,13 @@ impl Monitor {
     }
 }
 
+/// The bounding box of a set of monitors.
+fn union_screen(monitors: &[Monitor]) -> Option<Screen> {
+    let mut rects = monitors.iter().map(|monitor| monitor.rect);
+    let first = rects.next()?;
+    Some(rects.fold(first, |acc, rect| acc.merged(rect)))
+}
+
 /// The span of a rectangle's edge along the axis a crossing is measured on.
 fn span_of(rect: Screen, position: Position) -> (f64, f64) {
     match position {
@@ -268,8 +275,38 @@ impl Placement {
 /// the routing. A drop that does not overlap the local edge is pulled back until
 /// it does, because a peer nothing can reach is not a layout, it is a bug.
 pub fn snap(local: Screen, monitors: &[Monitor], candidate: Screen) -> Placement {
-    let target = nearest_monitor(monitors, candidate);
     let position = nearest_edge(monitors, local, candidate);
+    /* The monitor the link is *attached to*, which for a card over empty space is the one
+     * it covers most along the shared edge - not the nearest by area. A 4K card pushed
+     * above the left monitor overlaps both monitors and neither contains its centre, and
+     * the area test picked the right one. */
+    let target = monitors
+        .iter()
+        .max_by(|a, b| {
+            let share = |m: &Monitor| {
+                let rect = m.rect;
+                match position {
+                    Position::Top | Position::Bottom => {
+                        (rect.right().min(candidate.right()) - rect.x.max(candidate.x)).max(0.0)
+                    }
+                    Position::Left | Position::Right => {
+                        (rect.bottom().min(candidate.bottom()) - rect.y.max(candidate.y)).max(0.0)
+                    }
+                }
+            };
+            /* Ties - a card that reaches no monitor along the shared edge, which a drop
+             * beside the desk does - fall back to the distance between the centres, so
+             * the answer is the closest screen rather than whichever came first. */
+            let distance = |m: &Monitor| {
+                let (mx, my) = m.rect.center();
+                let (cx, cy) = candidate.center();
+                ((mx - cx).powi(2) + (my - cy).powi(2)).sqrt()
+            };
+            share(a)
+                .total_cmp(&share(b))
+                .then(distance(b).total_cmp(&distance(a)))
+        })
+        .or_else(|| nearest_monitor(monitors, candidate));
     let anchor_rect = target.map(|monitor| monitor.rect).unwrap_or(local);
     let (anchor_lo, anchor_hi) = span_of(anchor_rect, position);
     let theirs = match position {
@@ -337,26 +374,74 @@ pub fn snap(local: Screen, monitors: &[Monitor], candidate: Screen) -> Placement
 /// which flips to the opposite side the moment a big screen is dropped near the
 /// middle.
 pub fn nearest_edge(monitors: &[Monitor], local: Screen, candidate: Screen) -> Position {
-    /* Measured against the monitor the card is being dropped on. Against the
-     * bounding box, a desk with a rotated panel puts the box's centre in empty
-     * space, and a card dragged up-and-left from it has a larger horizontal offset
-     * than a vertical one - so "above the left-hand screen" was read as "left". */
-    let reference = nearest_monitor(monitors, candidate)
-        .map(|monitor| monitor.rect)
-        .unwrap_or(local);
+    /* The direction is decided against *all* the monitors at once, not against one of
+     * them. A card being dragged in is usually over empty space for part of the gesture -
+     * a peer pushed up between two screens of unequal height is over nothing at all - and
+     * picking a single "nearest" monitor there is arbitrary: whichever is widest wins, so
+     * a straight-up push read as "left". The union of the monitors is where the desk
+     * actually is, and the card is above it, beside it, or below it without ambiguity. */
+    let reference = union_screen(monitors).unwrap_or(local);
+    /* The gap between the two rectangles, not the offset between their centres.
+     *
+     * Centres are the obvious measure and they are wrong here: a peer card is often
+     * larger than the screen it is being attached to, so a card overlapping the top of
+     * a monitor can still have its centre far to the side - and the dominant axis then
+     * reads as left/right. Measured as a gap, a card that overlaps a monitor along one
+     * axis has a gap of zero on that axis, so the axis it does *not* overlap decides,
+     * which is the edge it is actually being pushed against. */
+    /* Which axis the card is *pushed out along*, as a share of its own extent.
+     *
+     * Comparing the two gaps directly is what made a drop need several tries: a card
+     * above a monitor but wider than it has a bigger horizontal gap than a vertical one,
+     * so a straight-up push read as "left". What matters is how much of the card's own
+     * width or height lies outside the monitor - the axis where it is mostly outside is
+     * the axis it is being pushed along, no matter which gap is numerically larger.
+     */
+    let overlap = |a0: f64, a1: f64, b0: f64, b1: f64| (a1.min(b1) - a0.max(b0)).max(0.0);
+    let ox = overlap(
+        reference.x,
+        reference.right(),
+        candidate.x,
+        candidate.right(),
+    );
+    let oy = overlap(
+        reference.y,
+        reference.bottom(),
+        candidate.y,
+        candidate.bottom(),
+    );
+    let (rx, ry) = (
+        1.0 - ox / candidate.w.max(1.0),
+        1.0 - oy / candidate.h.max(1.0),
+    );
     let (lx, ly) = reference.center();
     let (cx, cy) = candidate.center();
-    let (dx, dy) = (cx - lx, cy - ly);
-    if dx.abs() >= dy.abs() {
-        if dx < 0.0 {
+    if rx > ry && rx > 0.001 {
+        if cx < lx {
             Position::Left
         } else {
             Position::Right
         }
-    } else if dy < 0.0 {
-        Position::Top
+    } else if ry > 0.001 {
+        if cy < ly {
+            Position::Top
+        } else {
+            Position::Bottom
+        }
     } else {
-        Position::Bottom
+        /* the card covers the monitor on both axes: the dominant offset is the only
+         * signal left */
+        if (cx - lx).abs() >= (cy - ly).abs() {
+            if cx < lx {
+                Position::Left
+            } else {
+                Position::Right
+            }
+        } else if cy < ly {
+            Position::Top
+        } else {
+            Position::Bottom
+        }
     }
 }
 
@@ -368,9 +453,21 @@ pub fn nearest_monitor(monitors: &[Monitor], candidate: Screen) -> Option<&Monit
     if monitors.is_empty() {
         return None;
     }
-    /* Overlap first: a card dropped on top of a monitor obviously belongs to it,
-     * and the largest overlap is also the least surprising choice when it covers
-     * two. */
+    /* The monitor the card is *centred* over, which is what the user is aiming at.
+     *
+     * Not the largest overlap: a card much bigger than the screens overlaps all of them
+     * and picks whichever happens to be widest, so a card pushed straight up over the
+     * left monitor attached to the right one. The centre has no such bias - it is a point
+     * and it is inside exactly one monitor, or none.
+     */
+    let (ccx, ccy) = candidate.center();
+    if let Some(monitor) = monitors.iter().find(|monitor| {
+        let rect = monitor.rect;
+        ccx >= rect.x && ccx <= rect.right() && ccy >= rect.y && ccy <= rect.bottom()
+    }) {
+        return Some(monitor);
+    }
+    /* Not over any monitor: the nearest by the distance between the centres. */
     let overlap = |monitor: &Monitor| {
         let rect = monitor.rect;
         let dx = rect.right().min(candidate.right()) - rect.x.max(candidate.x);
@@ -1036,6 +1133,24 @@ mod tests {
             "{:?}",
             placement.edge
         );
+    }
+
+    /// A card larger than the monitor it is dropped on still attaches to the edge the
+    /// user is pushing it against.
+    ///
+    /// Centres get this wrong: a peer card that overlaps the top of a monitor can have its
+    /// centre far to the side, so the dominant axis reads as left/right and the drop lands
+    /// on the wrong edge. That is why a screen took several drags to put where it was
+    /// wanted.
+    #[test]
+    fn a_large_card_attaches_to_the_edge_it_overlaps_least_on() {
+        let (bounds, monitors) = two_monitor_desk();
+        /* A 4K card centred over the upright monitor (x 0..2560), hanging above it.
+         * Wider than the monitor, so most of it sticks out to the sides. */
+        let candidate = Screen::new(-640.0, 1120.0 - 2160.0 + 200.0, 3840.0, 2160.0);
+        let placement = snap(bounds, &monitors, candidate);
+        assert_eq!(placement.position, Position::Top, "{placement:?}");
+        assert_eq!(placement.display.as_deref(), Some("DP-3"));
     }
 
     #[test]

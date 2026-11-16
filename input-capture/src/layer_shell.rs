@@ -1042,7 +1042,8 @@ impl Dispatch<WlPointer, ()> for State {
                  * lock, relative pointer,... objects are still in place)
                  */
                 if app.pointer_lock.is_some() {
-                    log::warn!("compositor released mouse");
+                    /* Normal: a gesture ends, or the compositor takes the pointer back. */
+                    log::debug!("compositor released mouse");
                 }
                 // If we were actively capturing, the compositor just took the
                 // pointer away (lock screen, new surface, display change). The
