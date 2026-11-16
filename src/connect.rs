@@ -306,7 +306,7 @@ async fn connect_to_handle(
         // Describe this machine, and ask the peer to do the same. The request
         // matters: a receive-only peer's own push may never reach us, but it can
         // always answer a packet we sent.
-        for chunk in crate::sysinfo::chunks(&crate::sysinfo::LOCAL) {
+        for chunk in crate::sysinfo::chunks(&crate::sysinfo::local()) {
             let (buf, len) = chunk.into();
             if let Err(e) = conn.send(&buf[..len]).await {
                 log::debug!("peer info chunk to {addr} failed: {e}");

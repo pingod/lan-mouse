@@ -168,6 +168,22 @@ fn full_edge() -> EdgeRange {
     EdgeRange::FULL
 }
 
+/// Parse the size out of a peer's display report.
+///
+/// A report is `"<width>x<height>"`, or the older `"<n> displays, <w>x<h>"`, or
+/// empty for a peer that never told us anything. Only the size is interesting:
+/// it is what the arrangement canvas draws the peer's screen to scale with, and
+/// without it the cards stay equal sized and an edge range says nothing visually.
+pub fn parse_screen_size(report: &str) -> Option<(u32, u32)> {
+    let token = report
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .find(|part| part.contains('x'))?;
+    let (width, height) = token.split_once('x')?;
+    let width = width.trim().parse::<u32>().ok()?;
+    let height = height.trim().parse::<u32>().ok()?;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
@@ -783,6 +799,23 @@ mod serialization_tests {
         assert!("middle".parse::<SwitchCorner>().is_err());
         let json = serde_json::to_string(&vec![SwitchCorner::BottomLeft]).expect("encode");
         assert_eq!(json, r#"["bottom-left"]"#);
+    }
+
+    /// A peer running an older build reports `"2 displays, 2560x1440"`, and one
+    /// that never answered reports nothing; both have to decode without the
+    /// canvas mistaking a count for a width.
+    #[test]
+    fn screen_sizes_are_parsed_from_either_report_shape() {
+        assert_eq!(parse_screen_size("2560x1440"), Some((2560, 1440)));
+        assert_eq!(
+            parse_screen_size("2 displays, 2560x1440"),
+            Some((2560, 1440))
+        );
+        assert_eq!(parse_screen_size(""), None);
+        assert_eq!(parse_screen_size("no idea"), None);
+        assert_eq!(parse_screen_size("0x0"), None);
+        // the count must not be read as the width
+        assert_eq!(parse_screen_size("1 display"), None);
     }
 
     #[test]

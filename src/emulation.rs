@@ -211,13 +211,13 @@ impl ListenTask {
                                 // Describe this machine in pieces: the
                                 // listening side cannot push a whole record to
                                 // the connecting side.
-                                for chunk in crate::sysinfo::chunks(&crate::sysinfo::LOCAL) {
+                                for chunk in crate::sysinfo::chunks(&crate::sysinfo::local()) {
                                     self.listener.reply(addr, chunk).await;
                                 }
                                 send_event(&self.event_tx, EmulationEvent::PeerHello { addr, commit });
                             }
                             ProtoEvent::PeerInfoRequest => {
-                                for chunk in crate::sysinfo::chunks(&crate::sysinfo::LOCAL) {
+                                for chunk in crate::sysinfo::chunks(&crate::sysinfo::local()) {
                                     self.listener.reply(addr, chunk).await;
                                 }
                             }

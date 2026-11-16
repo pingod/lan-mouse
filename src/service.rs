@@ -103,6 +103,12 @@ pub struct Service {
     /// edge-crossing thresholds currently in effect, kept so a frontend that
     /// connects later can be told what they are
     switch_options: SwitchOptions,
+    /// the screen size last reported by the capture backend
+    ///
+    /// Tracked so a change can be announced to peers instead of only being
+    /// noticed by the frontend: a peer draws this screen to scale, and after a
+    /// monitor is plugged in its picture of our edge is stale.
+    screen_size: Option<(u32, u32)>,
     /// when a frontend is streaming logs: how often to poll and where we are
     log_stream: Option<(tokio::time::Interval, usize)>,
 }
@@ -204,6 +210,7 @@ impl Service {
             capture_backend_name: capture_backend_name.clone(),
             emulation_backend_name: emulation_backend_name.clone(),
             switch_options,
+            screen_size: None,
             log_stream: None,
         };
         Ok(service)
@@ -1134,7 +1141,29 @@ impl Service {
     /// Publish live counters. These change while the service runs, so unlike the
     /// peer reports they are refreshed on a timer — one small message per
     /// second, and only while a frontend is listening.
+    /// Notice a change in the reachable screen area and tell the peers about it.
+    ///
+    /// The report travels as part of our own `PeerInfo`: asking a peer for its
+    /// details makes it answer, and the answer path sends our report back to it,
+    /// so one round trip refreshes both ends.
+    fn refresh_screen_size(&mut self) {
+        let size = self.capture.screen_size();
+        if size == self.screen_size {
+            return;
+        }
+        self.screen_size = size;
+        match size {
+            Some((width, height)) => log::info!("reachable screen area is {width}x{height}"),
+            None => log::debug!("the capture backend reports no screen geometry"),
+        }
+        crate::sysinfo::set_screen_size(size);
+        for handle in self.client_manager.active_clients() {
+            self.capture.request_peer_info(handle);
+        }
+    }
+
     fn publish_runtime(&mut self) {
+        self.refresh_screen_size();
         let outbound = self
             .client_manager
             .active_clients()
@@ -1171,8 +1200,8 @@ impl Service {
              * that reports no geometry leaves the cards equal sized. The capture
              * task refreshes the value whenever it registers barriers, which is
              * when a monitor plug-in or a mode change alters them. */
-            screen_width: self.capture.screen_size().map(|(w, _)| w).unwrap_or(0),
-            screen_height: self.capture.screen_size().map(|(_, h)| h).unwrap_or(0),
+            screen_width: self.screen_size.map(|(w, _)| w).unwrap_or(0),
+            screen_height: self.screen_size.map(|(_, h)| h).unwrap_or(0),
         }));
     }
 

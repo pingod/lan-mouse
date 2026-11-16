@@ -1,23 +1,49 @@
 //! Collect what this machine reports about itself to peers.
 //!
-//! The values are gathered once at startup: they describe hardware and OS
-//! install state, which do not change while the process runs, and reading them
-//! per handshake would shell out repeatedly for no benefit.
+//! Most of it is gathered once at startup: it describes hardware and OS install
+//! state, which do not change while the process runs, and reading it per
+//! handshake would shell out repeatedly for no benefit. The display geometry is
+//! the exception - it is what the peer needs in order to draw this screen to
+//! scale, and it changes when a monitor is plugged in, so it is refreshed from
+//! the capture backend rather than probed here.
 
-use std::sync::LazyLock;
+use std::cell::RefCell;
 
 use lan_mouse_proto::{PeerInfo, info_slot};
 
-/// This machine's description, built once.
-pub static LOCAL: LazyLock<PeerInfo> = LazyLock::new(build);
+/// This machine's description, with the display slot kept up to date.
+///
+/// `PeerInfo` is `Copy`, so the borrow ends here and nothing hands out a
+/// reference into the thread local.
+pub fn local() -> PeerInfo {
+    LOCAL.with(|local| *local.borrow())
+}
 
-fn build() -> PeerInfo {
+thread_local! {
+    static LOCAL: RefCell<PeerInfo> = RefCell::new(build(None));
+}
+
+/// Record the size of the area the pointer can reach and put it in the report.
+///
+/// The peer draws this machine's screen to scale with it, which is what turns an
+/// edge range from a decoration into something both ends agree on. `None` keeps
+/// whatever the platform probe found.
+pub fn set_screen_size(size: Option<(u32, u32)>) {
+    LOCAL.with(|local| {
+        let updated = build(size);
+        if *local.borrow() != updated {
+            *local.borrow_mut() = updated;
+        }
+    });
+}
+
+fn build(size: Option<(u32, u32)>) -> PeerInfo {
     // `PeerInfo::new` takes `&str`; the owned values live until the call
     // returns, so bind them first.
     let os_version = os_version();
     let kernel = kernel_version();
     let hostname = hostname();
-    let displays = displays();
+    let displays = displays(size);
     let commit = short_commit();
     PeerInfo::new([
         os_name(),
@@ -104,12 +130,22 @@ fn short_commit() -> String {
     crate::config::local_commit_string()
 }
 
-/// Display geometry summary.
+/// Display geometry, as `"<width>x<height>"`.
 ///
-/// Only a size and count: enough for a peer to sanity-check that both sides
-/// agree on the layout, without shipping a per-display list over a fixed-size
-/// event.
-fn displays() -> String {
+/// The capture backend's answer wins: it is the area the pointer can actually
+/// reach, which is what the peer has to line its edge up with. Only when the
+/// backend does not report one does this fall back to a platform probe, and the
+/// probe keeps the `N displays, WxH` shape it always had - the size parser reads
+/// the leading `WxH` of either form.
+fn displays(size: Option<(u32, u32)>) -> String {
+    if let Some((width, height)) = size.filter(|(w, h)| *w > 0 && *h > 0) {
+        return format!("{width}x{height}");
+    }
+    probe_displays()
+}
+
+/// Platform probe of the display geometry.
+fn probe_displays() -> String {
     #[cfg(target_os = "linux")]
     {
         // Wayland sessions usually have no X display; report nothing rather
@@ -270,9 +306,29 @@ pub fn describe(info: &PeerInfo) -> String {
 mod tests {
     use super::*;
 
+    /// The report is refreshed, not built once, so a test that changes it must
+    /// not leave the new size behind for the tests that run after it.
+    #[test]
+    fn screen_size_goes_into_the_display_slot() {
+        let before = local().get(info_slot::DISPLAYS).to_owned();
+
+        set_screen_size(Some((2560, 1440)));
+        assert_eq!(local().get(info_slot::DISPLAYS), "2560x1440");
+
+        /* A backend that reports nothing falls back to the platform probe, which
+         * is what an older or geometry-less backend used to produce. */
+        set_screen_size(None);
+        assert_eq!(local().get(info_slot::DISPLAYS), before);
+
+        // a zero size is not a size
+        set_screen_size(Some((0, 0)));
+        assert_eq!(local().get(info_slot::DISPLAYS), before);
+        set_screen_size(None);
+    }
+
     #[test]
     fn local_info_is_populated() {
-        let info = &*LOCAL;
+        let info = &local();
         // Architecture and app version are compile-time constants and must
         // always be present; OS detection always resolves to something.
         assert_eq!(info.get(info_slot::ARCH), std::env::consts::ARCH);
