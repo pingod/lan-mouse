@@ -43,9 +43,8 @@ fn build(layout: Option<input_event::Layout>) -> PeerInfo {
     let os_version = os_version();
     let kernel = kernel_version();
     let hostname = hostname();
-    let displays = displays(layout);
     let commit = short_commit();
-    PeerInfo::new([
+    let mut info = PeerInfo::new([
         os_name(),
         &os_version,
         &kernel,
@@ -53,8 +52,11 @@ fn build(layout: Option<input_event::Layout>) -> PeerInfo {
         &hostname,
         env!("CARGO_PKG_VERSION"),
         &commit,
-        &displays,
-    ])
+    ]);
+    /* the display list does not fit in one slot: two monitors already run past it,
+     * and a list cut there still decodes as a valid list of one monitor */
+    info.set_displays(&displays(layout));
+    info
 }
 
 /// `linux`, `macos`, `windows`.
@@ -212,7 +214,7 @@ pub fn flatten(info: &PeerInfo) -> lan_mouse_ipc::IncomingInfo {
         hostname: info.get(info_slot::HOSTNAME).to_owned(),
         app_version: info.get(info_slot::APP_VERSION).to_owned(),
         commit: info.get(info_slot::COMMIT).to_owned(),
-        displays: info.get(info_slot::DISPLAYS).to_owned(),
+        displays: info.displays(),
     }
 }
 
@@ -371,7 +373,7 @@ mod tests {
 
     #[test]
     fn chunks_reassemble_to_the_original() {
-        let info = PeerInfo::new([
+        let mut info = PeerInfo::new([
             "linux",
             "CachyOS",
             "7.3.4-1-cachyos",
@@ -379,10 +381,11 @@ mod tests {
             "cachyos-x8664",
             "0.11.0",
             "abc12345",
-            "2 displays",
         ]);
+        let displays = "DP-2:2560,0:1440x2560:right:1;DP-3:0,1120:2560x1440:normal:1";
+        info.set_displays(displays);
         let pieces = chunks(&info);
-        assert!(pieces.len() > 1, "a 257-byte report must span chunks");
+        assert!(pieces.len() > 1, "a report must span chunks");
 
         let mut r = Reassembler::default();
         let mut out = None;
@@ -395,11 +398,16 @@ mod tests {
         let out = out.expect("all chunks arrived");
         assert_eq!(out, info);
         assert_eq!(out.get(info_slot::KERNEL), "7.3.4-1-cachyos");
+        /* The list is longer than one slot and has to survive the trip intact: a
+         * cut at the first slot still decodes as a valid list of one monitor, which
+         * is how two machines came to draw each other as a single screen. */
+        assert!(displays.len() > lan_mouse_proto::PEER_INFO_FIELD);
+        assert_eq!(out.displays(), displays);
     }
 
     #[test]
     fn a_missing_chunk_yields_nothing() {
-        let info = PeerInfo::new(["a", "b", "c", "d", "e", "f", "g", "h"]);
+        let info = PeerInfo::new(["a", "b", "c", "d", "e", "f", "g"]);
         let mut r = Reassembler::default();
         let pieces = chunks(&info);
         // Feed everything except the last piece: no report may be produced.
@@ -414,7 +422,7 @@ mod tests {
     #[test]
     fn long_values_are_truncated_not_corrupted() {
         let long = "x".repeat(500);
-        let info = PeerInfo::new([&long, "", "", "", "", "", "", ""]);
+        let info = PeerInfo::new([&long, "", "", "", "", "", ""]);
         let got = info.get(info_slot::OS);
         assert_eq!(got.len(), lan_mouse_proto::PEER_INFO_FIELD - 1);
         assert!(got.chars().all(|c| c == 'x'));

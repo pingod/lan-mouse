@@ -21,7 +21,13 @@ use thiserror::Error;
 pub const PEER_INFO_FIELD: usize = 32;
 
 /// Number of fixed-width string slots in a [`ProtoEvent::PeerInfo`].
-pub const PEER_INFO_FIELDS: usize = 8;
+/// How many slots a report has.
+///
+/// More than the eight fixed properties, because the display list has to fit
+/// somewhere and it does not fit in one slot: two monitors are around 60 bytes
+/// and `PEER_INFO_FIELD` is 32. It spans `DISPLAYS..PEER_INFO_FIELDS` and is
+/// reassembled on the other side.
+pub const PEER_INFO_FIELDS: usize = 12;
 
 /// Bytes of a [`ProtoEvent::PeerInfo`] carried per chunk.
 ///
@@ -168,9 +174,21 @@ pub mod info_slot {
     pub const DISPLAYS: usize = 7;
 }
 
+/// The slots the display list may occupy.
+///
+/// A report is a fixed-width record, so the list has a hard ceiling: five slots of
+/// 32 bytes hold about seven monitors with connector names. That is enough for a
+/// desk and far more than the one slot it used to have, which truncated every
+/// report past the first monitor and is why two machines drew each other as a
+/// single screen.
+pub const DISPLAY_SLOTS: usize = PEER_INFO_FIELDS - info_slot::DISPLAYS;
+
 impl PeerInfo {
-    /// Build from owned strings, truncating anything too long.
-    pub fn new(fields: [&str; PEER_INFO_FIELDS]) -> Self {
+    /// Build from the fixed properties, truncating anything too long.
+    ///
+    /// The display list is not one of them: it does not fit in a slot, so it is
+    /// written separately by [`PeerInfo::set_displays`].
+    pub fn new(fields: [&str; info_slot::DISPLAYS]) -> Self {
         let mut out = [[0u8; PEER_INFO_FIELD]; PEER_INFO_FIELDS];
         for (slot, value) in out.iter_mut().zip(fields.iter()) {
             let bytes = value.as_bytes();
@@ -185,6 +203,36 @@ impl PeerInfo {
         let slot = &self.fields[idx];
         let end = slot.iter().position(|b| *b == 0).unwrap_or(slot.len());
         std::str::from_utf8(&slot[..end]).unwrap_or("")
+    }
+
+    /// Write the display list across the slots reserved for it.
+    ///
+    /// Every slot keeps one NUL so it stays a valid string when read on its own,
+    /// which is what the chunking and the debug output assume.
+    pub fn set_displays(&mut self, displays: &str) {
+        let per_slot = PEER_INFO_FIELD - 1;
+        for (index, slot) in self.fields[info_slot::DISPLAYS..].iter_mut().enumerate() {
+            let start = index * per_slot;
+            let end = (start + per_slot).min(displays.len());
+            *slot = [0; PEER_INFO_FIELD];
+            if start < displays.len() {
+                slot[..end - start].copy_from_slice(&displays.as_bytes()[start..end]);
+            }
+        }
+    }
+
+    /// The display list, reassembled from the slots it spans.
+    ///
+    /// The list is a string, so it can be longer than one slot; a report that was
+    /// cut at the first slot is exactly the bug this fixes, and it is invisible
+    /// from here because a truncated list is still a valid list of one monitor.
+    pub fn displays(&self) -> String {
+        let mut out = String::new();
+        for slot in &self.fields[info_slot::DISPLAYS..] {
+            let end = slot.iter().position(|b| *b == 0).unwrap_or(slot.len());
+            out.push_str(std::str::from_utf8(&slot[..end]).unwrap_or(""));
+        }
+        out
     }
 }
 

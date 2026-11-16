@@ -207,7 +207,7 @@ struct State {
     resize: Option<Resize>,
     /// the card the pointer is over, which is also the keyboard-selected one
     hover: Option<ClientHandle>,
-    /// where a pan started, when the local screen is being dragged
+    /// the view's pan when a pan began, while the local screen is being dragged
     panning: Option<(f64, f64)>,
     /// zoom applied on top of the automatic fit
     zoom: f64,
@@ -1011,7 +1011,7 @@ fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
                 .iter()
                 .any(|monitor| monitor.rect.contains(lx, ly))
             {
-                state.panning = Some((x, y));
+                state.panning = Some(state.pan);
                 area.set_cursor_from_name(Some("grabbing"));
                 return;
             }
@@ -1045,8 +1045,12 @@ fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
         let area = area.clone();
         drag.connect_drag_update(move |_gesture, dx, dy| {
             let mut state = state.borrow_mut();
-            if state.panning.is_some() {
-                state.pan = (state.pan.0 + dx, state.pan.1 + dy);
+            if let Some(from) = state.panning {
+                /* `dx` is the offset from where the drag began, not the step since
+                 * the last update: adding it to the current pan accumulates
+                 * quadratically, which is why the picture ran away from the
+                 * pointer. It is applied to the pan the drag started from. */
+                state.pan = (from.0 + dx, from.1 + dy);
                 area.queue_draw();
                 return;
             }
@@ -1771,6 +1775,34 @@ mod render {
             &[(palette.accent, 0.9), (palette.card, 1.0)],
         );
         assert!(background > 1000, "{background} background pixels");
+    }
+
+    /// A peer's two monitors are decoded and normalised to the group's corner.
+    ///
+    /// The report is the per-monitor form, so a peer of the same shape as this desk
+    /// has to come back as two rectangles with their offsets, not as one box.
+    /// Normalised, because the group is drawn at wherever the link put it and the
+    /// monitors are then placed inside that - an unnormalised report would draw the
+    /// peer's second monitor outside its own card.
+    #[test]
+    fn a_peers_monitors_are_decoded_and_normalised() {
+        /* The wire form carries the rectangle *after* rotation and records the
+         * rotation as normal: the backends that report a region (portal, layer-shell,
+         * CoreGraphics) hand back a rect, not a panel size plus a transform. */
+        let monitors =
+            peer_monitors("DP-2:2560,0:1440x2560:normal:1;DP-3:0,1120:2560x1440:normal:1");
+        assert_eq!(monitors.len(), 2);
+        let dp2 = monitors.iter().find(|m| m.name == "DP-2").expect("DP-2");
+        let dp3 = monitors.iter().find(|m| m.name == "DP-3").expect("DP-3");
+        /* normalised: the group's own corner is (0,0), so the rotated panel keeps its
+         * offset to the right of the upright one and the upright one keeps its
+         * offset below the top */
+        assert_eq!(dp2.rect, Screen::new(2560.0, 0.0, 1440.0, 2560.0));
+        assert_eq!(dp3.rect, Screen::new(0.0, 1120.0, 2560.0, 1440.0));
+
+        /* a report that says nothing is one box, which is all that is known */
+        assert!(peer_monitors("").is_empty());
+        assert!(peer_monitors("2560x1440").is_empty());
     }
 
     /// The local monitors are drawn where the compositor put them.
