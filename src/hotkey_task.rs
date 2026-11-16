@@ -362,6 +362,7 @@ mod imp_macos {
         }
 
         pub(crate) fn set_hotkeys(&mut self, hotkeys: Vec<Hotkey>) {
+            log::debug!("hotkeys: {} rule(s) armed", hotkeys.len());
             self.state.set_hotkeys(hotkeys);
         }
 
@@ -432,6 +433,7 @@ mod imp_macos {
                              event: &core_graphics::event::CGEvent| {
             // Runs on the tap thread: never block and never panic, or the
             // kernel disables the tap (and `panic = "abort"` kills the daemon).
+            log::trace!("hotkeys: tap event {event_type:?}");
             match event_type {
                 CGEventType::KeyDown | CGEventType::KeyUp => {
                     if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
@@ -442,6 +444,7 @@ mod imp_macos {
                     let keycode =
                         event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
                     let Some(key) = evdev_key(keycode) else {
+                        log::trace!("hotkeys: ignoring unmapped keycode {keycode}");
                         return CallbackResult::Keep;
                     };
                     let value = if matches!(event_type, CGEventType::KeyDown) {
@@ -455,6 +458,7 @@ mod imp_macos {
                     } else {
                         0
                     };
+                    log::trace!("hotkeys: sample {key} {value}");
                     let _ = key_tx.send(KeySample { key, value });
                 }
                 CGEventType::FlagsChanged => {
@@ -466,6 +470,7 @@ mod imp_macos {
                     let keycode =
                         event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
                     let Some(key) = evdev_key(keycode) else {
+                        log::trace!("hotkeys: ignoring unmapped keycode {keycode}");
                         return CallbackResult::Keep;
                     };
                     let value = match held.try_borrow_mut() {
@@ -479,6 +484,7 @@ mod imp_macos {
                         }
                         Err(_) => return CallbackResult::Keep,
                     };
+                    log::trace!("hotkeys: sample {key} {value}");
                     let _ = key_tx.send(KeySample { key, value });
                 }
                 CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput => {
