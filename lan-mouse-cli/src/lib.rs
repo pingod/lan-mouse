@@ -6,7 +6,7 @@ use thiserror::Error;
 
 use lan_mouse_ipc::{
     AsyncFrontendEventReader, AsyncFrontendRequestWriter, ClientHandle, ConnectionError,
-    DEFAULT_PORT, FrontendEvent, FrontendRequest, IpcError, Position, connect_async,
+    DEFAULT_PORT, EdgeRange, FrontendEvent, FrontendRequest, IpcError, Position, connect_async,
 };
 
 #[derive(Debug, Error)]
@@ -46,6 +46,20 @@ struct Client {
     enter_hook: Option<String>,
     #[arg(long)]
     leave_hook: Option<String>,
+    /// which edge of this screen the client sits behind
+    #[arg(long)]
+    position: Option<Position>,
+    /// the part of that edge the pointer crosses to reach it, as
+    /// `start,end` fractions of the edge (0.0-1.0)
+    ///
+    /// Several clients can share one edge as long as their ranges do not
+    /// overlap. Absent means the whole edge.
+    #[arg(long)]
+    edge: Option<EdgeRange>,
+    /// the part of the client's facing edge the cursor lands in, same form as
+    /// `--edge`
+    #[arg(long)]
+    peer_edge: Option<EdgeRange>,
 }
 
 #[derive(Clone, Subcommand, Debug, PartialEq, Eq)]
@@ -69,6 +83,17 @@ enum CliSubcommand {
     SetPort { id: ClientHandle, port: u16 },
     /// set position
     SetPosition { id: ClientHandle, pos: Position },
+    /// set the part of its edge a client is reached through, and the part of the
+    /// client's edge the cursor lands in
+    SetEdge {
+        id: ClientHandle,
+        /// `start,end` fractions of this screen's edge, e.g. `0.0,0.6`
+        #[arg(long)]
+        edge: EdgeRange,
+        /// `start,end` fractions of the client's facing edge
+        #[arg(long, default_value = "0.0,1.0")]
+        peer_edge: EdgeRange,
+    },
     /// set ips
     SetIps { id: ClientHandle, ips: Vec<IpAddr> },
     /// re-enable capture
@@ -109,6 +134,9 @@ enum CliSubcommand {
     SetLogLevel { level: String },
     /// ask a peer to send its machine details again
     RefreshPeerInfo { id: ClientHandle },
+    /// show the screen layout: this screen's size and who covers which part of
+    /// every edge
+    Screens,
 }
 
 pub async fn run(args: CliArgs) -> Result<(), CliError> {
@@ -125,6 +153,9 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             ips,
             enter_hook,
             leave_hook,
+            position,
+            edge,
+            peer_edge,
         }) => {
             // Create the client with its whole configuration in one request:
             // `Create` followed by `Update*` requests is racy because the
@@ -136,10 +167,12 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             tx.request(FrontendRequest::CreateClient {
                 hostname: hostname.clone(),
                 port,
-                position: Position::default(),
+                position: position.unwrap_or_default(),
                 fix_ips: fix_ips.clone(),
                 enter_hook,
                 leave_hook,
+                edge: edge.unwrap_or(EdgeRange::FULL),
+                peer_edge: peer_edge.unwrap_or(EdgeRange::FULL),
             })
             .await?;
             loop {
@@ -212,8 +245,16 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                                 (true, None) => "connected".to_owned(),
                                 (false, _) => "not connected".to_owned(),
                             };
+                            /* the range is only spelled out when it is not the
+                             * whole edge, so a plain two-machine setup still
+                             * reads the same as it always did */
+                            let placement = if config.edge == EdgeRange::FULL {
+                                pos.to_string()
+                            } else {
+                                format!("{pos} {edge}", edge = config.edge)
+                            };
                             println!(
-                                "id {handle}: {host}:{port} ({pos}) active: {active}, {health}, ips: {ips:?}"
+                                "id {handle}: {host}:{port} ({placement}) active: {active}, {health}, ips: {ips:?}"
                             );
                         }
                         break;
@@ -235,6 +276,15 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         CliSubcommand::SetPosition { id, pos } => {
             ensure_client_exists(&mut rx, &mut tx, id).await?;
             tx.request(FrontendRequest::UpdatePosition(id, pos)).await?
+        }
+        CliSubcommand::SetEdge { id, edge, peer_edge } => {
+            ensure_client_exists(&mut rx, &mut tx, id).await?;
+            tx.request(FrontendRequest::UpdateEdge {
+                handle: id,
+                edge,
+                peer_edge,
+            })
+            .await?
         }
         CliSubcommand::SetIps { id, ips } => {
             ensure_client_exists(&mut rx, &mut tx, id).await?;
@@ -298,6 +348,27 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
                     _ => {}
                 }
             }
+        }
+        CliSubcommand::Screens => {
+            tx.request(FrontendRequest::Enumerate()).await?;
+            let mut clients: Option<Vec<_>> = None;
+            let mut runtime: Option<lan_mouse_ipc::RuntimeInfo> = None;
+            while clients.is_none() || runtime.is_none() {
+                match rx.next().await.ok_or(CliError::ConnectionClosed)?? {
+                    FrontendEvent::Enumerate(c) => clients = Some(c),
+                    FrontendEvent::Runtime(info) => runtime = Some(info),
+                    FrontendEvent::Error(msg) => return Err(CliError::Service(msg)),
+                    _ => {}
+                }
+            }
+            let clients = clients.unwrap_or_default();
+            let runtime = runtime.expect("collected above");
+            print_screens(
+                runtime.screen_width,
+                runtime.screen_height,
+                &clients,
+                runtime.capturing_peer.as_str(),
+            );
         }
         CliSubcommand::Status => {
             tx.request(FrontendRequest::Enumerate()).await?;
@@ -375,6 +446,96 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
 ///
 /// The one-shot commands used to exit successfully even for unknown client
 /// handles because the daemon silently ignores requests for clients that do
+/// Print the screen layout the daemon is working with.
+///
+/// The point is to answer "why does the pointer not get there" without a
+/// display: which part of each edge is claimed, which part is a wall, and
+/// whether a client was squeezed out of the range it asked for. Only enabled
+/// clients are resolved, because only those have a barrier registered.
+fn print_screens(
+    width: u32,
+    height: u32,
+    clients: &[(ClientHandle, lan_mouse_ipc::ClientConfig, lan_mouse_ipc::ClientState)],
+    capturing_peer: &str,
+) {
+    if width > 0 && height > 0 {
+        println!("this screen: {width}x{height}");
+    } else {
+        /* Without a size the canvas cannot draw to scale and the corner
+         * thresholds cannot be located, so it is worth saying out loud. */
+        println!("this screen: size unknown to the capture backend");
+    }
+    if !capturing_peer.is_empty() {
+        println!("the pointer is on: {capturing_peer}");
+    }
+
+    for position in [
+        Position::Left,
+        Position::Right,
+        Position::Top,
+        Position::Bottom,
+    ] {
+        let on_edge: Vec<_> = clients
+            .iter()
+            .filter(|(_, config, _)| config.pos == position)
+            .collect();
+        println!("\n{position}:");
+        if on_edge.is_empty() {
+            println!("  nothing configured");
+            continue;
+        }
+        let enabled = on_edge
+            .iter()
+            .filter(|(_, _, state)| state.active)
+            .map(|(handle, config, _)| (*handle, config.edge))
+            .collect::<Vec<_>>();
+        let effective = EdgeRange::resolve(
+            &enabled
+                .iter()
+                .map(|(_, range)| *range)
+                .collect::<Vec<_>>(),
+        );
+        let reached = effective
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        for (handle, config, state) in on_edge.iter().map(|(h, c, s)| (*h, c.clone(), s.active)) {
+            let host = config
+                .hostname
+                .clone()
+                .unwrap_or_else(|| format!("client {handle}"));
+            let claim = enabled
+                .iter()
+                .position(|(other, _)| *other == handle)
+                .and_then(|index| effective[index]);
+            let note = if !state {
+                "disabled".to_owned()
+            } else {
+                match claim {
+                    None => "UNREACHABLE: another client already holds all of it".to_owned(),
+                    Some(claim) if claim != config.edge => {
+                        format!("narrowed to what is left of {}", config.edge)
+                    }
+                    Some(_) => "ok".to_owned(),
+                }
+            };
+            let shown = if state {
+                claim.map(|range| range.to_string()).unwrap_or_else(|| "-".to_owned())
+            } else {
+                config.edge.to_string()
+            };
+            println!("  id {handle}: {host} {shown}  [{note}]");
+            if config.peer_edge != EdgeRange::FULL {
+                println!("             lands in its {}", config.peer_edge);
+            }
+        }
+        for gap in EdgeRange::gaps(&reached) {
+            println!("  {gap} of the {position} edge is a wall");
+        }
+    }
+}
+
 /// not exist. `Enumerate` returns the authoritative snapshot, so a missing
 /// handle can be reported as an error.
 async fn ensure_client_exists(
