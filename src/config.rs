@@ -1013,6 +1013,37 @@ mod edge_tests {
         }
     }
 
+    /// The monitor a link is attached to survives a save and a load.
+    ///
+    /// It is the one property of a link that does not mean anything on its own -
+    /// it only scopes `edge` - so a round trip that drops it silently turns every
+    /// display-scoped link into a machine-level one, which covers a different
+    /// stretch of the edge and reaches different pixels.
+    #[test]
+    fn a_link_keeps_the_monitor_it_is_attached_to() {
+        let toml = r#"
+[[clients]]
+hostname = "a"
+position = "top"
+display = "DP-3"
+edge = [0.0, 1.0]
+"#;
+        let config: ConfigToml = toml::from_str(toml).expect("valid config");
+        let client = ConfigClient::from(config.clients.clone().expect("clients")[0].clone());
+        assert_eq!(client.display.as_deref(), Some("DP-3"));
+
+        /* and back out to toml */
+        let saved = TomlClient::from(client);
+        let written = toml::to_string(&saved).expect("serializes");
+        assert!(written.contains(r#"display = "DP-3""#), "{written}");
+
+        /* a config without the key stays machine-level */
+        let plain: ConfigToml =
+            toml::from_str("[[clients]]\nhostname = \"a\"\n").expect("valid config");
+        let plain = ConfigClient::from(plain.clients.clone().expect("clients")[0].clone());
+        assert_eq!(plain.display, None);
+    }
+
     /// A client written before edge ranges existed keeps the whole edge, which is
     /// exactly the behaviour that file produced.
     #[test]

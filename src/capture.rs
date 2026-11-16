@@ -601,6 +601,24 @@ impl CaptureTask {
         self.captures.iter().find(|entry| entry.handle == handle)
     }
 
+    /// The edges that have at least one link attached to a named monitor.
+    ///
+    /// Only those need re-resolving when the geometry arrives: a machine-level
+    /// link means the same thing before and after, so rebuilding its barriers
+    /// would be a pointless teardown.
+    fn monitor_scoped_positions(&self) -> Vec<Position> {
+        let mut out = Vec::new();
+        for entry in &self.captures {
+            if entry.display.is_some()
+                && entry.kind == CaptureType::Default
+                && !out.contains(&entry.pos)
+            {
+                out.push(entry.pos);
+            }
+        }
+        out
+    }
+
     /// Re-resolve which part of `pos` each client can be reached through and
     /// hand the result to the backend.
     ///
@@ -900,7 +918,23 @@ impl CaptureTask {
                                     .map(|(w, h)| format!("{w}x{h}"))
                                     .unwrap_or_else(|| "unknown size".to_owned()),
                             );
-                            *self.layout.borrow_mut() = Some(layout);
+                            *self.layout.borrow_mut() = Some(layout.clone());
+                            /* A link attached to a monitor cannot be resolved
+                             * before the backend says which monitors exist, so it
+                             * was registered against the whole edge as a fallback.
+                             * Now that the geometry is known it has to be resolved
+                             * again: otherwise the link silently covers a different
+                             * stretch than the one it was configured for, and on a
+                             * desk with unequal heights that stretch is a screen the
+                             * pointer cannot even reach. */
+                            let cancel = self.cancellation_token.clone();
+                            for pos in self.monitor_scoped_positions() {
+                                log::debug!("re-resolving the {pos} edge now that the monitors are known");
+                                tokio::select! {
+                                    r = self.refresh_position(capture, pos) => r?,
+                                    _ = cancel.cancelled() => return Ok(CaptureOutcome::Cancelled),
+                                }
+                            }
                         }
                     }
                 }
