@@ -16,7 +16,7 @@ use lan_mouse_ipc::{
 };
 
 use crate::{
-    arrangement::{Canvas, Machine, MachineRequest},
+    arrangement::{self, Canvas, Machine, MachineRequest},
     authorization_window::AuthorizationWindow,
     fingerprint_window::FingerprintWindow,
     key_object::KeyObject,
@@ -315,6 +315,7 @@ impl Window {
                     (data.edge(), data.peer_edge(), data.peer_size());
                 Machine {
                     handle: client.handle(),
+                    peer_monitors: arrangement::peer_monitors(&data.peer_displays),
                     display: (!data.display.is_empty()).then(|| data.display.clone()),
                     hostname: data
                         .hostname

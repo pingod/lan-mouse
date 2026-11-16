@@ -47,6 +47,12 @@ pub(super) struct Machine {
     pub peer_edge: EdgeRange,
     /// what the peer reported about its screen, in pixels
     pub peer_size: Option<(f64, f64)>,
+    /// the peer's monitors, normalised so the group's origin is (0,0)
+    ///
+    /// Drawn as individual screens rather than one box, for the same reason the
+    /// local machine is: the ranges and the barriers are per monitor, so a peer
+    /// flattened into one rectangle would put its screens where they are not.
+    pub peer_monitors: Vec<layout::Monitor>,
 }
 
 /// What the canvas asks the window to do.
@@ -65,6 +71,54 @@ pub(super) enum MachineRequest {
     },
     /// give every peer of an edge an equal, adjacent stretch of it
     AutoArrange(Vec<(ClientHandle, Position, Option<String>, EdgeRange, EdgeRange)>),
+}
+
+/// The monitors a peer reported, as rectangles normalised to their own origin.
+///
+/// The report is the same per-monitor form the local backend sends, so it decodes
+/// with the same code. A peer that sent nothing, or an older one that only sent a
+/// size, leaves this empty and is drawn as one box - which is all that is known
+/// about it.
+pub fn peer_monitors(displays: &str) -> Vec<layout::Monitor> {
+    let Some(layout) = input_event::Layout::decode(displays) else {
+        return Vec::new();
+    };
+    let rects = layout
+        .enabled()
+        .map(|display| {
+            let rect = display.on_screen();
+            layout::Monitor::new(
+                display.name.clone(),
+                Screen::new(
+                    rect.x as f64,
+                    rect.y as f64,
+                    rect.width as f64,
+                    rect.height as f64,
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    /* Normalised to the group's own corner so a monitor's rectangle can be added
+     * straight onto wherever the group was placed. Without this a peer whose
+     * monitors do not start at (0,0) - which is most desks with a rotated panel -
+     * would be drawn offset from its own box. */
+    let Some(first) = rects.first() else {
+        return Vec::new();
+    };
+    let mut min_x = first.rect.x;
+    let mut min_y = first.rect.y;
+    for monitor in &rects {
+        min_x = min_x.min(monitor.rect.x);
+        min_y = min_y.min(monitor.rect.y);
+    }
+    rects
+        .into_iter()
+        .map(|mut monitor| {
+            monitor.rect.x -= min_x;
+            monitor.rect.y -= min_y;
+            monitor
+        })
+        .collect()
 }
 
 /// The space between a card and the local screen, in layout units.
@@ -292,6 +346,58 @@ impl State {
             .iter()
             .find(|(other, _)| *other == handle)
             .map(|(_, rect)| *rect)
+    }
+
+    /// Where a machine's monitors are, in layout coordinates.
+    ///
+    /// A peer that reported its screens is as many rectangles as it has; one that
+    /// reported nothing is the single box it was placed as.
+    fn screens_of(&self, handle: ClientHandle) -> Vec<Screen> {
+        let Some(group) = self.rect_of(handle) else {
+            return Vec::new();
+        };
+        let monitors = self
+            .machine(handle)
+            .map(|machine| machine.peer_monitors.clone())
+            .unwrap_or_default();
+        if monitors.is_empty() {
+            return vec![group];
+        }
+        monitors
+            .iter()
+            .map(|monitor| {
+                Screen::new(
+                    group.x + monitor.rect.x,
+                    group.y + monitor.rect.y,
+                    monitor.rect.w,
+                    monitor.rect.h,
+                )
+            })
+            .collect()
+    }
+
+    /// The local monitor a machine's link is attached to.
+    ///
+    /// The link is drawn against this rather than against the bounding box: the
+    /// range is a fraction of *this* monitor's edge, so the bridge has to start
+    /// where this monitor ends. Using the box made the bridge's height negative on
+    /// a desk with unequal heights, which is why the two screens stopped looking
+    /// connected at all.
+    fn anchor_of(&self, machine: &Machine) -> Screen {
+        let local = self.local_screen();
+        let placement = self.placement_of(machine, local);
+        layout::anchor_monitor(local, &self.local_monitors(), &placement)
+    }
+
+    /// A machine's position in the list, for picking its colour.
+    ///
+    /// By handle rather than by list index, so a machine does not change colour
+    /// when another one is enabled, disabled or removed.
+    fn machine_index(&self, handle: ClientHandle) -> usize {
+        self.machines
+            .iter()
+            .position(|machine| machine.handle == handle)
+            .unwrap_or(0)
     }
 
     /// The topmost card under a canvas point.
@@ -1103,6 +1209,7 @@ mod tests {
     fn machine(handle: ClientHandle, position: Position, edge: (f64, f64)) -> Machine {
         Machine {
             handle,
+            peer_monitors: Vec::new(),
             display: None,
             hostname: format!("host{handle}"),
             position,
@@ -1373,6 +1480,7 @@ mod render {
     ) -> Machine {
         Machine {
             handle,
+            peer_monitors: Vec::new(),
             display: None,
             hostname: format!("host{handle}"),
             position,
@@ -1665,6 +1773,45 @@ mod render {
         assert!(background > 1000, "{background} background pixels");
     }
 
+    /// The local monitors are drawn where the compositor put them.
+    ///
+    /// A rotated panel occupies a different rectangle from its panel size, and on a
+    /// desk of unequal heights the two monitors do not start on the same line. Both
+    /// are easy to lose: the canvas drew one box for the whole desk until recently,
+    /// and a box has no offsets to get wrong.
+    #[test]
+    fn the_local_monitors_keep_their_real_offsets() {
+        let mut state = state(vec![]);
+        state.local_displays = vec![
+            input_event::DisplayInfo {
+                name: "DP-2".to_owned(),
+                x: 2560,
+                y: 0,
+                width: 2560,
+                height: 1440,
+                rotation: input_event::Rotation::Right,
+                enabled: true,
+            },
+            input_event::DisplayInfo {
+                name: "DP-3".to_owned(),
+                x: 0,
+                y: 1120,
+                width: 2560,
+                height: 1440,
+                rotation: input_event::Rotation::Normal,
+                enabled: true,
+            },
+        ];
+        let monitors = state.local_monitors();
+        let dp2 = monitors.iter().find(|m| m.name == "DP-2").expect("DP-2");
+        let dp3 = monitors.iter().find(|m| m.name == "DP-3").expect("DP-3");
+        /* the rotated panel occupies 1440x2560 at its offset, and it starts at the
+         * top of the desk while the upright one starts 1120 px lower */
+        assert_eq!(dp2.rect, Screen::new(2560.0, 0.0, 1440.0, 2560.0));
+        assert_eq!(dp3.rect, Screen::new(0.0, 1120.0, 2560.0, 1440.0));
+        assert_ne!(dp2.rect.y, dp3.rect.y);
+    }
+
     /// Write a PNG of a representative layout so the picture can be looked at.
     ///
     /// Only with `LAN_MOUSE_RENDER_DEMO=/path`: a test that writes files
@@ -1710,7 +1857,7 @@ mod render {
                 enabled: true,
             },
         ];
-        let surface = render(&mut state, 1000, 620);
+        let surface = render(&mut state, 1600, 1000);
         let mut file =
             std::io::BufWriter::new(std::fs::File::create(path).expect("create the demo image"));
         surface

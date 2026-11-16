@@ -61,6 +61,33 @@ impl Palette {
 }
 
 /// Set the source colour with an alpha.
+/// A stable border colour for the `index`-th machine.
+///
+/// Every machine owns one colour so its screens read as one machine even when
+/// they are not adjacent on the canvas - a desk where one machine's two monitors
+/// are separated by another machine's screen is unreadable if all borders are the
+/// same blue. The local machine is index 0 and keeps the accent colour, because
+/// the accent is what the rest of the interface already uses for "this machine".
+pub fn machine_color(index: usize, palette: &Palette) -> (f64, f64, f64) {
+    /* The local machine keeps the theme's accent: the rest of the interface already
+     * uses it for "this machine", and it is the one colour that has to work in both
+     * the dark and the light theme. */
+    if index == 0 {
+        return palette.accent;
+    }
+    /* The rest are chosen to stay distinguishable from each other and from the
+     * accent, success and danger colours used for state: a machine's identity must
+     * not be mistaken for "reachable" or "blocked". */
+    const PEERS: [(f64, f64, f64); 5] = [
+        (0.78, 0.55, 0.95), // violet
+        (0.95, 0.66, 0.36), // amber
+        (0.45, 0.85, 0.75), // teal
+        (0.95, 0.55, 0.70), // pink
+        (0.70, 0.85, 0.45), // lime
+    ];
+    PEERS[(index - 1) % PEERS.len()]
+}
+
 pub fn set(cr: &cairo::Context, color: (f64, f64, f64), alpha: f64) {
     cr.set_source_rgba(color.0, color.1, color.2, alpha);
 }

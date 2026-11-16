@@ -30,7 +30,7 @@ pub(super) fn draw(cr: &cairo::Context, width: f64, height: f64, state: &State, 
         let Some(rect) = state.rect_of(machine.handle) else {
             continue;
         };
-        draw_link(cr, state, local, machine, *piece, rect, palette);
+        draw_link(cr, state, machine, *piece, rect, palette);
     }
     for position in positions() {
         /* The walls are the complement of what is reachable, per edge: a stretch
@@ -59,56 +59,54 @@ pub(super) fn draw(cr: &cairo::Context, width: f64, height: f64, state: &State, 
         draw_snap_preview(cr, state, drag, palette);
     }
 
-    /* The local screen: every monitor drawn where it actually is.
+    /* Every screen of every machine, in the one coordinate space they actually
+     * share.
      *
-     * Drawing one box for the bounding rectangle would claim screen where a desk
-     * with a rotated monitor has none - and the pointer cannot be there, so the
-     * picture would promise a crossing at a place the edge range does not cover.
+     * A machine is drawn as the monitors it has, not as one box, for the same
+     * reason the ranges are per monitor: a box around two screens of unequal
+     * height covers area no screen does, so a border there would claim a screen
+     * that does not exist. Each machine gets its own border colour, so a desk
+     * where one machine's screens are separated by another's still reads as two
+     * machines rather than three.
      */
     let monitors = state.local_monitors();
-    for (index, monitor) in monitors.iter().enumerate() {
-        let canvas_monitor = state.to_canvas(monitor.rect);
-        paint::fill_card(cr, canvas_monitor, palette);
-        paint::set(cr, palette.accent, 0.9);
+    let local_colour = paint::machine_color(0, palette);
+    for monitor in &monitors {
+        let canvas = state.to_canvas(monitor.rect);
+        paint::fill_card(cr, canvas, palette);
+        paint::set(cr, local_colour, 0.9);
         cr.set_line_width(2.0);
         let _ = cr.stroke();
-        /* a hairline between monitors, so two touching screens read as two */
-        if monitors.len() > 1 {
-            paint::set(cr, palette.foreground, 0.25);
-            cr.set_line_width(1.0);
-            let _ = cr.stroke();
-        }
-        let _ = index;
+        draw_resolution(cr, canvas, monitor.rect, palette);
     }
     let canvas_local = state.to_canvas(local);
-    /* `active` is false here on purpose: the green subtitle means "a pointer can
-     * cross to this machine", which is a statement about a peer. The local screen
-     * is the thing being crossed *from*, and it is already outlined in accent. */
     /* The label goes on the largest monitor, not on the bounding box: with a
      * rotated monitor in the desk the box's centre can be a place where there is
      * no screen at all, and the name would float over nothing. */
     let labelled = monitors
         .iter()
-        .max_by(|a, b| {
-            let area = |monitor: &super::layout::Monitor| monitor.rect.w * monitor.rect.h;
-            area(a).total_cmp(&area(b))
-        })
+        .max_by(|a, b| (a.rect.w * a.rect.h).total_cmp(&(b.rect.w * b.rect.h)))
         .map(|monitor| state.to_canvas(monitor.rect))
         .unwrap_or(canvas_local);
+    /* the name on every screen, the full card on the largest */
+    for monitor in &monitors {
+        let canvas = state.to_canvas(monitor.rect);
+        if canvas != labelled {
+            draw_screen_name(cr, canvas, &state.local_hostname, local_colour, palette);
+        }
+    }
     draw_card(
         cr,
         labelled,
         &state.local_hostname,
         if state.local_displays.is_empty() {
             "this screen · size unknown".to_owned()
-        } else if state.local_displays.len() > 1 {
-            format!("this screen · {} displays", state.local_displays.len())
         } else {
-            "this screen".to_owned()
+            format!("this machine · {} screens", monitors.len().max(1))
         },
         None,
         palette,
-        false,
+        Some(local_colour),
     );
 
     /* the peers, the dragged one last so it is on top */
@@ -140,24 +138,38 @@ pub(super) fn draw(cr: &cairo::Context, width: f64, height: f64, state: &State, 
             paint::rounded_rect(cr, shadow, 10.0);
             let _ = cr.fill();
         }
-        paint::fill_card(cr, canvas, palette);
-        paint::set(
-            cr,
-            if blocked {
-                palette.danger
-            } else if hovered || dragging {
-                palette.accent
-            } else {
-                palette.success
-            },
-            if hovered || dragging { 0.95 } else { 0.6 },
-        );
-        cr.set_line_width(if hovered || dragging { 2.5 } else { 1.5 });
-        let _ = cr.stroke();
+        /* A peer that reported its monitors is drawn as those monitors, the same
+         * way the local machine is. A peer that reported nothing is one box - that
+         * is all that is known about it. */
+        let colour = paint::machine_color(state.machine_index(handle) + 1, palette);
+        let screens = state.screens_of(handle);
+        for screen in &screens {
+            let card = state.to_canvas(*screen);
+            paint::fill_card(cr, card, palette);
+            paint::set(
+                cr,
+                if blocked { palette.danger } else { colour },
+                if hovered || dragging { 0.95 } else { 0.7 },
+            );
+            cr.set_line_width(if hovered || dragging { 2.0 } else { 1.5 });
+            let _ = cr.stroke();
+            draw_resolution(cr, card, *screen, palette);
+        }
 
+        let name_at = screens
+            .iter()
+            .max_by(|a, b| (a.w * a.h).total_cmp(&(b.w * b.h)))
+            .map(|screen| state.to_canvas(*screen))
+            .unwrap_or(canvas);
+        for screen in &screens {
+            let canvas = state.to_canvas(*screen);
+            if canvas != name_at {
+                draw_screen_name(cr, canvas, &machine.hostname, colour, palette);
+            }
+        }
         draw_card(
             cr,
-            canvas,
+            name_at,
             &machine.hostname,
             format!("{} · {}", edge_label(machine.position), machine.edge),
             machine
@@ -165,17 +177,29 @@ pub(super) fn draw(cr: &cairo::Context, width: f64, height: f64, state: &State, 
                 .map(Detail::Size)
                 .or(Some(Detail::Range(machine.peer_edge))),
             palette,
-            machine.active,
+            machine.active.then_some(colour),
         );
         if blocked {
             paint::set(cr, palette.danger, 0.95);
-            let text = Text::new(cr, "unreachable", 10.5, true, (canvas.w - 16.0).max(1.0));
-            text.draw(cr, canvas.x + canvas.w / 2.0, canvas.bottom() - 12.0);
+            let text = Text::new(cr, "unreachable", 10.5, true, (name_at.w - 16.0).max(1.0));
+            text.draw(cr, name_at.x + name_at.w / 2.0, name_at.bottom() - 12.0);
         }
     }
 
-    /* the handles, on top of what they adjust */
-    for handle in &state.geometry.handles {
+    /* The handles, on top of what they adjust - and only for the machine the
+     * pointer is on.
+     *
+     * Drawn for every machine they are eight identical blue squares with nothing
+     * saying what they belong to or what they do, which reads as decoration or as
+     * an error. Showing them for one machine at a time makes them part of that
+     * machine's card. */
+    let focused = state.drag.as_ref().map(|drag| drag.handle).or(state.hover);
+    for handle in state
+        .geometry
+        .handles
+        .iter()
+        .filter(|handle| Some(handle.handle) == focused)
+    {
         let canvas = state.to_canvas(handle.rect);
         paint::set(cr, palette.accent, 0.95);
         paint::rounded_rect(cr, canvas, 3.0);
@@ -304,27 +328,45 @@ fn draw_grid(cr: &cairo::Context, state: &State, palette: &Palette) {
 fn draw_link(
     cr: &cairo::Context,
     state: &State,
-    local: Screen,
     machine: &Machine,
     piece: EdgeRange,
     peer: Screen,
     palette: &Palette,
 ) {
-    let edge_len = local.extent_along(machine.position);
+    /* The band spans the gap between the peer's card and the monitor it is
+     * attached to - not the bounding box.
+     *
+     * `piece` is measured against the monitor the link names, and on a desk with
+     * unequal heights the box's edge is a different line from that monitor's: the
+     * box top belongs to the rotated panel while the link sits on the upright one,
+     * 1120 px lower. Anchoring to the box made the height of this band negative, so
+     * the link disappeared and the two screens stopped looking connected. */
+    let anchor = state.anchor_of(machine);
+    let edge_len = anchor.extent_along(machine.position);
     if edge_len <= 0.0 {
         return;
     }
-    let low = local.edge_start(machine.position);
+    let low = anchor.edge_start(machine.position);
     let start = low + piece.start() as f64 / 1000.0 * edge_len;
     let stop = low + piece.end() as f64 / 1000.0 * edge_len;
     let band = match machine.position {
-        Position::Left => Screen::new(peer.right(), start, local.x - peer.right(), stop - start),
-        Position::Right => Screen::new(local.right(), start, peer.x - local.right(), stop - start),
-        Position::Top => Screen::new(start, peer.bottom(), stop - start, local.y - peer.bottom()),
-        Position::Bottom => {
-            Screen::new(start, local.bottom(), stop - start, peer.y - local.bottom())
+        Position::Left => Screen::new(peer.right(), start, anchor.x - peer.right(), stop - start),
+        Position::Right => {
+            Screen::new(anchor.right(), start, peer.x - anchor.right(), stop - start)
         }
+        Position::Top => Screen::new(start, peer.bottom(), stop - start, anchor.y - peer.bottom()),
+        Position::Bottom => Screen::new(
+            start,
+            anchor.bottom(),
+            stop - start,
+            peer.y - anchor.bottom(),
+        ),
     };
+    if band.w <= 0.0 || band.h <= 0.0 {
+        /* the peer is inside the anchor's own row, which a drag does momentarily;
+         * a negative rectangle is not a link */
+        return;
+    }
     let canvas = state.to_canvas(band);
     paint::set(cr, palette.success, 0.5);
     cr.rectangle(canvas.x, canvas.y, canvas.w.max(1.0), canvas.h.max(1.0));
@@ -344,6 +386,9 @@ fn draw_wall(
     let low = local.edge_start(position);
     let start = low + gap.start() as f64 / 1000.0 * edge_len;
     let stop = low + gap.end() as f64 / 1000.0 * edge_len;
+    /* A wall is the complement of what is reachable along the whole edge, so it is
+     * drawn against the box: it spans several monitors, and no single one of them
+     * owns it. */
     let band = match position {
         Position::Left => Screen::new(local.x - GAP, start, GAP, stop - start),
         Position::Right => Screen::new(local.right(), start, GAP, stop - start),
@@ -395,22 +440,17 @@ fn draw_card(
     subtitle: String,
     detail: Option<Detail>,
     palette: &Palette,
-    active: bool,
+    /* the machine's colour while it can be reached, `None` when it cannot */
+    machine: Option<(f64, f64, f64)>,
 ) {
     let inner = (rect.w - 16.0).max(1.0);
     paint::set(cr, palette.foreground, 0.95);
     let title = Text::new(cr, name, 14.0, true, inner);
     title.draw(cr, rect.x + rect.w / 2.0, rect.y + rect.h / 2.0 - 8.0);
 
-    paint::set(
-        cr,
-        if active {
-            palette.success
-        } else {
-            palette.accent
-        },
-        0.95,
-    );
+    /* the subtitle is in the machine's own colour, so the second line already
+     * says which machine this card belongs to before the border is noticed */
+    paint::set(cr, machine.unwrap_or(palette.foreground), 0.95);
     let sub = Text::new(cr, &subtitle, 11.5, false, inner);
     sub.draw(cr, rect.x + rect.w / 2.0, rect.y + rect.h / 2.0 + 12.0);
 
@@ -423,6 +463,45 @@ fn draw_card(
         let line = Text::new(cr, &text, 10.5, false, inner);
         line.draw(cr, rect.x + rect.w / 2.0, rect.y + rect.h / 2.0 + 28.0);
     }
+}
+
+/// The machine a screen belongs to, in the top-left of that screen.
+///
+/// Every screen, not only the largest one: a machine with two monitors otherwise
+/// has one labelled rectangle and one anonymous one, and "which of these is my
+/// second screen" is exactly what a per-monitor picture has to answer. Small and
+/// dim, so it never competes with the full card on the largest screen.
+fn draw_screen_name(
+    cr: &cairo::Context,
+    canvas: Screen,
+    name: &str,
+    colour: (f64, f64, f64),
+    palette: &Palette,
+) {
+    let _ = palette;
+    if canvas.w < 96.0 || canvas.h < 56.0 {
+        return;
+    }
+    paint::set(cr, colour, 0.75);
+    let text = Text::new(cr, name, 11.0, true, (canvas.w - 16.0).max(1.0));
+    text.draw(cr, canvas.x + canvas.w / 2.0, canvas.y + 16.0);
+}
+
+/// The pixel size of one screen, in its bottom-left corner.
+///
+/// Every screen gets one, not only the largest: a desk is bought and arranged by
+/// its resolutions, and "which of these is the 1440p one" is the question the
+/// canvas exists to answer. Drawn small and dim so it never competes with the
+/// machine name.
+fn draw_resolution(cr: &cairo::Context, canvas: Screen, layout: Screen, palette: &Palette) {
+    if canvas.w < 64.0 || canvas.h < 40.0 {
+        /* unreadable at this size, and the label would be clipped to nothing */
+        return;
+    }
+    paint::set(cr, palette.foreground, 0.45);
+    let text = format!("{}×{}", layout.w as i64, layout.h as i64);
+    let line = Text::new(cr, &text, 10.0, false, (canvas.w - 12.0).max(1.0));
+    line.draw(cr, canvas.x + canvas.w / 2.0, canvas.bottom() - 10.0);
 }
 
 /// The third line of a card: what the peer's screen is, or where its cursor lands.
