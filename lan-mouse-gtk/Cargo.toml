@@ -14,6 +14,7 @@ gtk = { package = "gtk4", version = "0.9.0", features = ["v4_2"] }
 pangocairo = "0.20"
 adw = { package = "libadwaita", version = "0.7.0", features = ["v1_4"] }
 async-channel = { version = "2.1.1" }
+futures = "0.3.28"
 hostname = "0.4.0"
 log = "0.4.20"
 lan-mouse-ipc = { path = "../lan-mouse-ipc", version = "0.3.0" }

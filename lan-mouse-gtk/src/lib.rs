@@ -240,7 +240,7 @@ fn build_ui(app: &Application) {
     }
 
     log::debug!("connecting to lan-mouse-socket");
-    let (mut frontend_rx, frontend_tx) = match lan_mouse_ipc::try_connect() {
+    let (frontend_rx, frontend_tx) = match lan_mouse_ipc::try_connect() {
         Ok(conn) => conn,
         Err(e) => {
             /* The caller already started the daemon as a child process, so do
@@ -282,25 +282,57 @@ fn build_ui(app: &Application) {
     log::debug!("connected to lan-mouse-socket");
 
     let (sender, receiver) = async_channel::bounded(10);
+    /* Carries a fresh writer after the daemon came back. Separate from the event
+     * channel because it is not an event: the window swaps its connection and asks for
+     * the state again, and nothing about it is a snapshot of the daemon's state. */
+    let (conn_tx, conn_rx) = async_channel::bounded(1);
+    /* The window needs a writer to send with, and the reader thread needs it back to
+     * keep reading: the pair is not cloneable, so it is passed along the same channel
+     * that carries a reconnected one. */
+    let _ = conn_tx.send_blocking(frontend_tx);
 
     gio::spawn_blocking(move || {
-        while let Some(e) = frontend_rx.next_event() {
-            match e {
-                // the receiver is gone once the window is closed
-                Ok(e) => {
-                    if sender.send_blocking(e).is_err() {
+        let mut reader = frontend_rx;
+        loop {
+            while let Some(e) = reader.next_event() {
+                match e {
+                    // the receiver is gone once the window is closed
+                    Ok(e) => {
+                        if sender.send_blocking(e).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("frontend read failed: {e}");
                         break;
                     }
                 }
-                Err(e) => {
-                    log::error!("{e}");
-                    break;
+            }
+
+            /* The daemon went away - it is restarted on every upgrade, and the window
+             * used to quit here, which meant a deploy closed whatever the user had
+             * open. Wait for it to come back and carry on with the same widgets. */
+            log::warn!("lost the daemon connection, waiting for it to come back");
+            loop {
+                std::thread::sleep(CONNECT_RETRY_INTERVAL);
+                match lan_mouse_ipc::try_connect() {
+                    Ok((new_reader, new_writer)) => {
+                        reader = new_reader;
+                        /* hand the new writer to the window; if it cannot be
+                         * delivered the window is gone */
+                        if conn_tx.send_blocking(new_writer).is_err() {
+                            return;
+                        }
+                        break;
+                    }
+                    Err(_) => continue,
                 }
             }
+            log::info!("reconnected to the lan-mouse daemon");
         }
     });
 
-    let window = Window::new(app, frontend_tx);
+    let window = Window::new(app, conn_rx.recv_blocking().expect("the first writer"));
     // Ask the daemon for the hotkey rules, version and autostart state as soon
     // as the window exists, so the UI is populated before the first event.
     window.request_initial_state();
@@ -347,17 +379,54 @@ fn build_ui(app: &Application) {
         app,
         async move {
             loop {
-                let Ok(notify) = receiver.recv().await else {
-                    /* The daemon connection is gone (the reader thread ended).
-                     * Quit through the application so the main loop returns and
-                     * the caller can clean up the daemon it spawned. Closing the
-                     * window is not enough on macOS, where the close-request
-                     * handler only hides it.
-                     */
-                    log::error!("lost connection to the lan-mouse daemon");
-                    let _ = STARTUP_ERROR.set("the connection to the daemon was lost".to_owned());
-                    app.quit();
-                    return;
+                /* A reconnected writer arrives here; the reader thread keeps the
+                 * event channel open across the gap, so this is the only place the
+                 * window learns that it has to swap connections. Selected rather than
+                 * polled: the loop would otherwise sit in `recv` and miss it. */
+                /* One channel of either kind: a state event, or the writer of a
+                 * connection that came back. Selected rather than polled - the loop
+                 * would otherwise sit in `recv` and miss the reconnect. */
+                /* boxed, because a `FrontendEvent` is much larger than a writer and
+                 * every iteration would otherwise reserve for the largest variant */
+                enum Incoming {
+                    Event(Box<FrontendEvent>),
+                    Writer(Box<lan_mouse_ipc::FrontendRequestWriter>),
+                    Gone,
+                }
+                let incoming = futures::future::select(
+                    Box::pin(async {
+                        match receiver.recv().await {
+                            Ok(event) => Incoming::Event(Box::new(event)),
+                            Err(_) => Incoming::Gone,
+                        }
+                    }),
+                    Box::pin(async {
+                        match conn_rx.recv().await {
+                            Ok(writer) => Incoming::Writer(Box::new(writer)),
+                            Err(_) => Incoming::Gone,
+                        }
+                    }),
+                );
+                let notify = match incoming.await {
+                    futures::future::Either::Left((Incoming::Event(event), _)) => *event,
+                    futures::future::Either::Left((_, _)) => {
+                        log::error!("lost connection to the lan-mouse daemon");
+                        let _ =
+                            STARTUP_ERROR.set("the connection to the daemon was lost".to_owned());
+                        app.quit();
+                        return;
+                    }
+                    futures::future::Either::Right((Incoming::Writer(writer), _)) => {
+                        window.replace_connection(*writer);
+                        continue;
+                    }
+                    futures::future::Either::Right((_, _)) => {
+                        log::error!("lost connection to the lan-mouse daemon");
+                        let _ =
+                            STARTUP_ERROR.set("the connection to the daemon was lost".to_owned());
+                        app.quit();
+                        return;
+                    }
                 };
                 match notify {
                     FrontendEvent::Created(handle, client, state) => {

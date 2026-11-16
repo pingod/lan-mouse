@@ -1183,6 +1183,22 @@ impl Window {
         self.request(FrontendRequest::RemoveAuthorizedKey(fp));
     }
 
+    /// Swap in a fresh connection after the daemon came back.
+    ///
+    /// The daemon is commonly restarted (an upgrade, a config change), and the window
+    /// used to treat the closed socket as fatal. Keeping the widgets and replacing the
+    /// writer is what lets it survive that.
+    pub(super) fn replace_connection(&self, conn: FrontendRequestWriter) {
+        self.imp()
+            .frontend_request_writer
+            .borrow_mut()
+            .replace(conn);
+        log::info!("reconnected to the lan-mouse daemon");
+        /* Everything the window shows was read from the old connection, so ask for it
+         * again rather than leaving stale values on screen. */
+        self.request_initial_state();
+    }
+
     fn request(&self, request: FrontendRequest) {
         let mut requester = self.imp().frontend_request_writer.borrow_mut();
         let Some(requester) = requester.as_mut() else {

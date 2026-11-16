@@ -129,32 +129,6 @@ pub fn peer_monitors(displays: &str) -> Vec<layout::Monitor> {
         .collect()
 }
 
-/// The parts of a machine's link that a change in means an edit happened.
-type ConfigSignature = (
-    ClientHandle,
-    lan_mouse_ipc::Position,
-    Option<String>,
-    EdgeRange,
-    EdgeRange,
-    bool,
-);
-
-fn config_signature(machines: &[Machine]) -> Vec<ConfigSignature> {
-    machines
-        .iter()
-        .map(|machine| {
-            (
-                machine.handle,
-                machine.position,
-                machine.display.clone(),
-                machine.edge,
-                machine.peer_edge,
-                machine.active,
-            )
-        })
-        .collect()
-}
-
 /// Milliseconds since the epoch, used as the revision of an edit.
 ///
 /// A clock rather than a counter because the two machines each keep their own
@@ -350,12 +324,6 @@ struct State {
     local_revision: u64,
     /// the last picture handed to the daemon, so an unchanged one is not resent
     published: String,
-    /// the link configuration the daemon last reported, before any adoption
-    ///
-    /// Kept separately because `machines` is overwritten by an adopted picture:
-    /// comparing against that would make every report look like a change, bump the
-    /// revision on every tick, and the two machines would never settle.
-    last_signature: Vec<ConfigSignature>,
     /// zoom applied on top of the automatic fit
     zoom: f64,
     /// pan applied on top of the automatic centring, in canvas units
@@ -402,6 +370,19 @@ impl State {
 
     fn local_bounds(&self) -> Option<input_event::ScreenRect> {
         self.local_layout()?.bounds()
+    }
+
+    /// Record that this side changed the layout, so its picture wins.
+    ///
+    /// Called from the gestures and only from the gestures. Detecting an edit by
+    /// watching the configuration for changes does not work: the daemon rewrites the
+    /// file, a peer's action changes a link, and this window's own re-derivation
+    /// changes the geometry - all of those look like edits and all of them stamped a
+    /// fresh revision, which made the local picture always newer than the peer's and
+    /// the canvas never adopt one.
+    fn mark_edited(&mut self) {
+        self.local_revision = now_millis();
+        self.published.clear();
     }
 
     /// The picture this side would draw, from its own geometry.
@@ -900,6 +881,7 @@ impl State {
                     || machine.peer_edge != placement.peer_edge
             });
             if changed {
+                self.mark_edited();
                 (self.on_request)(MachineRequest::Move {
                     handle: drag.handle,
                     position: placement.position,
@@ -915,6 +897,7 @@ impl State {
                 .map(|machine| (machine.position, machine.display.clone()));
             if resize.current != resize.start {
                 if let Some((position, display)) = link {
+                    self.mark_edited();
                     (self.on_request)(MachineRequest::Move {
                         handle: resize.handle,
                         position,
@@ -980,7 +963,6 @@ impl Canvas {
             local_offset: (0.0, 0.0),
             local_revision: 0,
             published: String::new(),
-            last_signature: Vec::new(),
             zoom: 1.0,
             pan: (0.0, 0.0),
             canvas: (1.0, 1.0),
@@ -1082,24 +1064,13 @@ impl Canvas {
                  * becomes the current one and the peer will adopt it. Detected from
                  * the report rather than from the gesture so a change made with
                  * `cli set-edge` counts too. */
-                let signature = config_signature(machines);
-                let signature_changed = signature != state.last_signature;
-                if signature_changed {
-                    let first_observation = state.last_signature.is_empty();
-                    state.last_signature = signature;
-                    /* The first report is not an edit: it is this window finding out
-                     * what the configuration already is. Stamping it with the clock
-                     * made the local revision always newer than the peer's, so the peer's
-                     * picture could never win and the canvas never adopted one - the
-                     * window looked frozen while the data was arriving fine.
-                     *
-                     * A revision of zero means "this side has not edited anything", and
-                     * any picture from a side that has will win. */
-                    if !first_observation {
-                        state.local_revision = now_millis();
-                        state.published.clear();
-                    }
-                }
+                /* Nothing here decides whether an edit happened. A configuration that
+                 * changed is not the same thing as a user changing the layout: the
+                 * daemon rewrites the file, a peer's action edits a link, and this
+                 * window's own re-derivation changes the geometry. Watching for that
+                 * made every tick look like an edit, so the local revision was always
+                 * the newest and the peer's picture never won. The gestures mark their
+                 * own edits with `mark_edited`. */
                 state.machines = machines.to_vec();
                 if let Some(path) = std::env::var_os("LAN_MOUSE_CANVAS_TRACE") {
                     use std::io::Write;
@@ -1110,14 +1081,13 @@ impl Canvas {
                     {
                         let _ = writeln!(
                             file,
-                            "update: local_rev={} peer_pictures={} sig_changed={}",
+                            "update: local_rev={} peer_pictures={}",
                             state.local_revision,
                             state
                                 .machines
                                 .iter()
                                 .filter(|m| m.peer_picture.is_some())
                                 .count(),
-                            signature_changed,
                         );
                     }
                 }
@@ -1623,6 +1593,7 @@ fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
                         if let Some(machine) = state.machine(handle) {
                             let (edge, peer_edge) = (machine.edge, machine.peer_edge);
                             let display = state.machine(handle).and_then(|m| m.display.clone());
+                            state.mark_edited();
                             (state.on_request)(MachineRequest::Move {
                                 handle,
                                 position,
@@ -1690,7 +1661,6 @@ mod tests {
             local_offset: (0.0, 0.0),
             local_revision: 0,
             published: String::new(),
-            last_signature: Vec::new(),
             zoom: 1.0,
             pan: (0.0, 0.0),
             canvas: (800.0, 460.0),
@@ -1967,7 +1937,6 @@ mod render {
             local_offset: (0.0, 0.0),
             local_revision: 0,
             published: String::new(),
-            last_signature: Vec::new(),
             zoom: 1.0,
             pan: (0.0, 0.0),
             canvas: (1.0, 1.0),
@@ -2360,6 +2329,39 @@ mod render {
                 "the two machines disagree: {theirs:?} vs {mine:?}"
             );
         }
+    }
+
+    /// Only a gesture makes this side's picture newer.
+    ///
+    /// The daemon rewrites its config, a peer's action edits a link, and the canvas
+    /// re-derives its geometry on every resize - all of those looked like edits when
+    /// they were detected from the configuration, and each stamped a fresh revision.
+    /// The local picture then always won, so the peer's was never adopted: the reported
+    /// "拖了也一动不动" with the data arriving correctly the whole time.
+    #[test]
+    fn an_untouched_canvas_keeps_a_revision_of_zero() {
+        let mut state = state(vec![]);
+        state.local_displays = vec![input_event::DisplayInfo {
+            name: "eDP-1".to_owned(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            rotation: input_event::Rotation::Normal,
+            enabled: true,
+        }];
+        let mut desk = machine(4, Position::Bottom, (0.0, 1.0), true);
+        desk.hostname = "desk".to_owned();
+        state.machines = vec![desk];
+
+        /* updates, resizes and re-derivations must not touch the revision */
+        state.relayout(800.0, 500.0);
+        state.relayout(1200.0, 700.0);
+        assert_eq!(state.local_revision, 0);
+
+        /* a gesture does */
+        state.mark_edited();
+        assert!(state.local_revision > 0);
     }
 
     /// A window that has not edited anything adopts any picture it is offered.
