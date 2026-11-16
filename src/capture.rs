@@ -88,6 +88,31 @@ fn unpack_size(packed: u64) -> Option<(u32, u32)> {
     Some(((packed >> 32) as u32, packed as u32))
 }
 
+impl CaptureTask {
+    /// Publish a geometry the backend just reported.
+    ///
+    /// `None` is not published: at this point in the lifecycle it means "the
+    /// backend has not talked to the compositor yet", not "there are no
+    /// screens", and writing it would erase a size that is already correct.
+    /// The session loop polls until an answer arrives, so nothing is lost by
+    /// ignoring this one.
+    fn publish_size(&mut self, size: Option<(u32, u32)>) {
+        if let Some(size) = size {
+            self.screen_size.set(pack_size(Some(size)));
+        }
+    }
+}
+
+/// How often to ask a backend for its geometry while it still reports none.
+///
+/// A backend can only answer once it has talked to the compositor, and the
+/// session that makes that possible is established inside the capture task, not
+/// when the barrier is registered: `libei`'s `create` only queues a message. So
+/// the first read after `create_captures` legitimately comes back empty, and
+/// nothing else in the service would ever ask again - the value would stay
+/// unknown for the lifetime of the process.
+const SCREEN_SIZE_POLL: Duration = Duration::from_secs(1);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CaptureType {
     /// a normal input capture
@@ -512,12 +537,11 @@ impl CaptureTask {
         }
         let segments = effective.into_iter().flatten().collect::<Vec<_>>();
         capture.set_segments(pos, segments).await?;
-        /* Registering barriers means we talked to the backend, which is the only
-         * moment its screen geometry can be read without a separate request: the
-         * value only changes when a monitor is plugged in or the mode changes,
-         * both of which rebuild the barriers. */
+        /* Worth a read here - a backend that builds its barriers synchronously
+         * (layer-shell) already knows the answer - but not the only one: the
+         * session loop keeps asking until the asynchronous ones catch up. */
         let size = capture.screen_size().await;
-        self.screen_size.set(pack_size(size));
+        self.publish_size(size);
         Ok(())
     }
 
@@ -653,7 +677,7 @@ impl CaptureTask {
             }
         }
         let size = capture.screen_size().await;
-        self.screen_size.set(pack_size(size));
+        self.publish_size(size);
         /* the barriers belong to a position, not to a client, so the segments of
          * every edge are handed over once all clients are registered */
         let mut positions = self
@@ -673,8 +697,35 @@ impl CaptureTask {
         &mut self,
         capture: &mut InputCapture,
     ) -> Result<(), InputCaptureError> {
+        /* Ask the backend for its geometry until it answers. The first read in
+         * `create_captures` happens before the backend has a session - libei
+         * queues the request and only then talks to the portal - so it returns
+         * nothing, and without this the service would never learn the size. The
+         * poll stops as soon as a size arrives; a backend that genuinely has no
+         * geometry keeps costing one cheap call per second. */
+        let mut size_poll = tokio::time::interval(SCREEN_SIZE_POLL);
+        size_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
+                _ = size_poll.tick() => {
+                    /* Asked every second, not only while unknown: plugging a
+                     * monitor in changes the answer without changing which
+                     * stretch of an edge anybody owns, so nothing else would
+                     * notice. A backend that answers `None` keeps the last known
+                     * value rather than blanking it - "not ready yet" and "no
+                     * screens at all" are indistinguishable from here, and
+                     * blanking a working layout is the worse mistake. */
+                    if let Some(size) = capture.screen_size().await {
+                        if unpack_size(self.screen_size.get()) != Some(size) {
+                            log::info!(
+                                "the capture backend reports a {}x{} screen area",
+                                size.0,
+                                size.1
+                            );
+                            self.screen_size.set(pack_size(Some(size)));
+                        }
+                    }
+                }
                 event = capture.next() => match event {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
                     None => {
@@ -1433,5 +1484,35 @@ mod routing_tests {
                 _ => assert_eq!(unpacked, None),
             }
         }
+    }
+
+    /// A backend that answers "not yet" must not erase a size that is already
+    /// known.
+    ///
+    /// The ordering that caused the bug: `create_captures` reads the geometry
+    /// right after registering the barriers, and for the portal backend that is
+    /// before the session exists - `libei`'s `create` only queues a message - so
+    /// the read returns nothing. Writing that `None` over a size that a later
+    /// read had already filled in would blank the layout, and the canvas would
+    /// fall back to a guessed 1920x1080.
+    #[test]
+    fn an_unanswered_geometry_read_does_not_erase_a_known_size() {
+        let known = pack_size(Some((2560, 1440)));
+        assert_eq!(unpack_size(known), Some((2560, 1440)));
+
+        /* what `publish_size` does with a `None`: nothing */
+        let after_none = known;
+        assert_eq!(unpack_size(after_none), Some((2560, 1440)));
+
+        /* and with a real answer: replaces it */
+        let after_change = pack_size(Some((1920, 1080)));
+        assert_eq!(unpack_size(after_change), Some((1920, 1080)));
+    }
+
+    /// The poll interval has to be short enough to be invisible and long enough
+    /// not to hammer a portal that is still starting up.
+    #[test]
+    fn the_geometry_poll_is_a_second() {
+        assert_eq!(SCREEN_SIZE_POLL, Duration::from_secs(1));
     }
 }

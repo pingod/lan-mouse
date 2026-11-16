@@ -1152,15 +1152,25 @@ impl Service {
         if size == self.screen_size {
             return;
         }
+        /* A backend that has not answered yet must not erase a size that is
+         * already known: the capture task keeps polling and will publish the new
+         * one when it has it, so ignoring this read loses nothing. */
+        if size.is_none() && self.screen_size.is_some() {
+            return;
+        }
         self.screen_size = size;
         match size {
             Some((width, height)) => log::info!("reachable screen area is {width}x{height}"),
-            None => log::debug!("the capture backend reports no screen geometry"),
+            None => log::debug!("the capture backend reports no screen geometry yet"),
         }
         crate::sysinfo::set_screen_size(size);
         for handle in self.client_manager.active_clients() {
             self.capture.request_peer_info(handle);
         }
+        /* The frontend does not need a separate notification: `publish_runtime`
+         * calls this function and then broadcasts, and it runs on the one-second
+         * tick, so an open canvas picks the size up on the next tick. Calling
+         * `publish_runtime` from here would recurse into it. */
     }
 
     fn publish_runtime(&mut self) {
