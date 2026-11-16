@@ -4,6 +4,11 @@ pub mod edge;
 pub mod error;
 pub mod scancode;
 
+// The edge a client is reached through travels with the event types: capture
+// backends, the daemon and the frontends all need it, so it is not buried in
+// the module.
+pub use edge::EdgeRange;
+
 #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
 mod libei;
 

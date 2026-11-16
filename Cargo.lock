@@ -1771,6 +1771,7 @@ name = "lan-mouse-ipc"
 version = "0.3.0"
 dependencies = [
  "futures",
+ "input-event",
  "log",
  "serde",
  "serde_json",

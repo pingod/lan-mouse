@@ -16,6 +16,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+// Frontends talk about edge ranges through `ClientConfig` and the requests
+// below, so the type is re-exported: a frontend only needs this crate.
+pub use input_event::edge::EdgeRange;
+
 mod connect;
 mod connect_async;
 mod listen;
@@ -142,6 +146,26 @@ pub struct ClientConfig {
     pub cmd: Option<String>,
     /// leave hook
     pub leave_cmd: Option<String>,
+    /// segment of the local edge the pointer crosses to reach this client
+    ///
+    /// Several clients may share one edge as long as their ranges are disjoint;
+    /// a crossing outside every range hits a wall. [`EdgeRange::FULL`] is what
+    /// a client had before ranges existed, and what an older configuration
+    /// without the key decodes to.
+    #[serde(default = "full_edge")]
+    pub edge: EdgeRange,
+    /// segment of this client's facing edge the cursor lands in
+    ///
+    /// The crossing point is mapped from [`Self::edge`] onto this range, the way
+    /// Synergy maps a link's source interval onto its destination interval, so
+    /// two screens of different sizes keep the cursor where the user left it.
+    #[serde(default = "full_edge")]
+    pub peer_edge: EdgeRange,
+}
+
+/// The whole edge, for messages written by a frontend that predates edge ranges.
+fn full_edge() -> EdgeRange {
+    EdgeRange::FULL
 }
 
 impl Default for ClientConfig {
@@ -153,6 +177,8 @@ impl Default for ClientConfig {
             pos: Default::default(),
             cmd: None,
             leave_cmd: None,
+            edge: EdgeRange::FULL,
+            peer_edge: EdgeRange::FULL,
         }
     }
 }
@@ -229,6 +255,16 @@ pub enum FrontendEvent {
     Paused(bool),
     /// periodic restart interval in seconds, `None` when disabled
     RestartInterval(Option<u64>),
+    /// one or more edge ranges were narrowed because several clients claim the
+    /// same part of an edge; the message says which and what is in effect
+    ///
+    /// Synergy refuses to save such a configuration at all ("overlapping
+    /// range"). lan-mouse keeps every client reachable by letting the earlier
+    /// one win and reporting the result, because the arrangement canvas and the
+    /// config file are edited independently here.
+    EdgeConflict(String),
+    /// current edge-crossing thresholds
+    SwitchOptions(SwitchOptions),
     /// the active log level
     LogLevel(String),
     /// buffered log records, oldest first
@@ -308,6 +344,12 @@ pub enum FrontendRequest {
         enter_hook: Option<String>,
         /// command to run when the pointer leaves this client
         leave_hook: Option<String>,
+        /// segment of the local edge the pointer crosses to reach it
+        #[serde(default = "full_edge")]
+        edge: EdgeRange,
+        /// segment of the client's facing edge the cursor lands in
+        #[serde(default = "full_edge")]
+        peer_edge: EdgeRange,
     },
     /// change the listen port (recreate udp listener)
     ChangePort(u16),
@@ -323,6 +365,24 @@ pub enum FrontendRequest {
     UpdatePort(ClientHandle, u16),
     /// update position
     UpdatePosition(ClientHandle, Position),
+    /// set both edge ranges of one client at once
+    ///
+    /// The two ranges describe one link and are always edited together (the
+    /// arrangement canvas drags them as one rectangle), so a single request is
+    /// used: sending [`FrontendRequest::UpdatePosition`] and then two range
+    /// updates would broadcast half-saved states to every frontend.
+    ///
+    /// The daemon resolves overlaps against the other clients on that edge, so
+    /// the range that ends up in effect can be narrower than the one requested;
+    /// it reports that with [`FrontendEvent::EdgeConflict`].
+    UpdateEdge {
+        /// the client whose link is edited
+        handle: ClientHandle,
+        /// segment of the local edge the pointer crosses to reach it
+        edge: EdgeRange,
+        /// segment of the client's facing edge the cursor lands in
+        peer_edge: EdgeRange,
+    },
     /// update fix-ips
     UpdateFixIps(ClientHandle, Vec<IpAddr>),
     /// request reenabling input capture
@@ -387,6 +447,10 @@ pub enum FrontendRequest {
     SetRestartInterval(Option<u64>),
     /// request the pause state and restart schedule
     EnumerateServiceState,
+    /// replace the edge-crossing thresholds
+    SetSwitchOptions(SwitchOptions),
+    /// request the current edge-crossing thresholds
+    EnumerateSwitchOptions,
     /// release the pointer from whatever client currently holds it
     ForceRelease,
     /// hand control to the next client (or back to this machine)
@@ -399,6 +463,78 @@ pub enum FrontendRequest {
     SubscribeLogs(Option<usize>),
     /// re-ask a peer for its machine details
     RefreshPeerInfo(ClientHandle),
+}
+
+/// How close to an edge the pointer has to behave before it may cross.
+///
+/// These are the parts of Synergy's `section: options` that lan-mouse can
+/// implement from a crossing alone: a hit can require a second hit, and the
+/// corners can be blocked. `switchDelay` cannot be expressed because a barrier
+/// reports the crossing rather than the dwell, and the `switchNeedsShift` /
+/// `switchNeedsControl` / `switchNeedsAlt` family cannot be read on Wayland,
+/// where the compositor does not expose the modifiers of a pointer this process
+/// does not own.
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub struct SwitchOptions {
+    /// milliseconds within which the same edge has to be hit twice; `0` lets a
+    /// single crossing through
+    ///
+    /// This is Synergy's `switchDoubleTap`. Its `switchDelay` has no lan-mouse
+    /// equivalent: a delay needs to watch the pointer *dwell* on the edge, and a
+    /// barrier reports only the crossing - once it fires the pointer is already
+    /// gone, so there is nothing to wait for.
+    #[serde(default)]
+    pub double_tap_ms: u32,
+    /// radius in pixels of the corners the pointer may not leave through;
+    /// `0` disables the corners
+    #[serde(default)]
+    pub corner_size: u32,
+    /// which corners are blocked; empty when none are
+    #[serde(default)]
+    pub corners: Vec<SwitchCorner>,
+}
+
+/// A corner of the reachable screen area.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SwitchCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+impl SwitchCorner {
+    /// The spelling used in the config file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SwitchCorner::TopLeft => "top-left",
+            SwitchCorner::TopRight => "top-right",
+            SwitchCorner::BottomLeft => "bottom-left",
+            SwitchCorner::BottomRight => "bottom-right",
+        }
+    }
+}
+
+impl std::str::FromStr for SwitchCorner {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "top-left" => Ok(SwitchCorner::TopLeft),
+            "top-right" => Ok(SwitchCorner::TopRight),
+            "bottom-left" => Ok(SwitchCorner::BottomLeft),
+            "bottom-right" => Ok(SwitchCorner::BottomRight),
+            other => Err(format!("not a corner: `{other}`")),
+        }
+    }
+}
+
+impl SwitchOptions {
+    /// Whether no threshold is active, for logging and for the frontend hint.
+    pub fn has_no_thresholds(&self) -> bool {
+        self.double_tap_ms == 0 && self.corner_size == 0
+    }
 }
 
 /// Live state of the running service.
@@ -431,6 +567,14 @@ pub struct RuntimeInfo {
     pub outbound: usize,
     /// best round-trip time across peers, in milliseconds; 0 when unknown
     pub best_rtt_ms: u32,
+    /// width of the reachable screen area in pixels; 0 when the backend does
+    /// not report one. The arrangement canvas needs it to draw the local screen
+    /// to scale, which is what makes an edge range mean something visually.
+    #[serde(default)]
+    pub screen_width: u32,
+    /// height of the reachable screen area in pixels; 0 when unknown
+    #[serde(default)]
+    pub screen_height: u32,
 }
 
 /// One device currently driving (or allowed to drive) this machine.
@@ -536,4 +680,115 @@ pub fn is_service_running() -> bool {
 #[cfg(windows)]
 pub fn is_service_running() -> bool {
     std::net::TcpStream::connect("127.0.0.1:5252").is_ok()
+}
+
+#[cfg(test)]
+mod serialization_tests {
+    use super::*;
+
+    /// A `ClientConfig` written by a frontend that predates edge ranges must
+    /// still decode: both ranges fall back to the whole edge, which is exactly
+    /// the behaviour that frontend expected.
+    #[test]
+    fn client_config_without_edge_ranges_still_decodes() {
+        let json = r#"{"hostname":"iridium","fix_ips":[],"port":4242,"pos":"right","cmd":null,"leave_cmd":null}"#;
+        let config: ClientConfig = serde_json::from_str(json).expect("decode");
+        assert_eq!(config.edge, EdgeRange::FULL);
+        assert_eq!(config.peer_edge, EdgeRange::FULL);
+    }
+
+    #[test]
+    fn edge_ranges_round_trip() {
+        let config = ClientConfig {
+            edge: EdgeRange::from_fractions(0.5, 1.0).expect("range"),
+            peer_edge: EdgeRange::from_fractions(0.0, 0.25).expect("range"),
+            ..ClientConfig::default()
+        };
+        let json = serde_json::to_string(&config).expect("encode");
+        let back: ClientConfig = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back, config);
+        assert!(json.contains("[0.5,1.0]"), "{json}");
+    }
+
+    /// The daemon matches on these; a request from an older CLI has to decode
+    /// with the full edge rather than being rejected.
+    #[test]
+    fn create_client_without_edge_ranges_still_decodes() {
+        let json = r#"{"CreateClient":{"hostname":"a","port":4242,"position":"left","fix_ips":[],"enter_hook":null,"leave_hook":null}}"#;
+        let request: FrontendRequest = serde_json::from_str(json).expect("decode");
+        let FrontendRequest::CreateClient {
+            edge, peer_edge, ..
+        } = request
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(edge, EdgeRange::FULL);
+        assert_eq!(peer_edge, EdgeRange::FULL);
+    }
+
+    #[test]
+    fn update_edge_round_trips() {
+        let request = FrontendRequest::UpdateEdge {
+            handle: 7,
+            edge: EdgeRange::from_fractions(0.0, 0.4).expect("range"),
+            peer_edge: EdgeRange::from_fractions(0.6, 1.0).expect("range"),
+        };
+        let json = serde_json::to_string(&request).expect("encode");
+        let back: FrontendRequest = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back, request);
+    }
+
+    /// A `RuntimeInfo` from an older service has no screen geometry; the canvas
+    /// falls back to equal-sized cards rather than failing to decode.
+    #[test]
+    fn runtime_info_without_screen_size_still_decodes() {
+        let json = r#"{
+            "capture_backend": "libei",
+            "emulation_backend": "wlroots",
+            "capture_alive": true,
+            "emulation_alive": true,
+            "capturing": false,
+            "capturing_peer": "",
+            "port": 4242,
+            "uptime_secs": 3,
+            "paused": false,
+            "inbound": 0,
+            "outbound": 1,
+            "best_rtt_ms": 4
+        }"#;
+        let back: RuntimeInfo =
+            serde_json::from_str(json).unwrap_or_else(|e| panic!("could not decode: {e}"));
+        assert_eq!(back.screen_width, 0);
+        assert_eq!(back.screen_height, 0);
+        assert_eq!(back.port, 4242);
+    }
+
+    #[test]
+    fn switch_options_round_trip_and_defaults() {
+        let json = r#"{"double_tap_ms":250}"#;
+        let options: SwitchOptions = serde_json::from_str(json).expect("decode");
+        assert_eq!(options.double_tap_ms, 250);
+        assert_eq!(options.corner_size, 0);
+        assert!(options.corners.is_empty());
+        let encoded = serde_json::to_string(&options).expect("encode");
+        let back: SwitchOptions = serde_json::from_str(&encoded).expect("re-decode");
+        assert_eq!(back, options);
+    }
+
+    #[test]
+    fn switch_corners_use_the_config_spelling() {
+        let corner: SwitchCorner = "top-right".parse().expect("parse");
+        assert_eq!(corner, SwitchCorner::TopRight);
+        assert_eq!(corner.as_str(), "top-right");
+        assert!("middle".parse::<SwitchCorner>().is_err());
+        let json = serde_json::to_string(&vec![SwitchCorner::BottomLeft]).expect("encode");
+        assert_eq!(json, r#"["bottom-left"]"#);
+    }
+
+    #[test]
+    fn default_config_has_the_whole_edge() {
+        assert_eq!(ClientConfig::default().edge, EdgeRange::FULL);
+        assert_eq!(ClientConfig::default().peer_edge, EdgeRange::FULL);
+        assert!(SwitchOptions::default().has_no_thresholds());
+    }
 }

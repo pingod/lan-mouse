@@ -9,6 +9,9 @@ repository = "https://github.com/feschber/lan-mouse"
 [dependencies]
 futures = "0.3.30"
 log = "0.4.22"
+# `EdgeRange` lives in input-event, the one crate both the daemon and the
+# frontends already share for event types
+input-event = { path = "../input-event", version = "0.4.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.107"
 thiserror = "2.0.0"
