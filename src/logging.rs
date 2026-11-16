@@ -268,10 +268,10 @@ fn from_local_zone(secs: u64) -> Option<(u32, u32, u32)> {
 
 #[cfg(windows)]
 fn from_local_zone(secs: u64) -> Option<(u32, u32, u32)> {
-    use windows::Win32::Foundation::FILETIME;
-    use windows::Win32::System::Time::{
-        FileTimeToSystemTime, SYSTEMTIME, SystemTimeToTzSpecificLocalTime,
-    };
+    /* `SYSTEMTIME` lives in `Foundation` in the `windows` crate even though the
+     * conversion functions are in `System::Time`. */
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 
     // 100-nanosecond intervals between 1601-01-01 and 1970-01-01.
     const EPOCH_DIFFERENCE: u64 = 11_644_473_600;

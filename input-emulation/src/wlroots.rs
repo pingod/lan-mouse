@@ -177,7 +177,12 @@ impl State {
         let keyboard = match self.keyboard.as_ref() {
             Some(keyboard) => keyboard.clone(),
             None => {
-                // TODO: use server side keymap
+                /* A `zwp_virtual_keyboard_v1` must upload its own keymap: the
+                 * protocol has no way to borrow the compositor's, so a key that
+                 * the shipped keymap does not know cannot be emulated. The
+                 * keymap comes from the seat's `wl_keyboard.keymap` event, which
+                 * is the compositor's active layout, so in practice this matches
+                 * what the user has configured. */
                 let Some((format, fd, size)) = self.keymap.as_ref() else {
                     log::error!("cannot create virtual keyboard: no keymap available");
                     return;
