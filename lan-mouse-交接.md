@@ -55,6 +55,10 @@ Windows 目前仍是空实现（`noop`）。
 | Mac 上媒体键（音量旋钮、静音）无反应 | 媒体键必须发 `NSEventTypeSystemDefined` 事件，普通 CGEvent 键盘事件被窗口服务器忽略 |
 | 并发 `add-client` 出现 `unknown:4242` | `Create` 后的 `Update*` 应答会广播给所有前端，两个前端互相改错 handle → 改为 `CreateClient` 原子创建 |
 | 删掉最后一个客户端又自己复活 | 空列表时提前返回，配置没落盘，watch 回灌旧列表 |
+| 跨屏后指针位置偏移（左上出、右下进） | 接收端只有相对 motion，没人放光标 → `Enter` 带上"沿边分数"，接收端用 `motion_absolute`/`XWarpPointer`/`CGWarpMouseCursorPosition` 定位 |
+| 首次跨屏仍然偏移 | 放置光标时对端还没发过输入，虚拟指针尚未创建 → `enter(handle, ..)` 先按需 `create` |
+| macOS 媒体旋钮只影响本机 | 媒体键是 `NSEventTypeSystemDefined`，不在 tap 订阅里 → 订阅并在捕获时转发后 `Drop` |
+| 小键盘不工作、NumLock 关不掉 | 捕获路径又发 key 又发显式 modifiers，锁键被 toggle 两次且 locked 被覆盖 → 只发键事件，状态交给合成器 keymap |
 | 换显示器后 barrier 不重建（#512） | `zones_changed` 触发时整会话重建，`update_barriers` 随之执行 |
 | macOS 上全局热键完全不生效 | `hotkey_task` 只有 Linux evdev 实现，其余平台是 `noop`（`next()` 永远 pending）→ 增加 Quartz 被动事件 tap |
 | 热键组合键改不了 | GUI 只能增删 → 新增 `UpdateHotkey` / 行内编辑按钮 |
