@@ -321,8 +321,8 @@ mod imp_macos {
     use core_foundation::base::TCFType;
     use core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes};
     use core_graphics::event::{
-        CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
-        CallbackResult, EventField,
+        CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+        CGEventType, CallbackResult, EventField,
     };
     use keycode::{KeyMap, KeyMapping};
     use tokio::sync::mpsc;
@@ -393,6 +393,48 @@ mod imp_macos {
 
     /// Convert a macOS virtual key code into the evdev code the matching logic
     /// and the wire protocol use.
+    /// evdev key codes of the modifiers we track, with the flag that reports
+    /// them. Only the left variants exist on the wire: `HotkeyState` matches
+    /// either side, and macOS reports both with the same flag.
+    const MODIFIER_KEYS: [(u64, u32); 4] = [
+        (CGEventFlags::CGEventFlagShift.bits(), 42), // KeyLeftShift
+        (CGEventFlags::CGEventFlagControl.bits(), 29), // KeyLeftCtrl
+        (CGEventFlags::CGEventFlagAlternate.bits(), 56), // KeyLeftAlt
+        (CGEventFlags::CGEventFlagCommand.bits(), 125), // KeyLeftMeta
+    ];
+
+    fn is_modifier(key: u32) -> bool {
+        MODIFIER_KEYS.iter().any(|(_, modifier)| *modifier == key)
+    }
+
+    /// Emit press/release samples for every modifier whose state changed.
+    fn sync_modifiers(
+        event: &core_graphics::event::CGEvent,
+        held: &RefCell<HashSet<u32>>,
+        key_tx: &mpsc::UnboundedSender<KeySample>,
+    ) {
+        let flags = event.get_flags().bits();
+        let Ok(mut held) = held.try_borrow_mut() else {
+            return;
+        };
+        for (mask, key) in MODIFIER_KEYS {
+            let is_down = flags & mask != 0;
+            match (is_down, held.contains(&key)) {
+                (true, false) => {
+                    held.insert(key);
+                    log::trace!("hotkeys: sample {key} 1");
+                    let _ = key_tx.send(KeySample { key, value: 1 });
+                }
+                (false, true) => {
+                    held.remove(&key);
+                    log::trace!("hotkeys: sample {key} 0");
+                    let _ = key_tx.send(KeySample { key, value: 0 });
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn evdev_key(keycode: u16) -> Option<u32> {
         match KeyMap::from_key_mapping(KeyMapping::Mac(keycode)) {
             Ok(map) => Some(u32::from(map.evdev)),
@@ -413,9 +455,9 @@ mod imp_macos {
     }
 
     fn run_tap(key_tx: mpsc::UnboundedSender<KeySample>) {
-        // Modifier keys arrive as `FlagsChanged` without a press/release flag,
-        // so remember which of them we last reported as held.
-        let held: RefCell<HashSet<u16>> = RefCell::new(HashSet::new());
+        // Modifiers we last reported as held, so a change in the event flags
+        // can be turned into press/release samples.
+        let held: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
         // Mach port of the tap, for re-enabling it from inside the callback.
         let tap_port: Arc<OnceLock<usize>> = Arc::new(OnceLock::new());
         let tap_port_cb = Arc::clone(&tap_port);
@@ -435,10 +477,18 @@ mod imp_macos {
             // kernel disables the tap (and `panic = "abort"` kills the daemon).
             log::trace!("hotkeys: tap event {event_type:?}");
             match event_type {
-                CGEventType::KeyDown | CGEventType::KeyUp => {
+                CGEventType::KeyDown | CGEventType::KeyUp | CGEventType::FlagsChanged => {
                     if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
                         == INJECTED_EVENT_TAG
                     {
+                        return CallbackResult::Keep;
+                    }
+                    // Modifiers come from the event flags rather than from the
+                    // `FlagsChanged` key codes: the flags are set correctly on
+                    // every key event (also for synthesized ones) and they tell
+                    // press and release apart, which `FlagsChanged` does not.
+                    sync_modifiers(event, &held, &key_tx);
+                    if matches!(event_type, CGEventType::FlagsChanged) {
                         return CallbackResult::Keep;
                     }
                     let keycode =
@@ -447,6 +497,10 @@ mod imp_macos {
                         log::trace!("hotkeys: ignoring unmapped keycode {keycode}");
                         return CallbackResult::Keep;
                     };
+                    // a modifier key event is already covered by the flags
+                    if is_modifier(key) {
+                        return CallbackResult::Keep;
+                    }
                     let value = if matches!(event_type, CGEventType::KeyDown) {
                         // 1 is a press, 2 is autorepeat; only a press fires.
                         if event.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT) != 0
@@ -457,32 +511,6 @@ mod imp_macos {
                         }
                     } else {
                         0
-                    };
-                    log::trace!("hotkeys: sample {key} {value}");
-                    let _ = key_tx.send(KeySample { key, value });
-                }
-                CGEventType::FlagsChanged => {
-                    if event.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA)
-                        == INJECTED_EVENT_TAG
-                    {
-                        return CallbackResult::Keep;
-                    }
-                    let keycode =
-                        event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
-                    let Some(key) = evdev_key(keycode) else {
-                        log::trace!("hotkeys: ignoring unmapped keycode {keycode}");
-                        return CallbackResult::Keep;
-                    };
-                    let value = match held.try_borrow_mut() {
-                        Ok(mut held) => {
-                            if held.remove(&keycode) {
-                                0
-                            } else {
-                                held.insert(keycode);
-                                1
-                            }
-                        }
-                        Err(_) => return CallbackResult::Keep,
                     };
                     log::trace!("hotkeys: sample {key} {value}");
                     let _ = key_tx.send(KeySample { key, value });
@@ -529,6 +557,9 @@ mod imp_macos {
                 }
                 // The port is needed by the callback to undo a timeout disable.
                 let _ = tap_port.set(tap.mach_port().as_concrete_TypeRef() as usize);
+                // `CGEventTap::new` leaves the tap disabled: without this it
+                // never delivers a single event.
+                tap.enable();
                 log::info!("hotkeys: listening on the macOS event tap");
                 // `tap` must outlive the loop: dropping it invalidates the port.
                 CFRunLoop::run_current();
