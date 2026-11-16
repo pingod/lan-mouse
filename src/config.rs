@@ -17,7 +17,7 @@ use toml;
 use toml_edit::{self, DocumentMut, Item};
 
 use lan_mouse_cli::CliArgs;
-use lan_mouse_ipc::{DEFAULT_PORT, Position};
+use lan_mouse_ipc::{DEFAULT_PORT, EdgeRange, Position, SwitchCorner, SwitchOptions};
 
 use input_event::scancode::{
     self,
@@ -78,6 +78,12 @@ struct ConfigToml {
     hotkey: Option<Vec<TomlHotkey>>,
     /// restart the service every N seconds; `None` disables it
     restart_interval: Option<u64>,
+    /// milliseconds within which the edge has to be hit twice
+    switch_double_tap: Option<u32>,
+    /// radius in pixels of the blocked corners
+    switch_corner_size: Option<u32>,
+    /// corners the pointer may not leave the screen through
+    switch_corners: Option<Vec<SwitchCorner>>,
 }
 
 /// A global hotkey: pressing `from` while typing locally sends `to` to the peer.
@@ -124,6 +130,15 @@ struct TomlClient {
     activate_on_startup: Option<bool>,
     enter_hook: Option<String>,
     leave_hook: Option<String>,
+    /// segment of the local edge this client is reached through
+    ///
+    /// Written as `[start, end]` fractions of the edge, the way Synergy writes
+    /// `right(0,60) = other`. Absent means the whole edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    edge: Option<EdgeRange>,
+    /// segment of this client's facing edge the cursor lands in
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    peer_edge: Option<EdgeRange>,
 }
 
 impl ConfigToml {
@@ -369,6 +384,7 @@ pub struct Config {
     watch_rx: tokio::sync::mpsc::Receiver<Result<notify::Event, notify::Error>>,
 }
 
+#[derive(Clone, Debug)]
 pub struct ConfigClient {
     pub ips: HashSet<IpAddr>,
     pub hostname: Option<String>,
@@ -377,6 +393,10 @@ pub struct ConfigClient {
     pub active: bool,
     pub enter_hook: Option<String>,
     pub leave_hook: Option<String>,
+    /// segment of the local edge this client is reached through
+    pub edge: EdgeRange,
+    /// segment of this client's facing edge the cursor lands in
+    pub peer_edge: EdgeRange,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -396,6 +416,8 @@ impl From<TomlClient> for ConfigClient {
             active,
             enter_hook,
             leave_hook,
+            edge: toml.edge.unwrap_or(EdgeRange::FULL),
+            peer_edge: toml.peer_edge.unwrap_or(EdgeRange::FULL),
         }
     }
 }
@@ -416,6 +438,11 @@ impl From<ConfigClient> for TomlClient {
         let activate_on_startup = if client.active { Some(true) } else { None };
         let enter_hook = client.enter_hook;
         let leave_hook = client.leave_hook;
+        /* the whole edge is what every client had before ranges existed, so it
+         * is not written: a config file only carries what the user chose
+         */
+        let edge = (client.edge != EdgeRange::FULL).then_some(client.edge);
+        let peer_edge = (client.peer_edge != EdgeRange::FULL).then_some(client.peer_edge);
         Self {
             hostname,
             host_name,
@@ -425,6 +452,8 @@ impl From<ConfigClient> for TomlClient {
             activate_on_startup,
             enter_hook,
             leave_hook,
+            edge,
+            peer_edge,
         }
     }
 }
@@ -592,6 +621,35 @@ impl Config {
             .port
             .or(self.config_toml.as_ref().and_then(|c| c.port))
             .unwrap_or(DEFAULT_PORT)
+    }
+
+    /// Edge-crossing thresholds: how close to an edge the pointer has to behave
+    /// before it may cross to a peer.
+    ///
+    /// The lan-mouse equivalent of Synergy's `switchDelay`, `switchDoubleTap`,
+    /// `switchCornerSize` and `switchCorners`. They are read once at startup and
+    /// replaced at runtime when a frontend edits them.
+    pub fn switch_options(&self) -> SwitchOptions {
+        let toml = self.config_toml.as_ref();
+        SwitchOptions {
+            double_tap_ms: toml.and_then(|c| c.switch_double_tap).unwrap_or(0),
+            corner_size: toml.and_then(|c| c.switch_corner_size).unwrap_or(0),
+            corners: toml
+                .and_then(|c| c.switch_corners.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Store the edge-crossing thresholds.
+    ///
+    /// A value of `0` is written as absent rather than as `switch_delay = 0`:
+    /// the keys are opt-in, and a config file full of zeros would look like the
+    /// user had tuned them.
+    pub fn set_switch_options(&mut self, options: &SwitchOptions) {
+        let config = self.toml_mut();
+        config.switch_double_tap = (options.double_tap_ms > 0).then_some(options.double_tap_ms);
+        config.switch_corner_size = (options.corner_size > 0).then_some(options.corner_size);
+        config.switch_corners = (!options.corners.is_empty()).then(|| options.corners.clone());
     }
 
     /// list of configured clients
@@ -911,5 +969,154 @@ to = ["KeyS"]
         let out = toml_edit::ser::to_string_pretty(&config).expect("serialize");
         let parsed: ConfigToml = toml::from_str(&out).expect("reparse");
         assert_eq!(parsed, config);
+    }
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+
+    fn parse(text: &str) -> ConfigToml {
+        toml::from_str(text).expect("valid config")
+    }
+
+    fn client(toml: &ConfigToml) -> ConfigClient {
+        ConfigClient::from(toml.clients.clone().expect("clients")[0].clone())
+    }
+
+    fn config_client(edge: EdgeRange, peer_edge: EdgeRange) -> ConfigClient {
+        ConfigClient {
+            ips: HashSet::new(),
+            hostname: Some("a".to_owned()),
+            port: DEFAULT_PORT,
+            pos: Position::Right,
+            active: false,
+            enter_hook: None,
+            leave_hook: None,
+            edge,
+            peer_edge,
+        }
+    }
+
+    /// A client written before edge ranges existed keeps the whole edge, which is
+    /// exactly the behaviour that file produced.
+    #[test]
+    fn a_client_without_edge_keys_gets_the_whole_edge() {
+        let config = parse("[[clients]]\nhostname = \"iridium\"\nposition = \"right\"\n");
+        let raw = config.clients.as_ref().unwrap()[0].clone();
+        assert_eq!(raw.edge, None);
+        assert_eq!(raw.peer_edge, None);
+        let client = ConfigClient::from(raw);
+        assert_eq!(client.edge, EdgeRange::FULL);
+        assert_eq!(client.peer_edge, EdgeRange::FULL);
+    }
+
+    #[test]
+    fn edge_ranges_are_read_as_fractions_of_the_edge() {
+        let config = parse(
+            "[[clients]]\nhostname = \"a\"\nposition = \"right\"\nedge = [0.0, 0.6]\npeer_edge = [0.4, 1.0]\n",
+        );
+        let client = client(&config);
+        assert_eq!(client.edge.fractions(), [0.0, 0.6]);
+        assert_eq!(client.peer_edge.fractions(), [0.4, 1.0]);
+    }
+
+    fn write(client: &ConfigClient) -> String {
+        let config = ConfigToml {
+            clients: Some(vec![TomlClient::from(client.clone())]),
+            ..ConfigToml::default()
+        };
+        toml_edit::ser::to_string_pretty(&config).expect("serialize")
+    }
+
+    fn read(text: &str) -> ConfigClient {
+        ConfigClient::from(parse(text).clients.expect("clients")[0].clone())
+    }
+
+    /// Only what the user chose is written: a client that covers a whole edge
+    /// must not gain two keys, or every existing config file would grow noise the
+    /// first time the daemon saved it.
+    #[test]
+    fn a_full_edge_is_not_written_out() {
+        let text = write(&config_client(EdgeRange::FULL, EdgeRange::FULL));
+        assert!(!text.contains("edge"), "{text}");
+
+        let half = EdgeRange::from_fractions(0.5, 1.0).expect("range");
+        let text = write(&config_client(half, EdgeRange::FULL));
+        assert!(text.contains("edge = ["), "{text}");
+        assert!(text.contains("0.5") && text.contains("1.0"), "{text}");
+        assert!(!text.contains("peer_edge"), "{text}");
+    }
+
+    #[test]
+    fn edge_ranges_round_trip_through_toml() {
+        let client = config_client(
+            EdgeRange::from_fractions(0.225, 0.75).expect("range"),
+            EdgeRange::from_fractions(0.0, 0.5).expect("range"),
+        );
+        let back = read(&write(&client));
+        assert_eq!(back.edge, client.edge);
+        assert_eq!(back.peer_edge, client.peer_edge);
+        assert_eq!(back.hostname, client.hostname);
+        assert_eq!(back.pos, client.pos);
+    }
+
+    #[test]
+    fn an_invalid_edge_range_is_rejected_not_guessed() {
+        let error =
+            toml::from_str::<ConfigToml>("[[clients]]\nhostname = \"a\"\nedge = [0.6, 0.4]\n")
+                .expect_err("an empty range must not parse");
+        assert!(error.to_string().contains("empty"), "{error}");
+        let error =
+            toml::from_str::<ConfigToml>("[[clients]]\nhostname = \"a\"\nedge = [0.0, 1.5]\n")
+                .expect_err("an out of bounds range must not parse");
+        assert!(error.to_string().contains("outside"), "{error}");
+    }
+
+    #[test]
+    fn switch_options_are_read_and_only_written_when_set() {
+        let config = parse(
+            "switch_double_tap = 250\nswitch_corner_size = 40\nswitch_corners = [\"top-left\"]\n",
+        );
+        assert_eq!(config.switch_double_tap, Some(250));
+        assert_eq!(config.switch_corner_size, Some(40));
+        assert_eq!(
+            config.switch_corners.as_ref().unwrap(),
+            &vec![SwitchCorner::TopLeft]
+        );
+
+        let text = toml_edit::ser::to_string_pretty(&config).expect("toml");
+        assert!(text.contains("switch_double_tap = 250"), "{text}");
+        assert!(text.contains("\"top-left\""), "{text}");
+
+        let empty = ConfigToml::default();
+        let text = toml_edit::ser::to_string_pretty(&empty).expect("toml");
+        assert!(!text.contains("switch_"), "{text}");
+    }
+
+    #[test]
+    fn a_config_without_switch_options_has_none() {
+        let config: ConfigToml = toml::from_str("port = 4242").expect("valid config");
+        assert_eq!(config.switch_double_tap, None);
+        assert!(config.switch_corners.is_none());
+    }
+
+    #[test]
+    fn switch_options_round_trip_through_toml() {
+        let options = SwitchOptions {
+            double_tap_ms: 120,
+            corner_size: 30,
+            corners: vec![SwitchCorner::BottomRight, SwitchCorner::TopLeft],
+        };
+        let config = ConfigToml {
+            switch_double_tap: (options.double_tap_ms > 0).then_some(options.double_tap_ms),
+            switch_corner_size: (options.corner_size > 0).then_some(options.corner_size),
+            switch_corners: (!options.corners.is_empty()).then(|| options.corners.clone()),
+            ..ConfigToml::default()
+        };
+        let text = toml_edit::ser::to_string_pretty(&config).expect("toml");
+        let back = parse(&text);
+        assert_eq!(back.switch_double_tap, Some(120));
+        assert_eq!(back.switch_corners, Some(options.corners));
     }
 }
