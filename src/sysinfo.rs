@@ -336,6 +336,38 @@ mod tests {
         assert!(!info.get(info_slot::OS).is_empty());
     }
 
+    /// The display slot is what a peer reads this machine's screen size out of,
+    /// so what goes on the wire has to be parseable by `parse_screen_size`.
+    ///
+    /// This is the join between the two halves of the feature: `set_screen_size`
+    /// writes the slot, `flatten` copies it into the peer report, and the canvas
+    /// on the other end parses it back into pixels.
+    #[test]
+    fn the_display_slot_round_trips_through_the_peer_report() {
+        set_screen_size(Some((2560, 1440)));
+
+        let report = flatten(&local());
+        assert_eq!(report.displays, "2560x1440");
+        assert_eq!(
+            lan_mouse_ipc::parse_screen_size(&report.displays),
+            Some((2560, 1440)),
+            "the peer cannot read the size back out of {:?}",
+            report.displays
+        );
+
+        // a backend that reports nothing keeps the platform probe, which an
+        // older peer still parses
+        set_screen_size(None);
+        let report = flatten(&local());
+        if report.displays.contains('x') {
+            assert!(
+                lan_mouse_ipc::parse_screen_size(&report.displays).is_some(),
+                "the fallback report {:?} is not parseable either",
+                report.displays
+            );
+        }
+    }
+
     #[test]
     fn chunks_reassemble_to_the_original() {
         let info = PeerInfo::new([

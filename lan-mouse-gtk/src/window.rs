@@ -332,6 +332,27 @@ impl Window {
         let local_hostname = imp.hostname_label.text().to_string();
         let switch_options = imp.switch_options.borrow().clone();
         let screen_size = *imp.screen_size.borrow();
+        /* The one line that says whether the canvas has the numbers it needs. A
+         * peer that never reported a size is drawn at a derived one, which looks
+         * like a layout bug until you can see that the size was `None`. */
+        log::debug!(
+            "arrangement: local {:?} at {:?}, {} machine(s): {}",
+            local_hostname,
+            screen_size,
+            machines.len(),
+            machines
+                .iter()
+                .map(|machine| format!(
+                    "{} {:?} {:?}/{:?} size {:?}",
+                    machine.hostname,
+                    machine.position,
+                    machine.edge,
+                    machine.peer_edge,
+                    machine.peer_size
+                ))
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
 
         let mut canvas = imp.canvas.borrow_mut();
         let canvas = canvas.get_or_insert_with(|| {
