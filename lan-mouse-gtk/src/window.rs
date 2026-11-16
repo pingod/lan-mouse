@@ -360,6 +360,30 @@ impl Window {
                 .join("; "),
         );
 
+        /* The window's own log ring is per process and only readable from the
+         * window, so a headless check of what the canvas decided has nowhere to look.
+         * This writes it where a shell can see it, only when asked for by path. */
+        if let Some(path) = std::env::var_os("LAN_MOUSE_CANVAS_TRACE") {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let peer_pictures = machines
+                    .iter()
+                    .filter_map(|machine| machine.peer_picture.as_ref())
+                    .map(|picture| format!("rev {} of {}", picture.revision, picture.author))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(
+                    file,
+                    "refresh: local={local_hostname:?} machines={} peer_pictures=[{peer_pictures}]",
+                    machines.len()
+                );
+            }
+        }
+
         let mut canvas = imp.canvas.borrow_mut();
         let canvas = canvas.get_or_insert_with(|| {
             Canvas::build(

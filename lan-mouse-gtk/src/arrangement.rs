@@ -1083,12 +1083,33 @@ impl Canvas {
                  * the report rather than from the gesture so a change made with
                  * `cli set-edge` counts too. */
                 let signature = config_signature(machines);
-                if signature != state.last_signature {
+                let signature_changed = signature != state.last_signature;
+                if signature_changed {
                     state.last_signature = signature;
                     state.local_revision = now_millis();
                     state.published.clear();
                 }
                 state.machines = machines.to_vec();
+                if let Some(path) = std::env::var_os("LAN_MOUSE_CANVAS_TRACE") {
+                    use std::io::Write;
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                    {
+                        let _ = writeln!(
+                            file,
+                            "update: local_rev={} peer_pictures={} sig_changed={}",
+                            state.local_revision,
+                            state
+                                .machines
+                                .iter()
+                                .filter(|m| m.peer_picture.is_some())
+                                .count(),
+                            signature_changed,
+                        );
+                    }
+                }
                 match state.newer_peer_picture() {
                     Some(picture) => {
                         log::info!(
