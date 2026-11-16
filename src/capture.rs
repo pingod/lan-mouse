@@ -1,18 +1,21 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     rc::Rc,
     time::{Duration, Instant},
 };
 
 use futures::StreamExt;
 use input_capture::{
-    CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
+    CaptureError, CaptureEvent, CaptureHandle, EdgeRange, InputCapture, InputCaptureError, Position,
 };
 use input_event::{Event, KeyboardEvent, scancode};
 use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
+
+use lan_mouse_ipc::{SwitchCorner, SwitchOptions};
 
 use crate::connect::LanMouseConnection;
 use crate::remap::{Remap, Rule};
@@ -22,6 +25,12 @@ pub(crate) struct Capture {
     request_tx: Sender<CaptureRequest>,
     task: JoinHandle<()>,
     event_rx: Receiver<ICaptureEvent>,
+    /// size of the reachable screen area as `width << 32 | height`, `0` unknown
+    ///
+    /// Written by the capture task, which is the only component that talks to a
+    /// backend. The service reads it for the frontend, and the task reads it to
+    /// turn a corner radius in pixels into a fraction of an edge.
+    screen_size: Rc<Cell<u64>>,
     /// whether the pointer is currently captured by a remote client
     ///
     /// Updated by the capture task itself rather than derived from the
@@ -63,6 +72,22 @@ pub(crate) enum ICaptureEvent {
     ClientLeft(u64),
 }
 
+/// Pack a screen size into the shared cell. See [`Capture::screen_size`].
+fn pack_size(size: Option<(u32, u32)>) -> u64 {
+    match size {
+        Some((width, height)) if width > 0 && height > 0 => ((width as u64) << 32) | height as u64,
+        _ => 0,
+    }
+}
+
+/// Unpack the shared screen size cell.
+fn unpack_size(packed: u64) -> Option<(u32, u32)> {
+    if packed == 0 {
+        return None;
+    }
+    Some(((packed >> 32) as u32, packed as u32))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CaptureType {
     /// a normal input capture
@@ -77,8 +102,12 @@ pub(crate) enum CaptureType {
 enum CaptureRequest {
     /// capture must release the mouse
     Release,
-    /// add a capture client
-    Create(CaptureHandle, Position, CaptureType),
+    /// add a capture client reachable through the given segment of its edge
+    Create(CaptureHandle, Position, CaptureType, EdgeRange, EdgeRange),
+    /// change the segment of its edge a capture client is reached through
+    SetEdge(CaptureHandle, EdgeRange),
+    /// replace the edge-crossing thresholds
+    SetSwitchOptions(SwitchOptions),
     /// take the pointer on this capture right now, without a crossing
     Begin(CaptureHandle),
     /// destory a capture client
@@ -108,9 +137,13 @@ impl Capture {
         let (event_tx, event_rx) = channel();
         let cancellation_token = CancellationToken::new();
         let active = Rc::new(Cell::new(false));
+        let screen_size = Rc::new(Cell::new(0));
         let capture_task = CaptureTask {
             active_client: None,
             enter_fraction: 0.5,
+            switch_options: SwitchOptions::default(),
+            last_edge_hit: Default::default(),
+            screen_size: Rc::clone(&screen_size),
             backend,
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
@@ -133,6 +166,7 @@ impl Capture {
             task,
             event_rx,
             active,
+            screen_size,
         }
     }
 
@@ -173,12 +207,29 @@ impl Capture {
         handle: CaptureHandle,
         pos: lan_mouse_ipc::Position,
         capture_type: CaptureType,
+        edge: EdgeRange,
+        peer_edge: EdgeRange,
     ) {
         let pos = to_capture_pos(pos);
         send_request(
             &self.request_tx,
-            CaptureRequest::Create(handle, pos, capture_type),
+            CaptureRequest::Create(handle, pos, capture_type, edge, peer_edge),
         );
+    }
+
+    /// Change the segment of its edge a client is reached through.
+    pub(crate) fn set_edge(&self, handle: CaptureHandle, edge: EdgeRange) {
+        send_request(&self.request_tx, CaptureRequest::SetEdge(handle, edge));
+    }
+
+    /// Replace the edge-crossing thresholds.
+    pub(crate) fn set_switch_options(&self, options: SwitchOptions) {
+        send_request(&self.request_tx, CaptureRequest::SetSwitchOptions(options));
+    }
+
+    /// Size of the reachable screen area, `None` when no backend reported one.
+    pub(crate) fn screen_size(&self) -> Option<(u32, u32)> {
+        unpack_size(self.screen_size.get())
     }
 
     pub(crate) fn destroy(&self, handle: CaptureHandle) {
@@ -234,6 +285,57 @@ macro_rules! debounce {
     };
 }
 
+/// One registered capture and the part of its edge it can be reached through.
+#[derive(Clone, Copy, Debug)]
+struct CaptureEntry {
+    handle: CaptureHandle,
+    pos: Position,
+    kind: CaptureType,
+    /// the segment this client asked for
+    requested: EdgeRange,
+    /// the segment it actually gets: `None` when an earlier client on the same
+    /// edge already covers everything it asked for, which makes it unreachable
+    effective: Option<EdgeRange>,
+    /// the segment of the peer's facing edge the cursor lands in
+    peer_edge: EdgeRange,
+}
+
+impl CaptureEntry {
+    /// Where on the peer's edge its cursor has to end up.
+    ///
+    /// The crossing point is carried as a fraction of the edge, so it is first
+    /// mapped into the local segment and then onto the peer's segment - the same
+    /// two-step `transform` / `inverse_transform` Synergy applies to a link's
+    /// intervals. Without it a peer whose screen is half as tall gets the cursor
+    /// at the same fraction of its own edge, which is not where the pointer was.
+    fn peer_fraction(&self, fraction: f64) -> f64 {
+        let local = self
+            .effective
+            .unwrap_or(EdgeRange::FULL)
+            .transform(fraction);
+        self.peer_edge.inverse_transform(local)
+    }
+}
+
+impl CaptureEntry {
+    fn new(
+        handle: CaptureHandle,
+        pos: Position,
+        kind: CaptureType,
+        requested: EdgeRange,
+        peer_edge: EdgeRange,
+    ) -> Self {
+        Self {
+            handle,
+            pos,
+            kind,
+            requested,
+            effective: Some(requested),
+            peer_edge,
+        }
+    }
+}
+
 struct CaptureTask {
     active_client: Option<CaptureHandle>,
     /// where along the edge the pointer crossed when the current capture
@@ -242,7 +344,13 @@ struct CaptureTask {
     enter_fraction: f64,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
-    captures: Vec<(CaptureHandle, Position, CaptureType)>,
+    captures: Vec<CaptureEntry>,
+    /// how close to an edge the pointer has to behave before it may cross
+    switch_options: SwitchOptions,
+    /// when an edge was last hit but refused, for the double-tap requirement
+    last_edge_hit: HashMap<Position, Instant>,
+    /// size of the reachable screen area, shared with the service
+    screen_size: Rc<Cell<u64>>,
     conn: LanMouseConnection,
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
@@ -266,33 +374,184 @@ struct CaptureTask {
     center_cursor: bool,
 }
 
+/// The client a crossing at `fraction` on `pos` belongs to.
+///
+/// Only the entries whose resolved segment contains the point are candidates:
+/// `effective` is what [`EdgeRange::resolve`] handed out, so a client that was
+/// squeezed out of an overlapping range cannot steal a crossing, and a point in
+/// a gap between two segments reaches nobody - the pointer hits a wall.
+fn route(entries: &[CaptureEntry], pos: Position, fraction: f64) -> Option<CaptureHandle> {
+    entries
+        .iter()
+        .filter(|entry| entry.pos == pos && entry.kind == CaptureType::Default)
+        .find(|entry| entry.effective.is_some_and(|edge| edge.contains(fraction)))
+        .map(|entry| entry.handle)
+}
+
+/// Whether a crossing of `pos` at `fraction` is inside a blocked corner.
+///
+/// The corner radius is given in pixels and the crossing point only as a
+/// fraction of the edge, so the screen size is needed to compare them; without a
+/// size the corners cannot be located and are not enforced.
+fn in_blocked_corner(
+    options: &SwitchOptions,
+    size: Option<(u32, u32)>,
+    pos: Position,
+    fraction: f64,
+) -> bool {
+    if options.corner_size == 0 || options.corners.is_empty() {
+        return false;
+    }
+    let Some((width, height)) = size else {
+        return false;
+    };
+    let radius = options.corner_size as f64;
+    /* the point the pointer crossed, in screen coordinates */
+    let (x, y) = match pos {
+        Position::Left => (0.0, fraction * height as f64),
+        Position::Right => (width as f64, fraction * height as f64),
+        Position::Top => (fraction * width as f64, 0.0),
+        Position::Bottom => (fraction * width as f64, height as f64),
+    };
+    let left = x <= radius;
+    let right = x >= width as f64 - radius;
+    let top = y <= radius;
+    let bottom = y >= height as f64 - radius;
+    [
+        (left && top, SwitchCorner::TopLeft),
+        (right && top, SwitchCorner::TopRight),
+        (left && bottom, SwitchCorner::BottomLeft),
+        (right && bottom, SwitchCorner::BottomRight),
+    ]
+    .into_iter()
+    .any(|(hit, corner)| hit && options.corners.contains(&corner))
+}
+
 impl CaptureTask {
-    fn add_capture(&mut self, handle: CaptureHandle, pos: Position, capture_type: CaptureType) {
-        self.captures.push((handle, pos, capture_type));
+    fn add_capture(&mut self, entry: CaptureEntry) {
+        self.captures.push(entry);
+    }
+
+    /// Log when a client cannot reach the edge it was configured for.
+    ///
+    /// The ranges of an edge are resolved in client order, so a later client
+    /// whose range is already taken ends up with nothing. That is invisible in
+    /// the UI unless it is reported, and the pointer simply never goes there.
+    fn report_unreachable(&self, handle: CaptureHandle, pos: Position) {
+        let Some(entry) = self.entry(handle) else {
+            return;
+        };
+        if entry.effective == Some(entry.requested) {
+            return;
+        }
+        match entry.effective {
+            Some(effective) => log::warn!(
+                "client {handle} asked for {} on the {pos} edge, only {effective} is free",
+                entry.requested
+            ),
+            None => log::warn!(
+                "client {handle} cannot be reached on the {pos} edge: {} is already taken",
+                entry.requested
+            ),
+        }
     }
 
     fn remove_capture(&mut self, handle: CaptureHandle) {
-        self.captures.retain(|&(h, ..)| handle != h);
+        self.captures.retain(|entry| entry.handle != handle);
     }
 
     fn is_default_capture_at(&self, pos: Position) -> bool {
         self.captures
             .iter()
-            .any(|&(_, p, t)| p == pos && t == CaptureType::Default)
+            .any(|entry| entry.pos == pos && entry.kind == CaptureType::Default)
     }
 
     fn get_pos(&self, handle: CaptureHandle) -> Option<Position> {
         self.captures
             .iter()
-            .find(|(h, ..)| *h == handle)
-            .map(|&(_, p, _)| p)
+            .find(|entry| entry.handle == handle)
+            .map(|entry| entry.pos)
     }
 
     fn get_type(&self, handle: CaptureHandle) -> Option<CaptureType> {
         self.captures
             .iter()
-            .find(|(h, ..)| *h == handle)
-            .map(|&(_, _, t)| t)
+            .find(|entry| entry.handle == handle)
+            .map(|entry| entry.kind)
+    }
+
+    fn entry(&self, handle: CaptureHandle) -> Option<&CaptureEntry> {
+        self.captures.iter().find(|entry| entry.handle == handle)
+    }
+
+    /// Re-resolve which part of `pos` each client can be reached through and
+    /// hand the result to the backend.
+    ///
+    /// Clients are resolved in handle order, the order they were configured in:
+    /// an overlapping request belongs to the lower handle and the higher one is
+    /// narrowed or dropped. That is what makes the barriers and the routing
+    /// agree - a crossing outside every registered segment never reaches a
+    /// client that was configured for it but squeezed out of it.
+    async fn refresh_position(
+        &mut self,
+        capture: &mut InputCapture,
+        pos: Position,
+    ) -> Result<(), CaptureError> {
+        let mut clients = self
+            .captures
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.pos == pos && entry.kind == CaptureType::Default)
+            .map(|(index, entry)| (index, entry.handle, entry.requested))
+            .collect::<Vec<_>>();
+        clients.sort_by_key(|(_, handle, _)| *handle);
+        let requested: Vec<EdgeRange> = clients.iter().map(|(_, _, range)| *range).collect();
+        let effective = EdgeRange::resolve(&requested);
+        for ((index, _, _), range) in clients.iter().zip(effective.iter()) {
+            self.captures[*index].effective = *range;
+        }
+        let segments = effective.into_iter().flatten().collect::<Vec<_>>();
+        capture.set_segments(pos, segments).await?;
+        /* Registering barriers means we talked to the backend, which is the only
+         * moment its screen geometry can be read without a separate request: the
+         * value only changes when a monitor is plugged in or the mode changes,
+         * both of which rebuild the barriers. */
+        let size = capture.screen_size().await;
+        self.screen_size.set(pack_size(size));
+        Ok(())
+    }
+
+    /// The client a crossing at `fraction` on `pos` belongs to.
+    fn route_at(&self, pos: Position, fraction: f64) -> Option<CaptureHandle> {
+        route(&self.captures, pos, fraction)
+    }
+
+    /// Whether a crossing of `pos` at `fraction` may switch to the peer now.
+    ///
+    /// Returns `Err(reason)` when a threshold refuses it, so the caller can say
+    /// why in the log.
+    fn crossing_allowed(&mut self, pos: Position, fraction: f64) -> Result<(), &'static str> {
+        let size = unpack_size(self.screen_size.get());
+        if in_blocked_corner(&self.switch_options, size, pos, fraction) {
+            return Err("corner is blocked");
+        }
+        let window = Duration::from_millis(self.switch_options.double_tap_ms as u64);
+        if window.is_zero() {
+            return Ok(());
+        }
+        /* A barrier reports the crossing, not the dwell, so a "hit the edge
+         * twice" requirement can only be honoured by bouncing the first hit
+         * back and letting the second one through. */
+        let armed = self
+            .last_edge_hit
+            .get(&pos)
+            .is_some_and(|at| at.elapsed() <= window);
+        if armed {
+            self.last_edge_hit.remove(&pos);
+            return Ok(());
+        }
+        self.last_edge_hit.insert(pos, Instant::now());
+        Err("double tap required")
     }
 
     async fn run(mut self) {
@@ -312,7 +571,12 @@ impl CaptureTask {
                             CaptureRequest::Disable => { /* nothing to do yet */ }
                             CaptureRequest::Preconnect(_) => { /* no connection yet */ }
                             CaptureRequest::RefreshPeerInfo(_) => { /* no connection yet */ }
-                            CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
+                            CaptureRequest::Create(h, p, t, edge, peer_edge) => {
+                                self.add_capture(CaptureEntry::new(h, p, t, edge, peer_edge));
+                            }
+                            CaptureRequest::SetEdge(..) | CaptureRequest::SetSwitchOptions(_) => {
+                                /* no capture to change yet */
+                            }
                             CaptureRequest::Destroy(h) => self.remove_capture(h),
                             CaptureRequest::Release => { /* nothing to do */ }
                             CaptureRequest::SetReleaseBind(bind) => {
@@ -357,12 +621,50 @@ impl CaptureTask {
     }
 
     async fn create_captures(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
-        let captures = self.captures.clone();
-        for (handle, pos, _type) in captures {
+        /* Resolve the segments of every edge before the clients are registered:
+         * a position that is not registered yet only remembers them, so the
+         * barrier is created once, with the geometry it will actually use. Doing
+         * it the other way round registers a full-edge barrier first and then
+         * immediately replaces it, which costs a round trip per edge and - on the
+         * compositor driven backends - briefly lets the pointer cross a stretch
+         * that belongs to nobody. */
+        let mut positions = self
+            .captures
+            .iter()
+            .map(|entry| entry.pos)
+            .collect::<Vec<_>>();
+        positions.sort_by_key(|pos| pos.to_string());
+        positions.dedup();
+        /* the token is cloned so the select can hold it while `self` is borrowed
+         * mutably by the refresh */
+        let cancel = self.cancellation_token.clone();
+        for pos in positions {
             tokio::select! {
-                r = capture.create(handle, pos) => r?,
+                r = self.refresh_position(capture, pos) => r?,
+                _ = cancel.cancelled() => return Ok(()),
+            }
+        }
+
+        let captures = self.captures.clone();
+        for entry in captures {
+            tokio::select! {
+                r = capture.create(entry.handle, entry.pos) => r?,
                 _ = self.cancellation_token.cancelled() => return Ok(()),
             }
+        }
+        let size = capture.screen_size().await;
+        self.screen_size.set(pack_size(size));
+        /* the barriers belong to a position, not to a client, so the segments of
+         * every edge are handed over once all clients are registered */
+        let mut positions = self
+            .captures
+            .iter()
+            .map(|entry| entry.pos)
+            .collect::<Vec<_>>();
+        positions.sort_by_key(|pos| pos.to_string());
+        positions.dedup();
+        for pos in positions {
+            self.refresh_position(capture, pos).await?;
         }
         Ok(())
     }
@@ -490,9 +792,45 @@ impl CaptureTask {
                     Some(CaptureRequest::RefreshPeerInfo(h)) => {
                         self.conn.request_peer_info(h).await;
                     }
-                    Some(CaptureRequest::Create(h, p, t)) => {
-                        self.add_capture(h, p, t);
+                    Some(CaptureRequest::Create(h, p, t, edge, peer_edge)) => {
+                        self.add_capture(CaptureEntry::new(h, p, t, edge, peer_edge));
+                        /* Resolve first: for the first client of an edge this only
+                         * stores the segments, and `create` then registers the
+                         * barrier with them in one step. A second client on an edge
+                         * that already has one brings no barrier of its own - it
+                         * shares the edge - so the re-resolution is the update. */
+                        if t == CaptureType::Default {
+                            self.refresh_position(capture, p).await?;
+                        }
                         capture.create(h, p).await?;
+                        if t == CaptureType::Default {
+                            self.report_unreachable(h, p);
+                        }
+                    }
+                    Some(CaptureRequest::SetEdge(h, edge)) => {
+                        let Some(pos) = self.get_pos(h) else {
+                            log::debug!("no capture for client {h}, ignoring its new edge");
+                            continue;
+                        };
+                        let Some(entry) = self.captures.iter_mut().find(|e| e.handle == h) else {
+                            continue;
+                        };
+                        entry.requested = edge;
+                        self.refresh_position(capture, pos).await?;
+                        self.report_unreachable(h, pos);
+                    }
+                    Some(CaptureRequest::SetSwitchOptions(options)) => {
+                        log::info!(
+                            "edge crossing thresholds: double tap {} ms, {} px in {:?}",
+                            options.double_tap_ms,
+                            options.corner_size,
+                            options
+                                .corners
+                                .iter()
+                                .map(|corner| corner.as_str())
+                                .collect::<Vec<_>>()
+                        );
+                        self.switch_options = options;
                     }
                     Some(CaptureRequest::Destroy(h)) => {
                         // If the capture we're tearing down is the
@@ -505,8 +843,26 @@ impl CaptureTask {
                         if self.active_client == Some(h) {
                             self.release_capture(capture).await?;
                         }
+                        let pos = self.get_pos(h);
+                        let was_default = self.get_type(h) == Some(CaptureType::Default);
                         self.remove_capture(h);
                         capture.destroy(h).await?;
+                        /* The remaining clients of that edge may now reach more of
+                         * it than they did while this one was squeezing them. */
+                        if let (true, Some(pos)) = (was_default, pos) {
+                            self.refresh_position(capture, pos).await?;
+                            /* A client that was squeezed out by the one that just
+                             * left can now take its stretch, so report the new
+                             * state of the edge. */
+                            for (handle, _) in self
+                                .captures
+                                .iter()
+                                .filter(|entry| entry.pos == pos)
+                                .map(|entry| (entry.handle, entry.pos))
+                            {
+                                self.report_unreachable(handle, pos);
+                            }
+                        }
                     }
                     Some(CaptureRequest::SetReleaseBind(bind)) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
@@ -569,7 +925,40 @@ impl CaptureTask {
             return Ok(());
         };
 
-        if matches!(event, CaptureEvent::Begin(_)) {
+        /* A crossing is routed to the one client that owns the part of the edge
+         * it happened at. The capture stream delivers the same `Begin` to every
+         * client registered on the position, so the copies for the others are
+         * dropped here: acting on them would hand the pointer to a machine that
+         * does not own that stretch, which is the bug the ranges exist to fix.
+         */
+        if let CaptureEvent::Begin(fraction) = event {
+            if capture_type == CaptureType::Default {
+                match self.route_at(pos, fraction) {
+                    Some(owner) if owner == handle => {}
+                    Some(owner) => {
+                        log::trace!(
+                            "crossing at {:.0}% of the {pos} edge belongs to client {owner}, not {handle}",
+                            fraction * 100.0
+                        );
+                        return Ok(());
+                    }
+                    None => {
+                        /* Nobody owns this stretch: the pointer hits a wall. On
+                         * Wayland the barrier is not even registered there, so
+                         * this is reached only by the backends that own the local
+                         * pointer and cannot carve a segment out of an edge. */
+                        log::info!(
+                            "releasing capture: no client covers {:.0}% of the {pos} edge",
+                            fraction * 100.0
+                        );
+                        return self.release_capture(capture).await;
+                    }
+                }
+                if let Err(reason) = self.crossing_allowed(pos, fraction) {
+                    log::info!("releasing capture: crossing of the {pos} edge refused, {reason}");
+                    return self.release_capture(capture).await;
+                }
+            }
             /* The receiver only goes away while the service is shutting down,
              * so there is nothing left to notify.
              */
@@ -639,7 +1028,12 @@ impl CaptureTask {
 
         // activated a new client
         if let CaptureEvent::Begin(fraction) = event {
-            self.enter_fraction = fraction;
+            /* Where the pointer left this edge, mapped into the segment of the
+             * peer's facing edge it is supposed to land in. */
+            self.enter_fraction = self
+                .entry(handle)
+                .map(|entry| entry.peer_fraction(fraction))
+                .unwrap_or(fraction);
             if Some(handle) != self.active_client {
                 self.state = State::WaitingForAck;
                 self.active_client.replace(handle);
@@ -668,8 +1062,8 @@ impl CaptureTask {
         let events: Vec<ProtoEvent> = match event {
             // already handled above (released the capture)
             CaptureEvent::Interrupted => return Ok(()),
-            CaptureEvent::Begin(fraction) => {
-                let mut events = vec![ProtoEvent::Enter(opposite_pos, fraction)];
+            CaptureEvent::Begin(_) => {
+                let mut events = vec![ProtoEvent::Enter(opposite_pos, self.enter_fraction)];
                 if std::mem::take(&mut self.center_cursor) {
                     events.push(ProtoEvent::CenterCursor);
                 }
@@ -845,6 +1239,199 @@ impl<T> Drop for DropGuard<T> {
         // panic here would abort the process
         if let Some(on_drop) = self.on_drop.take() {
             let _ = self.tx.send(on_drop);
+        }
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    fn range(start: f64, end: f64) -> EdgeRange {
+        EdgeRange::from_fractions(start, end).expect("valid range")
+    }
+
+    /// A client on the right edge owning `edge`.
+    fn client(handle: CaptureHandle, pos: Position, edge: EdgeRange) -> CaptureEntry {
+        CaptureEntry::new(handle, pos, CaptureType::Default, edge, EdgeRange::FULL)
+    }
+
+    /// The same client after the daemon resolved the edge it shares.
+    fn resolved(mut entry: CaptureEntry, effective: Option<EdgeRange>) -> CaptureEntry {
+        entry.effective = effective;
+        entry
+    }
+
+    #[test]
+    fn a_crossing_reaches_the_client_that_owns_that_stretch() {
+        let top = client(1, Position::Right, range(0.0, 0.5));
+        let bottom = client(2, Position::Right, range(0.5, 1.0));
+        let entries = [top, bottom];
+        assert_eq!(route(&entries, Position::Right, 0.1), Some(1));
+        assert_eq!(route(&entries, Position::Right, 0.49), Some(1));
+        assert_eq!(route(&entries, Position::Right, 0.5), Some(2));
+        assert_eq!(route(&entries, Position::Right, 0.99), Some(2));
+    }
+
+    #[test]
+    fn a_crossing_in_a_gap_reaches_nobody() {
+        // 0-40% and 60-100%: the middle of the edge is a wall
+        let entries = [
+            client(1, Position::Right, range(0.0, 0.4)),
+            client(2, Position::Right, range(0.6, 1.0)),
+        ];
+        assert_eq!(route(&entries, Position::Right, 0.5), None);
+        assert_eq!(route(&entries, Position::Right, 0.39), Some(1));
+        assert_eq!(route(&entries, Position::Right, 0.61), Some(2));
+    }
+
+    #[test]
+    fn a_client_squeezed_out_of_its_range_is_not_routed_to() {
+        // client 1 owns the whole edge, so client 2's resolved range is nothing
+        let entries = [
+            client(1, Position::Right, EdgeRange::FULL),
+            resolved(client(2, Position::Right, range(0.2, 0.3)), None),
+        ];
+        assert_eq!(route(&entries, Position::Right, 0.25), Some(1));
+    }
+
+    #[test]
+    fn a_client_squeezed_to_a_part_only_reaches_that_part() {
+        let entries = [
+            client(1, Position::Right, range(0.0, 0.6)),
+            resolved(
+                client(2, Position::Right, range(0.4, 1.0)),
+                Some(range(0.6, 1.0)),
+            ),
+        ];
+        assert_eq!(route(&entries, Position::Right, 0.5), Some(1));
+        assert_eq!(route(&entries, Position::Right, 0.7), Some(2));
+    }
+
+    #[test]
+    fn an_enter_only_capture_never_takes_a_crossing() {
+        // The inbound trigger sits on the same edge; it must not win the routing
+        let trigger = CaptureEntry::new(
+            9,
+            Position::Right,
+            CaptureType::EnterOnly,
+            EdgeRange::FULL,
+            EdgeRange::FULL,
+        );
+        let entries = [trigger, client(1, Position::Right, EdgeRange::FULL)];
+        assert_eq!(route(&entries, Position::Right, 0.5), Some(1));
+    }
+
+    #[test]
+    fn a_crossing_is_routed_only_on_its_own_edge() {
+        let entries = [
+            client(1, Position::Right, EdgeRange::FULL),
+            client(2, Position::Left, EdgeRange::FULL),
+        ];
+        assert_eq!(route(&entries, Position::Left, 0.5), Some(2));
+        assert_eq!(route(&entries, Position::Top, 0.5), None);
+    }
+
+    #[test]
+    fn the_crossing_point_is_mapped_into_the_peer_segment() {
+        // A client that owns the bottom half of the right edge and should land
+        // the peer's cursor in the top half of its own edge.
+        let mut entry = client(1, Position::Right, range(0.5, 1.0));
+        entry.peer_edge = range(0.0, 0.5);
+        // the very start of its stretch maps to the start of the peer's
+        assert_eq!(entry.peer_fraction(0.5), 0.0);
+        // and the middle of its stretch to the middle of the peer's
+        assert!((entry.peer_fraction(0.75) - 0.25).abs() < 1e-9);
+        /* The far end of the edge reads one permille short because a crossing at
+         * 100% is the last pixel of a 1000-pixel-wide span, so the mapping is
+         * exact up to that quantization - under one pixel on any real screen. */
+        assert!((entry.peer_fraction(1.0) - 0.5).abs() < 0.002);
+    }
+
+    #[test]
+    fn a_full_range_maps_the_crossing_point_straight_through() {
+        let entry = client(1, Position::Right, EdgeRange::FULL);
+        for fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let mapped = entry.peer_fraction(fraction);
+            assert!((mapped - fraction).abs() < 0.002, "{fraction} -> {mapped}");
+        }
+    }
+
+    #[test]
+    fn corners_are_only_blocked_when_configured_and_measurable() {
+        let size = Some((1920u32, 1080u32));
+        let none = SwitchOptions::default();
+        assert!(!in_blocked_corner(&none, size, Position::Right, 0.0));
+
+        let top_left = SwitchOptions {
+            corner_size: 50,
+            corners: vec![SwitchCorner::TopLeft],
+            ..SwitchOptions::default()
+        };
+        // the top 50 px of the left edge are the corner
+        assert!(in_blocked_corner(
+            &top_left,
+            size,
+            Position::Left,
+            10.0 / 1080.0
+        ));
+        // the bottom of the same edge is not
+        assert!(!in_blocked_corner(&top_left, size, Position::Left, 0.9));
+        // the top of the right edge is the other corner
+        assert!(!in_blocked_corner(
+            &top_left,
+            size,
+            Position::Right,
+            10.0 / 1080.0
+        ));
+    }
+
+    #[test]
+    fn a_corner_block_needs_to_know_the_screen_size() {
+        let options = SwitchOptions {
+            corner_size: 50,
+            corners: vec![SwitchCorner::TopLeft],
+            ..SwitchOptions::default()
+        };
+        // without geometry the fraction cannot be turned into pixels
+        assert!(!in_blocked_corner(&options, None, Position::Left, 0.0));
+    }
+
+    #[test]
+    fn a_bottom_left_corner_is_blocked_on_the_left_edge_bottom() {
+        let options = SwitchOptions {
+            corner_size: 100,
+            corners: vec![SwitchCorner::BottomLeft],
+            ..SwitchOptions::default()
+        };
+        assert!(in_blocked_corner(
+            &options,
+            Some((1920, 1080)),
+            Position::Left,
+            1000.0 / 1080.0
+        ));
+        assert!(!in_blocked_corner(
+            &options,
+            Some((1920, 1080)),
+            Position::Left,
+            500.0 / 1080.0
+        ));
+    }
+
+    #[test]
+    fn pack_and_unpack_round_trip_a_screen_size() {
+        for size in [
+            Some((1920, 1080)),
+            Some((3840, 2160)),
+            None,
+            Some((0, 1080)),
+        ] {
+            let packed = pack_size(size);
+            let unpacked = unpack_size(packed);
+            match size {
+                Some((w, h)) if w > 0 && h > 0 => assert_eq!(unpacked, size),
+                _ => assert_eq!(unpacked, None),
+            }
         }
     }
 }

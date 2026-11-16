@@ -8,7 +8,7 @@ use std::{
 
 use slab::Slab;
 
-use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState, Position};
+use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState, EdgeRange, Position};
 
 use crate::config::ConfigClient;
 
@@ -35,6 +35,8 @@ impl ClientManager {
             pos: config_client.pos,
             cmd: config_client.enter_hook,
             leave_cmd: config_client.leave_hook,
+            edge: config_client.edge,
+            peer_edge: config_client.peer_edge,
         };
         let state = ClientState {
             active: config_client.active,
@@ -110,6 +112,11 @@ impl ClientManager {
     }
 
     /// get the client at the given position
+    ///
+    /// Only correct when the caller has no crossing point: with several active
+    /// clients on one edge this returns the first in list order, which is what
+    /// decides who keeps an overlapping range. Use
+    /// [`ClientManager::client_at_fraction`] to route an actual crossing.
     pub fn client_at(&self, pos: Position) -> Option<ClientHandle> {
         self.clients
             .borrow()
@@ -122,6 +129,46 @@ impl ClientManager {
                 }
             })
             .map(|p| p as ClientHandle)
+    }
+
+    /// the active client whose edge range contains a crossing at `fraction`
+    ///
+    /// `fraction` counts from the left or top end of the edge, exactly like the
+    /// payload of the `Enter` protocol event. A crossing outside every range
+    /// reaches nobody: the pointer hits a wall, the way Synergy refuses to
+    /// switch when `getNeighbor` finds no link covering that point.
+    pub fn client_at_fraction(&self, pos: Position, fraction: f64) -> Option<ClientHandle> {
+        self.clients
+            .borrow()
+            .iter()
+            .find_map(|(k, (c, s))| {
+                if s.active && c.pos == pos && c.edge.contains(fraction) {
+                    Some(k)
+                } else {
+                    None
+                }
+            })
+            .map(|p| p as ClientHandle)
+    }
+
+    /// every active client on the given edge, in list order
+    pub fn clients_at(&self, pos: Position) -> Vec<(ClientHandle, ClientConfig)> {
+        self.clients
+            .borrow()
+            .iter()
+            .filter(|(_, (c, s))| s.active && c.pos == pos)
+            .map(|(k, (c, _))| (k as ClientHandle, c.clone()))
+            .collect()
+    }
+
+    /// the ranges the active clients claim on the given edge, in list order
+    pub fn edges_at(&self, pos: Position) -> Vec<(ClientHandle, EdgeRange)> {
+        self.clients
+            .borrow()
+            .iter()
+            .filter(|(_, (c, s))| s.active && c.pos == pos)
+            .map(|(k, (c, _))| (k as ClientHandle, c.edge))
+            .collect()
     }
 
     pub(crate) fn get_hostname(&self, handle: ClientHandle) -> Option<String> {
@@ -137,6 +184,36 @@ impl ClientManager {
             .borrow()
             .get(handle as usize)
             .map(|(c, _)| c.pos)
+    }
+
+    /// get the edge range of the corresponding client
+    pub(crate) fn get_edge(&self, handle: ClientHandle) -> Option<(EdgeRange, EdgeRange)> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .map(|(c, _)| (c.edge, c.peer_edge))
+    }
+
+    /// set both edge ranges of a client
+    ///
+    /// Returns whether anything changed, so the caller can avoid tearing down
+    /// and rebuilding the capture for a no-op edit.
+    pub(crate) fn set_edge(
+        &self,
+        handle: ClientHandle,
+        edge: EdgeRange,
+        peer_edge: EdgeRange,
+    ) -> bool {
+        let mut clients = self.clients.borrow_mut();
+        let Some((config, _)) = clients.get_mut(handle as usize) else {
+            return false;
+        };
+        if config.edge == edge && config.peer_edge == peer_edge {
+            return false;
+        }
+        config.edge = edge;
+        config.peer_edge = peer_edge;
+        true
     }
 
     /// remove a client from the list

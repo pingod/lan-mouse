@@ -11,8 +11,8 @@ use crate::{
 };
 use futures::StreamExt;
 use lan_mouse_ipc::{
-    AsyncFrontendListener, ClientConfig, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
-    IpcListenerCreationError, Position, Status,
+    AsyncFrontendListener, ClientConfig, ClientHandle, EdgeRange, FrontendEvent, FrontendRequest,
+    IpcError, IpcListenerCreationError, Position, Status, SwitchOptions,
 };
 use log;
 use std::{
@@ -100,6 +100,9 @@ pub struct Service {
     /// names of the backends actually in use
     capture_backend_name: String,
     emulation_backend_name: String,
+    /// edge-crossing thresholds currently in effect, kept so a frontend that
+    /// connects later can be told what they are
+    switch_options: SwitchOptions,
     /// when a frontend is streaming logs: how often to poll and where we are
     log_stream: Option<(tokio::time::Interval, usize)>,
 }
@@ -154,12 +157,14 @@ impl Service {
         // service keeps a clone for sending and preconnecting. A clone has no
         // receive side, so handing the clone to the capture task would panic on
         // its first `recv()`.
+        let switch_options = config.switch_options();
         let capture = Capture::new(
             capture_backend,
             conn,
             config.release_bind(),
             config.remap_rules(),
         );
+        capture.set_switch_options(switch_options.clone());
         let emulation_backend = config.emulation_backend().map(|b| b.into());
         let emulation = Emulation::new(emulation_backend, listener);
 
@@ -198,6 +203,7 @@ impl Service {
             started: Instant::now(),
             capture_backend_name: capture_backend_name.clone(),
             emulation_backend_name: emulation_backend_name.clone(),
+            switch_options,
             log_stream: None,
         };
         Ok(service)
@@ -461,6 +467,8 @@ impl Service {
                 fix_ips,
                 enter_hook,
                 leave_hook,
+                edge,
+                peer_edge,
             } => {
                 let handle = self.add_client_with(ClientConfig {
                     hostname,
@@ -469,6 +477,8 @@ impl Service {
                     fix_ips,
                     cmd: enter_hook,
                     leave_cmd: leave_hook,
+                    edge,
+                    peer_edge,
                 });
                 // `UpdateHostname` starts a lookup; a client created with a
                 // hostname must do the same, otherwise it never gets an address.
@@ -568,6 +578,19 @@ impl Service {
                 self.update_pos(handle, pos);
                 self.save_config();
             }
+            FrontendRequest::UpdateEdge {
+                handle,
+                edge,
+                peer_edge,
+            } => {
+                self.update_edge(handle, edge, peer_edge);
+                self.save_config();
+            }
+            FrontendRequest::SetSwitchOptions(options) => {
+                self.update_switch_options(options);
+                self.save_config();
+            }
+            FrontendRequest::EnumerateSwitchOptions => self.notify_switch_options(),
             FrontendRequest::ResolveDns(handle) => self.resolve(handle),
             FrontendRequest::Sync => self.sync_frontend(),
             FrontendRequest::RemoveAuthorizedKey(key) => {
@@ -852,6 +875,8 @@ impl Service {
                 active: s.active,
                 enter_hook: c.cmd,
                 leave_hook: c.leave_cmd,
+                edge: c.edge,
+                peer_edge: c.peer_edge,
             })
             .collect();
         self.config.set_clients(clients);
@@ -1101,6 +1126,7 @@ impl Service {
         // connecting later only learns about them from this snapshot. The hook
         // commands travel on their own inside each client's configuration.
         self.notify_remap();
+        self.notify_switch_options();
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;
@@ -1141,6 +1167,12 @@ impl Service {
             inbound: self.incoming_conn_info.len(),
             outbound,
             best_rtt_ms: best_rtt,
+            /* The canvas draws the local screen to scale with these; a backend
+             * that reports no geometry leaves the cards equal sized. The capture
+             * task refreshes the value whenever it registers barriers, which is
+             * when a monitor plug-in or a mode change alters them. */
+            screen_width: self.capture.screen_size().map(|(w, _)| w).unwrap_or(0),
+            screen_height: self.capture.screen_size().map(|(_, h)| h).unwrap_or(0),
         }));
     }
 
@@ -1171,7 +1203,16 @@ impl Service {
     fn add_incoming(&mut self, addr: SocketAddr, pos: Position, fingerprint: String) {
         let handle = Self::ENTER_HANDLE_BEGIN + self.next_trigger_handle;
         self.next_trigger_handle += 1;
-        self.capture.create(handle, pos, CaptureType::EnterOnly);
+        /* An inbound peer is only watched for the pointer reaching our edge, so
+         * it gets the whole edge: routing the crossing to a client is not this
+         * capture's job. */
+        self.capture.create(
+            handle,
+            pos,
+            CaptureType::EnterOnly,
+            EdgeRange::FULL,
+            EdgeRange::FULL,
+        );
         self.incoming_conns.insert(addr);
         self.incoming_conn_info.insert(
             handle,
@@ -1341,16 +1382,15 @@ impl Service {
         /* resolve dns on activate */
         self.resolve(handle);
 
-        /* deactivate potential other client at this position */
         let Some(pos) = self.client_manager.get_pos(handle) else {
             return;
         };
 
-        if let Some(other) = self.client_manager.client_at(pos) {
-            if other != handle {
-                self.deactivate_client(other);
-            }
-        }
+        /* Several clients can be active on one edge: they own different segments
+         * of it and a crossing is routed by the point the edge was hit at. The
+         * code here used to deactivate every other active client of the edge,
+         * which made each client after the first on an edge dead configuration -
+         * invisible, because the canvas drew them all as reachable. */
 
         /* activate the client */
         if self.client_manager.activate_client(handle) {
@@ -1359,7 +1399,12 @@ impl Service {
              * removes the round trip from the moment of crossing. */
             self.capture.preconnect(handle);
             /* notify capture and frontends */
-            self.capture.create(handle, pos, CaptureType::Default);
+            let (edge, peer_edge) = self
+                .client_manager
+                .get_edge(handle)
+                .unwrap_or((EdgeRange::FULL, EdgeRange::FULL));
+            self.capture
+                .create(handle, pos, CaptureType::Default, edge, peer_edge);
             self.broadcast_client(handle);
             log::info!("activated client {handle} ({pos})");
         }
@@ -1415,6 +1460,89 @@ impl Service {
             self.activate_client(handle);
         }
         self.broadcast_client(handle);
+        self.notify_edge_conflicts();
+    }
+
+    /// Move a client to another part of its edge.
+    ///
+    /// The capture is not torn down and rebuilt as it is for a position change:
+    /// the edge stays the same, only the segment shifts, and re-creating the
+    /// barrier would drop a session the pointer may be sitting in. The capture
+    /// task re-resolves the segments of the edge instead.
+    fn update_edge(&mut self, handle: ClientHandle, edge: EdgeRange, peer_edge: EdgeRange) {
+        if !self.client_manager.set_edge(handle, edge, peer_edge) {
+            return;
+        }
+        if self
+            .client_manager
+            .get_state(handle)
+            .is_some_and(|(_, state)| state.active)
+        {
+            self.capture.set_edge(handle, edge);
+        }
+        self.broadcast_client(handle);
+        /* Every client of the edge takes part in the resolution, so a neighbour
+         * that was squeezed out - or just freed - has to be reported too. */
+        self.notify_edge_conflicts();
+    }
+
+    /// Report the clients that do not get the edge range they asked for.
+    ///
+    /// The daemon still gives each of them what is free rather than refusing the
+    /// change, because the canvas and the config file are edited independently
+    /// here and a rejected write would leave the two out of step. What it must
+    /// not do is stay silent: a client that reaches nobody looks like a peer that
+    /// is broken.
+    fn notify_edge_conflicts(&mut self) {
+        let mut messages = Vec::new();
+        for position in [
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ] {
+            let clients = self.client_manager.clients_at(position);
+            if clients.len() < 2 {
+                continue;
+            }
+            let requested: Vec<EdgeRange> = clients.iter().map(|(_, c)| c.edge).collect();
+            let effective = EdgeRange::resolve(&requested);
+            for ((handle, config), effective) in clients.iter().zip(effective) {
+                if effective == Some(config.edge) {
+                    continue;
+                }
+                let name = config
+                    .hostname
+                    .clone()
+                    .unwrap_or_else(|| format!("client {handle}"));
+                messages.push(match effective {
+                    Some(range) => format!(
+                        "{name} asked for {} on the {position} edge, only {range} is free",
+                        config.edge
+                    ),
+                    None => format!(
+                        "{name} cannot be reached: all of its {position} range {} is taken",
+                        config.edge
+                    ),
+                });
+            }
+        }
+        for message in messages {
+            log::warn!("{message}");
+            self.notify_frontend(FrontendEvent::EdgeConflict(message));
+        }
+    }
+
+    /// Replace the edge-crossing thresholds and tell every frontend.
+    fn update_switch_options(&mut self, options: SwitchOptions) {
+        self.capture.set_switch_options(options.clone());
+        self.switch_options = options;
+        self.notify_switch_options();
+    }
+
+    fn notify_switch_options(&mut self) {
+        let options = self.switch_options.clone();
+        self.notify_frontend(FrontendEvent::SwitchOptions(options));
     }
 
     fn update_enter_hook(&mut self, handle: ClientHandle, enter_hook: Option<String>) {
