@@ -12,3 +12,6 @@ extfile.conf
 # flatpak files
 .flatpak-builder
 repo
+
+# local ssh shim used to deploy to the test Mac
+.sshshim/
