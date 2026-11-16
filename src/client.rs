@@ -111,63 +111,17 @@ impl ClientManager {
             .map(|p| p as ClientHandle)
     }
 
-    /// get the client at the given position
+    /// the active clients on the given edge, in list order
     ///
-    /// Only correct when the caller has no crossing point: with several active
-    /// clients on one edge this returns the first in list order, which is what
-    /// decides who keeps an overlapping range. Use
-    /// [`ClientManager::client_at_fraction`] to route an actual crossing.
-    pub fn client_at(&self, pos: Position) -> Option<ClientHandle> {
-        self.clients
-            .borrow()
-            .iter()
-            .find_map(|(k, (c, s))| {
-                if s.active && c.pos == pos {
-                    Some(k)
-                } else {
-                    None
-                }
-            })
-            .map(|p| p as ClientHandle)
-    }
-
-    /// the active client whose edge range contains a crossing at `fraction`
-    ///
-    /// `fraction` counts from the left or top end of the edge, exactly like the
-    /// payload of the `Enter` protocol event. A crossing outside every range
-    /// reaches nobody: the pointer hits a wall, the way Synergy refuses to
-    /// switch when `getNeighbor` finds no link covering that point.
-    pub fn client_at_fraction(&self, pos: Position, fraction: f64) -> Option<ClientHandle> {
-        self.clients
-            .borrow()
-            .iter()
-            .find_map(|(k, (c, s))| {
-                if s.active && c.pos == pos && c.edge.contains(fraction) {
-                    Some(k)
-                } else {
-                    None
-                }
-            })
-            .map(|p| p as ClientHandle)
-    }
-
-    /// every active client on the given edge, in list order
+    /// There is no longer a single answer for "the client at an edge": several
+    /// clients share one and a crossing is attributed by the point of the edge it
+    /// happened at, which only the capture task knows.
     pub fn clients_at(&self, pos: Position) -> Vec<(ClientHandle, ClientConfig)> {
         self.clients
             .borrow()
             .iter()
             .filter(|(_, (c, s))| s.active && c.pos == pos)
             .map(|(k, (c, _))| (k as ClientHandle, c.clone()))
-            .collect()
-    }
-
-    /// the ranges the active clients claim on the given edge, in list order
-    pub fn edges_at(&self, pos: Position) -> Vec<(ClientHandle, EdgeRange)> {
-        self.clients
-            .borrow()
-            .iter()
-            .filter(|(_, (c, s))| s.active && c.pos == pos)
-            .map(|(k, (c, _))| (k as ClientHandle, c.edge))
             .collect()
     }
 
@@ -196,8 +150,8 @@ impl ClientManager {
 
     /// set both edge ranges of a client
     ///
-    /// Returns whether anything changed, so the caller can avoid tearing down
-    /// and rebuilding the capture for a no-op edit.
+    /// Returns whether anything changed, so the caller can avoid re-resolving
+    /// the edge for a no-op edit.
     pub(crate) fn set_edge(
         &self,
         handle: ClientHandle,
