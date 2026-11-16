@@ -35,6 +35,7 @@ impl ClientManager {
             pos: config_client.pos,
             cmd: config_client.enter_hook,
             leave_cmd: config_client.leave_hook,
+            display: config_client.display,
             edge: config_client.edge,
             peer_edge: config_client.peer_edge,
         };
@@ -141,20 +142,25 @@ impl ClientManager {
     }
 
     /// get the edge range of the corresponding client
-    pub(crate) fn get_edge(&self, handle: ClientHandle) -> Option<(EdgeRange, EdgeRange)> {
+    /// The whole link of a client: which monitor, and the two ranges.
+    pub(crate) fn get_link(
+        &self,
+        handle: ClientHandle,
+    ) -> Option<(Option<String>, EdgeRange, EdgeRange)> {
         self.clients
             .borrow()
             .get(handle as usize)
-            .map(|(c, _)| (c.edge, c.peer_edge))
+            .map(|(c, _)| (c.display.clone(), c.edge, c.peer_edge))
     }
 
-    /// set both edge ranges of a client
+    /// set the monitor and both edge ranges of a client
     ///
     /// Returns whether anything changed, so the caller can avoid re-resolving
     /// the edge for a no-op edit.
-    pub(crate) fn set_edge(
+    pub(crate) fn set_link(
         &self,
         handle: ClientHandle,
+        display: Option<String>,
         edge: EdgeRange,
         peer_edge: EdgeRange,
     ) -> bool {
@@ -162,9 +168,10 @@ impl ClientManager {
         let Some((config, _)) = clients.get_mut(handle as usize) else {
             return false;
         };
-        if config.edge == edge && config.peer_edge == peer_edge {
+        if config.display == display && config.edge == edge && config.peer_edge == peer_edge {
             return false;
         }
+        config.display = display;
         config.edge = edge;
         config.peer_edge = peer_edge;
         true

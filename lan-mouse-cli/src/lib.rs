@@ -49,6 +49,13 @@ struct Client {
     /// which edge of this screen the client sits behind
     #[arg(long)]
     position: Option<Position>,
+    /// the local monitor this link is attached to, by name (see `screens`)
+    ///
+    /// Scopes `--edge` to that monitor's edge instead of the bounding box around
+    /// every monitor. Needed on a desk whose monitors have unequal heights, where
+    /// part of the box's edge belongs to a screen the link does not touch.
+    #[arg(long)]
+    display: Option<String>,
     /// the part of that edge the pointer crosses to reach it, as
     /// `start,end` fractions of the edge (0.0-1.0)
     ///
@@ -87,6 +94,9 @@ enum CliSubcommand {
     /// client's edge the cursor lands in
     SetEdge {
         id: ClientHandle,
+        /// the local monitor to attach the link to; omit to keep the current one
+        #[arg(long)]
+        display: Option<String>,
         /// `start,end` fractions of this screen's edge, e.g. `0.0,0.6`
         #[arg(long)]
         edge: EdgeRange,
@@ -154,6 +164,7 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             enter_hook,
             leave_hook,
             position,
+            display,
             edge,
             peer_edge,
         }) => {
@@ -165,6 +176,7 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
             let port = port.unwrap_or(DEFAULT_PORT);
             let fix_ips = ips.unwrap_or_default();
             tx.request(FrontendRequest::CreateClient {
+                display,
                 hostname: hostname.clone(),
                 port,
                 position: position.unwrap_or_default(),
@@ -279,16 +291,21 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         }
         CliSubcommand::SetEdge {
             id,
+            display,
             edge,
             peer_edge,
         } => {
             /* the edge is only half of a link: the position has to travel with
              * it, so the daemon gets one request instead of two half-saved
              * states */
-            let position = client_position(&mut rx, &mut tx, id).await?;
+            let (position, current_display) = client_link(&mut rx, &mut tx, id).await?;
+            /* `--display` is optional and omitting it must not detach the link
+             * from its monitor, so the current value is carried over */
+            let display = display.or(current_display);
             tx.request(FrontendRequest::UpdateLink {
                 handle: id,
                 position,
+                display,
                 edge,
                 peer_edge,
             })
@@ -496,61 +513,79 @@ fn print_screens(
             println!("  nothing configured");
             continue;
         }
-        let enabled = on_edge
-            .iter()
-            .filter(|(_, _, state)| state.active)
-            .map(|(handle, config, _)| (*handle, config.edge))
-            .collect::<Vec<_>>();
-        let effective =
-            EdgeRange::resolve(&enabled.iter().map(|(_, range)| *range).collect::<Vec<_>>());
-        let reached = effective.iter().flatten().copied().collect::<Vec<_>>();
-        for (handle, config, state) in on_edge.iter().map(|(h, c, s)| (*h, c.clone(), s.active)) {
-            let host = config
-                .hostname
-                .clone()
-                .unwrap_or_else(|| format!("client {handle}"));
-            let claim = enabled
-                .iter()
-                .position(|(other, _)| *other == handle)
-                .and_then(|index| effective[index]);
-            let note = if !state {
-                "disabled".to_owned()
-            } else {
-                match claim {
-                    None => "UNREACHABLE: another client already holds all of it".to_owned(),
-                    Some(claim) if claim != config.edge => {
-                        format!("narrowed to what is left of {}", config.edge)
-                    }
-                    Some(_) => "ok".to_owned(),
-                }
-            };
-            let shown = if state {
-                claim
-                    .map(|range| range.to_string())
-                    .unwrap_or_else(|| "-".to_owned())
-            } else {
-                config.edge.to_string()
-            };
-            println!("  id {handle}: {host} {shown}  [{note}]");
-            if config.peer_edge != EdgeRange::FULL {
-                println!("             lands in its {}", config.peer_edge);
+        /* Only links on the same monitor compete for a stretch: a link above one
+         * screen and a link above another are not narrowed by each other, and
+         * their ranges are fractions of different edges. */
+        let mut groups: Vec<Option<String>> = Vec::new();
+        for (_, config, _) in &on_edge {
+            if !groups.contains(&config.display) {
+                groups.push(config.display.clone());
             }
         }
-        for gap in EdgeRange::gaps(&reached) {
-            println!("  {gap} of the {position} edge is a wall");
+        for display in &groups {
+            let group: Vec<_> = on_edge
+                .iter()
+                .filter(|(_, config, _)| config.display == *display)
+                .collect();
+            let enabled = group
+                .iter()
+                .filter(|(_, _, state)| state.active)
+                .map(|(handle, config, _)| (*handle, config.edge))
+                .collect::<Vec<_>>();
+            let effective =
+                EdgeRange::resolve(&enabled.iter().map(|(_, range)| *range).collect::<Vec<_>>());
+            let reached = effective.iter().flatten().copied().collect::<Vec<_>>();
+            if let Some(display) = display.as_deref() {
+                println!("  {display}:");
+            }
+            for (handle, config, state) in group.iter().map(|(h, c, s)| (*h, c.clone(), s.active)) {
+                let host = config
+                    .hostname
+                    .clone()
+                    .unwrap_or_else(|| format!("client {handle}"));
+                let claim = enabled
+                    .iter()
+                    .position(|(other, _)| *other == handle)
+                    .and_then(|index| effective[index]);
+                let note = if !state {
+                    "disabled".to_owned()
+                } else {
+                    match claim {
+                        None => "UNREACHABLE: another client already holds all of it".to_owned(),
+                        Some(claim) if claim != config.edge => {
+                            format!("narrowed to what is left of {}", config.edge)
+                        }
+                        Some(_) => "ok".to_owned(),
+                    }
+                };
+                let shown = if state {
+                    claim
+                        .map(|range| range.to_string())
+                        .unwrap_or_else(|| "-".to_owned())
+                } else {
+                    config.edge.to_string()
+                };
+                println!("  id {handle}: {host} {shown}  [{note}]");
+                if config.peer_edge != EdgeRange::FULL {
+                    println!("             lands in its {}", config.peer_edge);
+                }
+            }
+            for gap in EdgeRange::gaps(&reached) {
+                println!("  {gap} of the {position} edge is a wall");
+            }
         }
     }
 }
 
-/// The edge a client currently sits behind.
+/// The edge, and the monitor, a client's link is currently attached to.
 ///
 /// `set-edge` changes only the ranges, but the daemon takes the whole link in one
-/// request, so the position has to be read first rather than assumed.
-async fn client_position(
+/// request, so the rest of it has to be read first rather than assumed.
+async fn client_link(
     rx: &mut AsyncFrontendEventReader,
     tx: &mut AsyncFrontendRequestWriter,
     id: ClientHandle,
-) -> Result<Position, CliError> {
+) -> Result<(Position, Option<String>), CliError> {
     tx.request(FrontendRequest::Enumerate()).await?;
     loop {
         match rx.next().await.ok_or(CliError::ConnectionClosed)?? {
@@ -559,7 +594,7 @@ async fn client_position(
                 return clients
                     .iter()
                     .find(|(handle, _, _)| *handle == id)
-                    .map(|(_, config, _)| config.pos)
+                    .map(|(_, config, _)| (config.pos, config.display.clone()))
                     .ok_or(CliError::NoSuchClient(id));
             }
             // unrelated notifications may arrive while waiting

@@ -67,7 +67,7 @@ pub(super) fn draw(cr: &cairo::Context, width: f64, height: f64, state: &State, 
      */
     let monitors = state.local_monitors();
     for (index, monitor) in monitors.iter().enumerate() {
-        let canvas_monitor = state.to_canvas(*monitor);
+        let canvas_monitor = state.to_canvas(monitor.rect);
         paint::fill_card(cr, canvas_monitor, palette);
         paint::set(cr, palette.accent, 0.9);
         cr.set_line_width(2.0);
@@ -89,9 +89,11 @@ pub(super) fn draw(cr: &cairo::Context, width: f64, height: f64, state: &State, 
      * no screen at all, and the name would float over nothing. */
     let labelled = monitors
         .iter()
-        .max_by(|a, b| (a.w * a.h).total_cmp(&(b.w * b.h)))
-        .copied()
-        .map(|rect| state.to_canvas(rect))
+        .max_by(|a, b| {
+            let area = |monitor: &super::layout::Monitor| monitor.rect.w * monitor.rect.h;
+            area(a).total_cmp(&area(b))
+        })
+        .map(|monitor| state.to_canvas(monitor.rect))
         .unwrap_or(canvas_local);
     draw_card(
         cr,

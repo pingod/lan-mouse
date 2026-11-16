@@ -475,9 +475,21 @@ mapping it onto `0.3-0.9` keeps it in the middle.
 
 A machine is described by its individual monitors, not by one box around them: a
 desk with a monitor turned on its side has a bounding box that covers area no
-screen does, and an edge range is a fraction of the *bounding box* (what a barrier
-spans) while the canvas draws the *monitors* (what exists). Rotated monitors are
-reported with the rectangle they actually occupy, so nothing has to be guessed.
+screen does. Rotated monitors are reported with the rectangle they actually
+occupy, so nothing has to be guessed.
+
+A link can name the monitor it is attached to, which is what makes "above the
+left-hand screen" expressible when the monitors have unequal heights:
+
+```sh
+lan-mouse cli add-client --host 192.168.1.5 --position top --display DP-3
+lan-mouse cli set-edge 0 --display DP-3 --edge 0.0,1.0
+```
+
+With `--display`, `--edge` is a fraction of *that monitor's* edge and the barrier
+is created on that monitor alone. Without it, `--edge` is a fraction of the
+bounding box around every monitor - which is what a config written before this
+means, so existing files need no migration.
 
 A stretch no client claims is a wall: the pointer stops there instead of jumping
 to whichever client happened to be first. When two clients claim overlapping
@@ -488,6 +500,7 @@ it, and the arrangement canvas draws it.
 ```sh
 lan-mouse cli screens          # what each edge is covered by, and where the walls are
 lan-mouse cli set-edge 0 --edge 0.0,0.6
+lan-mouse cli set-edge 0 --display DP-3 --edge 0.0,1.0   # scoped to one monitor
 ```
 
 ### Global hotkeys on Linux

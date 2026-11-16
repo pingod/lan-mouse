@@ -474,6 +474,7 @@ impl Service {
                 fix_ips,
                 enter_hook,
                 leave_hook,
+                display,
                 edge,
                 peer_edge,
             } => {
@@ -484,6 +485,7 @@ impl Service {
                     fix_ips,
                     cmd: enter_hook,
                     leave_cmd: leave_hook,
+                    display,
                     edge,
                     peer_edge,
                 });
@@ -588,10 +590,11 @@ impl Service {
             FrontendRequest::UpdateLink {
                 handle,
                 position,
+                display,
                 edge,
                 peer_edge,
             } => {
-                self.update_link(handle, position, edge, peer_edge);
+                self.update_link(handle, position, display, edge, peer_edge);
                 self.save_config();
             }
             FrontendRequest::SetSwitchOptions(options) => {
@@ -883,6 +886,7 @@ impl Service {
                 active: s.active,
                 enter_hook: c.cmd,
                 leave_hook: c.leave_cmd,
+                display: c.display,
                 edge: c.edge,
                 peer_edge: c.peer_edge,
             })
@@ -1265,6 +1269,7 @@ impl Service {
             handle,
             pos,
             CaptureType::EnterOnly,
+            None,
             EdgeRange::FULL,
             EdgeRange::FULL,
         );
@@ -1454,12 +1459,13 @@ impl Service {
              * removes the round trip from the moment of crossing. */
             self.capture.preconnect(handle);
             /* notify capture and frontends */
-            let (edge, peer_edge) = self
-                .client_manager
-                .get_edge(handle)
-                .unwrap_or((EdgeRange::FULL, EdgeRange::FULL));
+            let (display, edge, peer_edge) = self.client_manager.get_link(handle).unwrap_or((
+                None,
+                EdgeRange::FULL,
+                EdgeRange::FULL,
+            ));
             self.capture
-                .create(handle, pos, CaptureType::Default, edge, peer_edge);
+                .create(handle, pos, CaptureType::Default, display, edge, peer_edge);
             self.broadcast_client(handle);
             log::info!("activated client {handle} ({pos})");
         }
@@ -1528,6 +1534,7 @@ impl Service {
         &mut self,
         handle: ClientHandle,
         position: Position,
+        display: Option<String>,
         edge: EdgeRange,
         peer_edge: EdgeRange,
     ) {
@@ -1539,7 +1546,13 @@ impl Service {
         if moved {
             self.update_pos(handle, position);
         }
-        if !self.client_manager.set_edge(handle, edge, peer_edge) {
+        /* the capture needs the display after the manager has taken ownership of
+         * it, so the request is built from a clone */
+        let link_display = display.clone();
+        if !self
+            .client_manager
+            .set_link(handle, display, edge, peer_edge)
+        {
             if moved {
                 self.notify_edge_conflicts();
             }
@@ -1551,7 +1564,7 @@ impl Service {
                 .get_state(handle)
                 .is_some_and(|(_, state)| state.active)
         {
-            self.capture.set_edge(handle, edge);
+            self.capture.set_link(handle, link_display, edge);
         }
         self.broadcast_client(handle);
         /* Every client of the edge takes part in the resolution, so a neighbour
@@ -1574,30 +1587,51 @@ impl Service {
             Position::Top,
             Position::Bottom,
         ] {
-            let clients = self.client_manager.clients_at(position);
-            if clients.len() < 2 {
-                continue;
+            /* Only clients on the *same* monitor compete for a stretch: one above
+             * the left screen and one above the right screen are not in each
+             * other's way, and their ranges are fractions of different edges, so
+             * comparing them would report a conflict that does not exist. */
+            let mut groups: Vec<Option<String>> = Vec::new();
+            for (_, config) in self.client_manager.clients_at(position) {
+                if !groups.contains(&config.display) {
+                    groups.push(config.display);
+                }
             }
-            let requested: Vec<EdgeRange> = clients.iter().map(|(_, c)| c.edge).collect();
-            let effective = EdgeRange::resolve(&requested);
-            for ((handle, config), effective) in clients.iter().zip(effective) {
-                if effective == Some(config.edge) {
+            for display in groups {
+                let clients = self
+                    .client_manager
+                    .clients_at(position)
+                    .into_iter()
+                    .filter(|(_, config)| config.display == display)
+                    .collect::<Vec<_>>();
+                if clients.len() < 2 {
                     continue;
                 }
-                let name = config
-                    .hostname
-                    .clone()
-                    .unwrap_or_else(|| format!("client {handle}"));
-                messages.push(match effective {
-                    Some(range) => format!(
-                        "{name} asked for {} on the {position} edge, only {range} is free",
-                        config.edge
-                    ),
-                    None => format!(
-                        "{name} cannot be reached: all of its {position} range {} is taken",
-                        config.edge
-                    ),
-                });
+                let requested: Vec<EdgeRange> = clients.iter().map(|(_, c)| c.edge).collect();
+                let effective = EdgeRange::resolve(&requested);
+                for ((handle, config), effective) in clients.iter().zip(effective) {
+                    if effective == Some(config.edge) {
+                        continue;
+                    }
+                    let name = config
+                        .hostname
+                        .clone()
+                        .unwrap_or_else(|| format!("client {handle}"));
+                    let where_ = match display.as_deref() {
+                        Some(display) => format!("{position} edge of {display}"),
+                        None => format!("{position} edge"),
+                    };
+                    messages.push(match effective {
+                        Some(range) => format!(
+                            "{name} asked for {} on the {where_}, only {range} is free",
+                            config.edge
+                        ),
+                        None => format!(
+                            "{name} cannot be reached: all of its {where_} range {} is taken",
+                            config.edge
+                        ),
+                    });
+                }
             }
         }
         for message in messages {

@@ -315,6 +315,7 @@ impl Window {
                     (data.edge(), data.peer_edge(), data.peer_size());
                 Machine {
                     handle: client.handle(),
+                    display: (!data.display.is_empty()).then(|| data.display.clone()),
                     hostname: data
                         .hostname
                         .filter(|hostname| !hostname.is_empty())
@@ -378,6 +379,7 @@ impl Window {
             MachineRequest::Move {
                 handle,
                 position,
+                display,
                 edge,
                 peer_edge,
             } => {
@@ -385,15 +387,17 @@ impl Window {
                 self.request(FrontendRequest::UpdateLink {
                     handle,
                     position,
+                    display,
                     edge,
                     peer_edge,
                 });
             }
             MachineRequest::AutoArrange(updates) => {
-                for (handle, position, edge, peer_edge) in updates {
+                for (handle, position, display, edge, peer_edge) in updates {
                     self.request(FrontendRequest::UpdateLink {
                         handle,
                         position,
+                        display,
                         edge,
                         peer_edge,
                     });
@@ -1009,6 +1013,7 @@ impl Window {
          * hundreds of times a second.
          */
         if let Some(object) = self.client_object_for_handle(handle) {
+            object.set_property("display", client.display.clone().unwrap_or_default());
             object.set_property("edge-start", client.edge.start() as u32);
             object.set_property("edge-end", client.edge.end() as u32);
             object.set_property("peer-edge-start", client.peer_edge.start() as u32);

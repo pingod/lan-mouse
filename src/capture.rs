@@ -149,9 +149,16 @@ enum CaptureRequest {
     /// capture must release the mouse
     Release,
     /// add a capture client reachable through the given segment of its edge
-    Create(CaptureHandle, Position, CaptureType, EdgeRange, EdgeRange),
+    Create(
+        CaptureHandle,
+        Position,
+        CaptureType,
+        Option<String>,
+        EdgeRange,
+        EdgeRange,
+    ),
     /// change the segment of its edge a capture client is reached through
-    SetEdge(CaptureHandle, EdgeRange),
+    SetEdge(CaptureHandle, Option<String>, EdgeRange),
     /// replace the edge-crossing thresholds
     SetSwitchOptions(SwitchOptions),
     /// take the pointer on this capture right now, without a crossing
@@ -253,19 +260,24 @@ impl Capture {
         handle: CaptureHandle,
         pos: lan_mouse_ipc::Position,
         capture_type: CaptureType,
+        display: Option<String>,
         edge: EdgeRange,
         peer_edge: EdgeRange,
     ) {
         let pos = to_capture_pos(pos);
         send_request(
             &self.request_tx,
-            CaptureRequest::Create(handle, pos, capture_type, edge, peer_edge),
+            CaptureRequest::Create(handle, pos, capture_type, display, edge, peer_edge),
         );
     }
 
-    /// Change the segment of its edge a client is reached through.
-    pub(crate) fn set_edge(&self, handle: CaptureHandle, edge: EdgeRange) {
-        send_request(&self.request_tx, CaptureRequest::SetEdge(handle, edge));
+    /// Change which monitor, and which segment of its edge, a client is reached
+    /// through.
+    pub(crate) fn set_link(&self, handle: CaptureHandle, display: Option<String>, edge: EdgeRange) {
+        send_request(
+            &self.request_tx,
+            CaptureRequest::SetEdge(handle, display, edge),
+        );
     }
 
     /// Replace the edge-crossing thresholds.
@@ -333,18 +345,68 @@ macro_rules! debounce {
 }
 
 /// One registered capture and the part of its edge it can be reached through.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct CaptureEntry {
     handle: CaptureHandle,
     pos: Position,
     kind: CaptureType,
-    /// the segment this client asked for
+    /// the local monitor the link is attached to, by name
+    ///
+    /// `None` = the whole machine, and `requested` is a fraction of the bounding
+    /// box. `Some(name)` scopes it to that monitor's edge.
+    display: Option<String>,
+    /// the segment this client asked for, in its own terms
     requested: EdgeRange,
-    /// the segment it actually gets: `None` when an earlier client on the same
-    /// edge already covers everything it asked for, which makes it unreachable
+    /// the segment it actually gets, as a fraction of the bounding box.
+    ///
+    /// Routing and the barrier both work in those terms - a crossing is reported
+    /// as a fraction of the whole edge - so the display-scoped range is converted
+    /// before it is resolved against its neighbours.
     effective: Option<EdgeRange>,
+    /// the same, converted back into the link's own terms, for reporting
+    effective_own: Option<EdgeRange>,
     /// the segment of the peer's facing edge the cursor lands in
     peer_edge: EdgeRange,
+}
+
+/// Which side of a layout a `Position` is.
+fn side_of(pos: Position) -> input_event::Side {
+    match pos {
+        Position::Left => input_event::Side::Left,
+        Position::Right => input_event::Side::Right,
+        Position::Top => input_event::Side::Top,
+        Position::Bottom => input_event::Side::Bottom,
+    }
+}
+
+/// Map a link's own range onto the bounding box the barrier spans.
+///
+/// Falls back to the range unchanged when no layout is known yet, which is the
+/// state before the backend has answered and what a config written before the
+/// display dimension means anyway.
+fn to_bounds(
+    layout: Option<&input_event::Layout>,
+    pos: Position,
+    display: Option<&str>,
+    range: EdgeRange,
+) -> Option<EdgeRange> {
+    match layout {
+        Some(layout) => layout.to_bounds_range(side_of(pos), display, range),
+        None => Some(range),
+    }
+}
+
+/// The inverse of [`to_bounds`].
+fn from_bounds(
+    layout: Option<&input_event::Layout>,
+    pos: Position,
+    display: Option<&str>,
+    range: EdgeRange,
+) -> Option<EdgeRange> {
+    match layout {
+        Some(layout) => layout.from_bounds_range(side_of(pos), display, range),
+        None => Some(range),
+    }
 }
 
 impl CaptureEntry {
@@ -369,6 +431,7 @@ impl CaptureEntry {
         handle: CaptureHandle,
         pos: Position,
         kind: CaptureType,
+        display: Option<String>,
         requested: EdgeRange,
         peer_edge: EdgeRange,
     ) -> Self {
@@ -376,8 +439,10 @@ impl CaptureEntry {
             handle,
             pos,
             kind,
+            display,
             requested,
             effective: Some(requested),
+            effective_own: Some(requested),
             peer_edge,
         }
     }
@@ -489,10 +554,14 @@ impl CaptureTask {
         let Some(entry) = self.entry(handle) else {
             return;
         };
-        if entry.effective == Some(entry.requested) {
+        /* Compared in the link's own terms: `effective` is a fraction of the
+         * bounding box while `requested` may be a fraction of one monitor, so
+         * comparing them directly reports a conflict for every display-scoped link
+         * that got exactly what it asked for. */
+        if entry.effective_own == Some(entry.requested) {
             return;
         }
-        match entry.effective {
+        match entry.effective_own {
             Some(effective) => log::warn!(
                 "client {handle} asked for {} on the {pos} edge, only {effective} is free",
                 entry.requested
@@ -545,20 +614,43 @@ impl CaptureTask {
         capture: &mut InputCapture,
         pos: Position,
     ) -> Result<(), CaptureError> {
+        /* Every link is expressed in the terms it was configured in - a fraction of
+         * one monitor's edge, or of the whole machine - while routing and the
+         * barrier work in bounding-box terms. Convert once, resolve there, then
+         * convert the answer back for reporting. */
+        let layout = self.layout.borrow().clone();
+        let layout = layout.as_ref();
         let mut clients = self
             .captures
             .iter()
             .enumerate()
             .filter(|(_, entry)| entry.pos == pos && entry.kind == CaptureType::Default)
-            .map(|(index, entry)| (index, entry.handle, entry.requested))
+            .map(|(index, entry)| {
+                let bounds = to_bounds(layout, pos, entry.display.as_deref(), entry.requested);
+                (index, entry.handle, bounds)
+            })
             .collect::<Vec<_>>();
         clients.sort_by_key(|(_, handle, _)| *handle);
-        let requested: Vec<EdgeRange> = clients.iter().map(|(_, _, range)| *range).collect();
-        let effective = EdgeRange::resolve(&requested);
-        for ((index, _, _), range) in clients.iter().zip(effective.iter()) {
-            self.captures[*index].effective = *range;
+        /* a link whose monitor is gone takes part in the resolution as a link that
+         * asked for nothing, so the others are not narrowed by a range that cannot
+         * be placed */
+        let requested: Vec<EdgeRange> = clients
+            .iter()
+            .filter_map(|(_, _, range)| *range)
+            .collect::<Vec<_>>();
+        let mut effective = EdgeRange::resolve(&requested).into_iter();
+        for (index, _, bounds) in &clients {
+            let range = bounds.and_then(|_| effective.next().flatten());
+            self.captures[*index].effective = range;
+            let display = self.captures[*index].display.clone();
+            self.captures[*index].effective_own =
+                range.and_then(|range| from_bounds(layout, pos, display.as_deref(), range));
         }
-        let segments = effective.into_iter().flatten().collect::<Vec<_>>();
+        let effective = clients
+            .iter()
+            .filter_map(|(index, _, _)| self.captures[*index].effective)
+            .collect::<Vec<_>>();
+        let segments = effective;
         capture.set_segments(pos, segments).await?;
         /* Worth a read here - a backend that builds its barriers synchronously
          * (layer-shell) already knows the answer - but not the only one: the
@@ -660,8 +752,10 @@ impl CaptureTask {
                             CaptureRequest::Disable => { /* nothing to do yet */ }
                             CaptureRequest::Preconnect(_) => { /* no connection yet */ }
                             CaptureRequest::RefreshPeerInfo(_) => { /* no connection yet */ }
-                            CaptureRequest::Create(h, p, t, edge, peer_edge) => {
-                                self.add_capture(CaptureEntry::new(h, p, t, edge, peer_edge));
+                            CaptureRequest::Create(h, p, t, display, edge, peer_edge) => {
+                                self.add_capture(CaptureEntry::new(
+                                    h, p, t, display, edge, peer_edge,
+                                ));
                             }
                             CaptureRequest::SetEdge(..) | CaptureRequest::SetSwitchOptions(_) => {
                                 /* no capture to change yet */
@@ -922,8 +1016,8 @@ impl CaptureTask {
                     Some(CaptureRequest::RefreshPeerInfo(h)) => {
                         self.conn.request_peer_info(h).await;
                     }
-                    Some(CaptureRequest::Create(h, p, t, edge, peer_edge)) => {
-                        self.add_capture(CaptureEntry::new(h, p, t, edge, peer_edge));
+                    Some(CaptureRequest::Create(h, p, t, display, edge, peer_edge)) => {
+                        self.add_capture(CaptureEntry::new(h, p, t, display, edge, peer_edge));
                         /* Resolve first: for the first client of an edge this only
                          * stores the segments, and `create` then registers the
                          * barrier with them in one step. A second client on an edge
@@ -937,7 +1031,7 @@ impl CaptureTask {
                             self.report_unreachable(h, p);
                         }
                     }
-                    Some(CaptureRequest::SetEdge(h, edge)) => {
+                    Some(CaptureRequest::SetEdge(h, display, edge)) => {
                         let Some(pos) = self.get_pos(h) else {
                             log::debug!("no capture for client {h}, ignoring its new edge");
                             continue;
@@ -945,6 +1039,7 @@ impl CaptureTask {
                         let Some(entry) = self.captures.iter_mut().find(|e| e.handle == h) else {
                             continue;
                         };
+                        entry.display = display;
                         entry.requested = edge;
                         self.refresh_position(capture, pos).await?;
                         self.report_unreachable(h, pos);
@@ -1385,7 +1480,14 @@ mod routing_tests {
 
     /// A client on the right edge owning `edge`.
     fn client(handle: CaptureHandle, pos: Position, edge: EdgeRange) -> CaptureEntry {
-        CaptureEntry::new(handle, pos, CaptureType::Default, edge, EdgeRange::FULL)
+        CaptureEntry::new(
+            handle,
+            pos,
+            CaptureType::Default,
+            None,
+            edge,
+            EdgeRange::FULL,
+        )
     }
 
     /// The same client after the daemon resolved the edge it shares.
@@ -1440,6 +1542,57 @@ mod routing_tests {
         assert_eq!(route(&entries, Position::Right, 0.7), Some(2));
     }
 
+    /// A link attached to one monitor covers that monitor's stretch of the box,
+    /// not the whole edge.
+    ///
+    /// This is what makes "above the left-hand screen" expressible on a desk whose
+    /// monitors have unequal heights: the link names the monitor and its range is
+    /// a fraction of *that* screen, while routing still works in bounding-box
+    /// fractions because that is what a barrier spans.
+    #[test]
+    fn a_link_on_one_monitor_covers_only_that_monitors_stretch() {
+        /* a 2000x1000 box, two 1000x1000 monitors side by side */
+        let layout = Layout::new(vec![
+            input_event::DisplayInfo::new("LEFT", 0, 0, 1000, 1000, input_event::Rotation::Normal),
+            input_event::DisplayInfo::new(
+                "RIGHT",
+                1000,
+                0,
+                1000,
+                1000,
+                input_event::Rotation::Normal,
+            ),
+        ]);
+
+        /* the full width of RIGHT is the right half of the box */
+        let bounds = to_bounds(Some(&layout), Position::Top, Some("RIGHT"), EdgeRange::FULL)
+            .expect("resolves");
+        assert_eq!(bounds.fractions(), [0.5, 1.0]);
+
+        /* and dropping it half way along RIGHT is 75%..100% of the box */
+        let half = to_bounds(
+            Some(&layout),
+            Position::Top,
+            Some("RIGHT"),
+            EdgeRange::from_fractions(0.5, 1.0).expect("range"),
+        )
+        .expect("resolves");
+        assert_eq!(half.fractions(), [0.75, 1.0]);
+
+        /* without a name the same range means the box, which is the legacy
+         * meaning a config written before this keeps */
+        let machine_level =
+            to_bounds(Some(&layout), Position::Top, None, EdgeRange::FULL).expect("resolves");
+        assert_eq!(machine_level, EdgeRange::FULL);
+
+        /* a monitor that is not in the layout resolves to nothing, so the link
+         * cannot steal a crossing from one that is */
+        assert_eq!(
+            to_bounds(Some(&layout), Position::Top, Some("GONE"), EdgeRange::FULL),
+            None
+        );
+    }
+
     #[test]
     fn an_enter_only_capture_never_takes_a_crossing() {
         // The inbound trigger sits on the same edge; it must not win the routing
@@ -1447,6 +1600,7 @@ mod routing_tests {
             9,
             Position::Right,
             CaptureType::EnterOnly,
+            None,
             EdgeRange::FULL,
             EdgeRange::FULL,
         );

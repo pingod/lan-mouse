@@ -37,6 +37,10 @@ pub(super) struct Machine {
     pub hostname: String,
     pub position: Position,
     pub active: bool,
+    /// the local monitor this link is attached to, by name
+    ///
+    /// `None` = the whole machine, so `edge` is a fraction of the bounding box.
+    pub display: Option<String>,
     /// segment of the local edge the pointer crosses to reach it
     pub edge: EdgeRange,
     /// segment of the peer's facing edge the cursor lands in
@@ -55,11 +59,12 @@ pub(super) enum MachineRequest {
     Move {
         handle: ClientHandle,
         position: Position,
+        display: Option<String>,
         edge: EdgeRange,
         peer_edge: EdgeRange,
     },
     /// give every peer of an edge an equal, adjacent stretch of it
-    AutoArrange(Vec<(ClientHandle, Position, EdgeRange, EdgeRange)>),
+    AutoArrange(Vec<(ClientHandle, Position, Option<String>, EdgeRange, EdgeRange)>),
 }
 
 /// The space between a card and the local screen, in layout units.
@@ -198,21 +203,28 @@ impl State {
         self.local_layout()?.bounds()
     }
 
-    /// The individual monitors, in layout units.
-    fn local_monitors(&self) -> Vec<Screen> {
-        let layout = self.local_layout();
-        let Some(layout) = layout else {
-            return vec![self.local_screen()];
+    /// The individual monitors, in layout units, with their names.
+    ///
+    /// The name is what a link stores, so it has to reach the geometry code: it is
+    /// the only stable handle on "the screen the user dropped this card beside".
+    fn local_monitors(&self) -> Vec<layout::Monitor> {
+        let Some(layout) = self.local_layout() else {
+            /* no backend geometry: one unnamed screen, and links stay machine-level
+             * because there is nothing to name */
+            return vec![layout::Monitor::new("", self.local_screen())];
         };
         layout
             .enabled()
             .map(|display| {
                 let rect = display.on_screen();
-                Screen::new(
-                    rect.x as f64,
-                    rect.y as f64,
-                    rect.width as f64,
-                    rect.height as f64,
+                layout::Monitor::new(
+                    display.name.clone(),
+                    Screen::new(
+                        rect.x as f64,
+                        rect.y as f64,
+                        rect.width as f64,
+                        rect.height as f64,
+                    ),
                 )
             })
             .collect()
@@ -223,6 +235,7 @@ impl State {
             position: machine.position,
             edge: machine.edge,
             peer_edge: machine.peer_edge,
+            display: machine.display.clone(),
             size: layout::peer_size(
                 local,
                 machine.position,
@@ -432,6 +445,7 @@ impl State {
             let placement = drag.placement;
             let changed = self.machine(drag.handle).is_some_and(|machine| {
                 machine.position != placement.position
+                    || machine.display != placement.display
                     || machine.edge != placement.edge
                     || machine.peer_edge != placement.peer_edge
             });
@@ -439,18 +453,22 @@ impl State {
                 (self.on_request)(MachineRequest::Move {
                     handle: drag.handle,
                     position: placement.position,
+                    display: placement.display,
                     edge: placement.edge,
                     peer_edge: placement.peer_edge,
                 });
             }
         }
         if let Some(resize) = self.resize.take() {
-            let position = self.machine(resize.handle).map(|m| m.position);
+            let link = self
+                .machine(resize.handle)
+                .map(|machine| (machine.position, machine.display.clone()));
             if resize.current != resize.start {
-                if let Some(position) = position {
+                if let Some((position, display)) = link {
                     (self.on_request)(MachineRequest::Move {
                         handle: resize.handle,
                         position,
+                        display,
                         edge: resize.current.0,
                         peer_edge: resize.current.1,
                     });
@@ -689,11 +707,23 @@ fn auto_arrange(state: &Rc<RefCell<State>>) {
     let requests = {
         let state = state.borrow();
         let mut requests = Vec::new();
-        for position in positions() {
+        /* Grouped by the monitor as well as the edge: two peers above two
+         * different screens are not competing for one stretch, so splitting the
+         * edge between them would give each half of a screen it is not on. */
+        let mut groups: Vec<(Position, Option<String>)> = Vec::new();
+        for machine in state.machines.iter().filter(|machine| machine.active) {
+            let key = (machine.position, machine.display.clone());
+            if !groups.contains(&key) {
+                groups.push(key);
+            }
+        }
+        for (position, display) in groups {
             let on_edge = state
                 .machines
                 .iter()
-                .filter(|machine| machine.position == position && machine.active)
+                .filter(|machine| {
+                    machine.active && machine.position == position && machine.display == display
+                })
                 .collect::<Vec<_>>();
             if on_edge.len() < 2 {
                 continue;
@@ -701,7 +731,7 @@ fn auto_arrange(state: &Rc<RefCell<State>>) {
             let shares = layout::auto_arrange(on_edge.len());
             for (machine, (edge, peer_edge)) in on_edge.into_iter().zip(shares) {
                 if machine.edge != edge || machine.peer_edge != peer_edge {
-                    requests.push((machine.handle, position, edge, peer_edge));
+                    requests.push((machine.handle, position, display.clone(), edge, peer_edge));
                 }
             }
         }
@@ -873,7 +903,7 @@ fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
             if state
                 .local_monitors()
                 .iter()
-                .any(|rect| rect.contains(lx, ly))
+                .any(|monitor| monitor.rect.contains(lx, ly))
             {
                 state.panning = Some((x, y));
                 area.set_cursor_from_name(Some("grabbing"));
@@ -894,6 +924,7 @@ fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
                 current: rect,
                 placement: Placement {
                     position: machine.position,
+                    display: machine.display.clone(),
                     edge: machine.edge,
                     peer_edge: machine.peer_edge,
                     size: (rect.w, rect.h),
@@ -949,7 +980,7 @@ fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
             let placement = state
                 .drag
                 .as_ref()
-                .map(|drag| (drag.handle, drag.placement));
+                .map(|drag| (drag.handle, drag.placement.clone()));
             if let Some((handle, placement)) = placement {
                 if let Some(machine) = state.machines.iter_mut().find(|m| m.handle == handle) {
                     machine.position = placement.position;
@@ -1039,9 +1070,11 @@ fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
                     if let Some(handle) = state.hover {
                         if let Some(machine) = state.machine(handle) {
                             let (edge, peer_edge) = (machine.edge, machine.peer_edge);
+                            let display = state.machine(handle).and_then(|m| m.display.clone());
                             (state.on_request)(MachineRequest::Move {
                                 handle,
                                 position,
+                                display,
                                 edge,
                                 peer_edge,
                             });
@@ -1070,6 +1103,7 @@ mod tests {
     fn machine(handle: ClientHandle, position: Position, edge: (f64, f64)) -> Machine {
         Machine {
             handle,
+            display: None,
             hostname: format!("host{handle}"),
             position,
             active: true,
@@ -1339,6 +1373,7 @@ mod render {
     ) -> Machine {
         Machine {
             handle,
+            display: None,
             hostname: format!("host{handle}"),
             position,
             active,
@@ -1600,6 +1635,7 @@ mod render {
         /* the rotated one is taller than it is wide on screen */
         let rotated = monitors
             .iter()
+            .map(|monitor| monitor.rect)
             .find(|rect| (rect.w - 1440.0).abs() < 1.0)
             .expect("the rotated monitor");
         assert!(rotated.h > rotated.w, "{rotated:?}");
@@ -1608,7 +1644,10 @@ mod render {
          * left is empty */
         let bounds = state.local_screen();
         assert_eq!((bounds.w, bounds.h), (4000.0, 2560.0));
-        let covered: f64 = monitors.iter().map(|rect| rect.w * rect.h).sum();
+        let covered: f64 = monitors
+            .iter()
+            .map(|monitor| monitor.rect.w * monitor.rect.h)
+            .sum();
         assert!(
             covered < bounds.w * bounds.h,
             "the monitors cover the whole bounding box, so they were drawn as one"

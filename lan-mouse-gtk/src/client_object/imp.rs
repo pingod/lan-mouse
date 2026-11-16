@@ -25,6 +25,8 @@ pub struct ClientObject {
     #[property(name = "last-seen", get, set, type = u64, member = last_seen)]
     #[property(name = "forwarded", get, set, type = u64, member = forwarded)]
     #[property(name = "received", get, set, type = u64, member = received)]
+    /// the local monitor this link is attached to, empty when machine-level
+    #[property(name = "display", get, set, type = String, member = display)]
     #[property(name = "edge-start", get, set, type = u32, member = edge_start, maximum = 1000)]
     #[property(name = "edge-end", get, set, type = u32, member = edge_end, maximum = 1000)]
     #[property(name = "peer-edge-start", get, set, type = u32, member = peer_edge_start, maximum = 1000)]

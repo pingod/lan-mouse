@@ -15,6 +15,8 @@
 
 use std::fmt;
 
+use crate::EdgeRange;
+
 /// Which side of the layout a crossing happened on.
 ///
 /// A local enum rather than `lan_mouse_ipc::Position`: this crate is the bottom of
@@ -388,6 +390,153 @@ impl Layout {
         Some((display, local))
     }
 
+    /// The absolute interval a link covers on `side`'s edge.
+    ///
+    /// `display` names the monitor the link is attached to, and `edge` is a
+    /// fraction of *that monitor's* edge. Without a name the link is
+    /// machine-level and `edge` is a fraction of the bounding box, which is what
+    /// configs written before the display dimension existed mean.
+    ///
+    /// `None` when a named monitor is not in the layout: the machine it belonged
+    /// to is gone, or the compositor renamed it. The link cannot be resolved, and
+    /// pretending it covers the whole edge would make it silently steal crossings
+    /// from a link that does exist.
+    pub fn resolve(
+        &self,
+        side: Side,
+        display: Option<&str>,
+        edge: EdgeRange,
+    ) -> Option<(i32, i32)> {
+        let (lo, hi) = match display {
+            Some(name) => {
+                let monitor = self
+                    .enabled()
+                    .find(|candidate| candidate.name == name)?
+                    .on_screen();
+                if side.is_vertical() {
+                    (monitor.y, monitor.bottom())
+                } else {
+                    (monitor.x, monitor.right())
+                }
+            }
+            None => {
+                let bounds = self.bounds()?;
+                if side.is_vertical() {
+                    (bounds.y, bounds.bottom())
+                } else {
+                    (bounds.x, bounds.right())
+                }
+            }
+        };
+        /* `end` is exclusive, so the last pixel of the span is one before it */
+        let span = (hi - lo) as f64;
+        if span < 2.0 {
+            return None;
+        }
+        let scale = |permille: u16| lo as f64 + (permille as f64 / 1000.0) * span;
+        let start = (scale(edge.start()).round() as i32).clamp(lo, hi - 1);
+        let stop = (scale(edge.end()).round() as i32).clamp(start + 1, hi);
+        Some((start, stop))
+    }
+
+    /// A link's range as a fraction of the bounding box's edge.
+    ///
+    /// The capture backend reports a crossing as a fraction of the *whole* edge -
+    /// that is what a barrier spans - so routing has to be done in those terms
+    /// even when a link is attached to a single monitor.
+    pub fn to_bounds_range(
+        &self,
+        side: Side,
+        display: Option<&str>,
+        edge: EdgeRange,
+    ) -> Option<EdgeRange> {
+        let (start, stop) = self.resolve(side, display, edge)?;
+        let bounds = self.bounds()?;
+        let (lo, hi) = if side.is_vertical() {
+            (bounds.y, bounds.bottom())
+        } else {
+            (bounds.x, bounds.right())
+        };
+        let span = (hi - lo) as f64;
+        if span < 2.0 {
+            return None;
+        }
+        EdgeRange::from_fractions((start - lo) as f64 / span, (stop - lo) as f64 / span).ok()
+    }
+
+    /// A range measured against the bounding box, expressed against `display`.
+    ///
+    /// The inverse of [`Layout::to_bounds_range`], used to report back what a
+    /// link ended up with in the terms it was configured in.
+    pub fn from_bounds_range(
+        &self,
+        side: Side,
+        display: Option<&str>,
+        range: EdgeRange,
+    ) -> Option<EdgeRange> {
+        let (lo, hi) = match display {
+            Some(name) => {
+                let monitor = self
+                    .enabled()
+                    .find(|candidate| candidate.name == name)?
+                    .on_screen();
+                if side.is_vertical() {
+                    (monitor.y, monitor.bottom())
+                } else {
+                    (monitor.x, monitor.right())
+                }
+            }
+            None => {
+                let bounds = self.bounds()?;
+                if side.is_vertical() {
+                    (bounds.y, bounds.bottom())
+                } else {
+                    (bounds.x, bounds.right())
+                }
+            }
+        };
+        let bounds = self.bounds()?;
+        let (outer_lo, outer_hi) = if side.is_vertical() {
+            (bounds.y, bounds.bottom())
+        } else {
+            (bounds.x, bounds.right())
+        };
+        let outer_span = (outer_hi - outer_lo) as f64;
+        let span = (hi - lo) as f64;
+        if outer_span < 2.0 || span < 2.0 {
+            return None;
+        }
+        let abs = |permille: u16| outer_lo as f64 + (permille as f64 / 1000.0) * outer_span;
+        EdgeRange::from_fractions(
+            (abs(range.start()) - lo as f64) / span,
+            (abs(range.end()) - lo as f64) / span,
+        )
+        .ok()
+    }
+
+    /// Which monitor a link with no explicit display is attached to, if any.
+    ///
+    /// The monitor that covers the largest part of the link's stretch. Used when
+    /// a machine-level link has to be drawn, so the card can be anchored to a
+    /// screen rather than to the box.
+    pub fn monitor_for(&self, side: Side, edge: EdgeRange) -> Option<&DisplayInfo> {
+        let (start, stop) = self.resolve(side, None, edge)?;
+        self.enabled()
+            .map(|display| {
+                let rect = display.on_screen();
+                let (lo, hi) = if side.is_vertical() {
+                    (rect.y, rect.bottom())
+                } else {
+                    (rect.x, rect.right())
+                };
+                let overlap = stop.min(hi) - start.max(lo);
+                (display, overlap)
+            })
+            .filter(|(_, overlap)| *overlap > 0)
+            .max_by_key(|(_, overlap)| *overlap)
+            .map(|(display, _)| display)
+    }
+
     /// A short human description, for the peer details row.
     pub fn describe(&self) -> String {
         if self.displays.is_empty() {
@@ -531,6 +680,104 @@ mod tests {
         let (display, local) = layout.display_at_edge(Side::Left, 0.5).expect("a monitor");
         assert_eq!(display.name, "DP-3");
         assert!((local - 160.0 / 1440.0).abs() < 0.01, "{local}");
+    }
+
+    #[test]
+    fn a_link_on_one_monitor_is_resolved_against_that_monitor() {
+        let layout = two_monitors();
+        /* the full width of DP-3's top edge: x 0..2560 */
+        let span = layout
+            .resolve(Side::Top, Some("DP-3"), EdgeRange::FULL)
+            .expect("resolves");
+        assert_eq!(span, (0, 2560));
+
+        /* and the same link as a fraction of the bounding box is 0..64% */
+        let range = layout
+            .to_bounds_range(Side::Top, Some("DP-3"), EdgeRange::FULL)
+            .expect("resolves");
+        assert_eq!(range.fractions(), [0.0, 0.64]);
+    }
+
+    #[test]
+    fn a_link_on_the_rotated_monitor_starts_where_that_monitor_does() {
+        let layout = two_monitors();
+        /* DP-2 occupies x 2560..4000, which is 64%..100% of the 4000 px box */
+        let range = layout
+            .to_bounds_range(Side::Top, Some("DP-2"), EdgeRange::FULL)
+            .expect("resolves");
+        assert_eq!(range.fractions(), [0.64, 1.0]);
+        /* and its full height, for a link on one of its horizontal edges */
+        let span = layout
+            .resolve(Side::Right, Some("DP-2"), EdgeRange::FULL)
+            .expect("resolves");
+        assert_eq!(span, (0, 2560));
+    }
+
+    #[test]
+    fn a_machine_level_link_still_covers_the_whole_box() {
+        let layout = two_monitors();
+        let range = layout
+            .to_bounds_range(Side::Top, None, EdgeRange::FULL)
+            .expect("resolves");
+        assert_eq!(range, EdgeRange::FULL);
+        let half = layout
+            .to_bounds_range(
+                Side::Top,
+                None,
+                EdgeRange::from_fractions(0.0, 0.5).expect("range"),
+            )
+            .expect("resolves");
+        assert_eq!(half.fractions(), [0.0, 0.5]);
+    }
+
+    #[test]
+    fn a_link_naming_a_monitor_that_is_gone_does_not_resolve() {
+        let layout = two_monitors();
+        assert_eq!(
+            layout.resolve(Side::Top, Some("HDMI-9"), EdgeRange::FULL),
+            None
+        );
+        assert_eq!(
+            layout.to_bounds_range(Side::Top, Some("HDMI-9"), EdgeRange::FULL),
+            None
+        );
+    }
+
+    #[test]
+    fn converting_to_the_bounding_box_and_back_is_stable() {
+        let layout = two_monitors();
+        let original = EdgeRange::from_fractions(0.25, 0.75).expect("range");
+        for display in [Some("DP-3"), Some("DP-2"), None] {
+            let bounds = layout
+                .to_bounds_range(Side::Top, display, original)
+                .expect("resolves");
+            let back = layout
+                .from_bounds_range(Side::Top, display, bounds)
+                .expect("resolves");
+            let [a, b] = back.fractions();
+            let [c, d] = original.fractions();
+            assert!((a - c).abs() < 0.01, "{display:?}: {a} vs {c}");
+            assert!((b - d).abs() < 0.01, "{display:?}: {b} vs {d}");
+        }
+    }
+
+    #[test]
+    fn a_machine_level_link_is_attributed_to_the_monitor_it_covers() {
+        let layout = two_monitors();
+        let dp3 = layout
+            .monitor_for(
+                Side::Top,
+                EdgeRange::from_fractions(0.0, 0.6).expect("range"),
+            )
+            .expect("a monitor");
+        assert_eq!(dp3.name, "DP-3");
+        let dp2 = layout
+            .monitor_for(
+                Side::Top,
+                EdgeRange::from_fractions(0.7, 1.0).expect("range"),
+            )
+            .expect("a monitor");
+        assert_eq!(dp2.name, "DP-2");
     }
 
     #[test]

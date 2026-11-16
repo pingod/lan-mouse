@@ -154,6 +154,16 @@ pub struct ClientConfig {
     /// without the key decodes to.
     #[serde(default = "full_edge")]
     pub edge: EdgeRange,
+    /// the local monitor this link is attached to, by name.
+    ///
+    /// `None` means the whole machine: `edge` is then a fraction of the bounding
+    /// box around every monitor, which is what a config written before monitors
+    /// were individual rectangles means. `Some(name)` scopes `edge` to that
+    /// monitor's edge, which is what the arrangement canvas produces when a peer is
+    /// dropped beside one screen - a desk with unequal heights has edges that
+    /// belong to one monitor only, and the box cannot express them.
+    #[serde(default)]
+    pub display: Option<String>,
     /// segment of this client's facing edge the cursor lands in
     ///
     /// The crossing point is mapped from [`Self::edge`] onto this range, the way
@@ -206,6 +216,7 @@ impl Default for ClientConfig {
             pos: Default::default(),
             cmd: None,
             leave_cmd: None,
+            display: None,
             edge: EdgeRange::FULL,
             peer_edge: EdgeRange::FULL,
         }
@@ -373,6 +384,9 @@ pub enum FrontendRequest {
         enter_hook: Option<String>,
         /// command to run when the pointer leaves this client
         leave_hook: Option<String>,
+        /// the local monitor this link is attached to, by name
+        #[serde(default)]
+        display: Option<String>,
         /// segment of the local edge the pointer crosses to reach it
         #[serde(default = "full_edge")]
         edge: EdgeRange,
@@ -410,6 +424,9 @@ pub enum FrontendRequest {
         handle: ClientHandle,
         /// the edge of this screen the client sits behind
         position: Position,
+        /// the local monitor the link is attached to, by name
+        #[serde(default)]
+        display: Option<String>,
         /// segment of that edge the pointer crosses to reach it
         edge: EdgeRange,
         /// segment of the client's facing edge the cursor lands in
@@ -771,6 +788,7 @@ mod serialization_tests {
         let request = FrontendRequest::UpdateLink {
             handle: 7,
             position: Position::Bottom,
+            display: Some("DP-3".to_owned()),
             edge: EdgeRange::from_fractions(0.0, 0.4).expect("range"),
             peer_edge: EdgeRange::from_fractions(0.6, 1.0).expect("range"),
         };

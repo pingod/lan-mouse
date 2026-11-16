@@ -32,6 +32,7 @@ impl ClientObject {
             .property("last-seen", state.last_seen.unwrap_or(0))
             .property("forwarded", state.forwarded)
             .property("received", state.received)
+            .property("display", client.display.clone().unwrap_or_default())
             .property("edge-start", client.edge.start() as u32)
             .property("edge-end", client.edge.end() as u32)
             .property("peer-edge-start", client.peer_edge.start() as u32)
@@ -70,6 +71,8 @@ pub struct ClientData {
     pub last_seen: u64,
     pub forwarded: u64,
     pub received: u64,
+    /// the local monitor this link is attached to, empty when machine-level
+    pub display: String,
     /// segment of the local edge this client is reached through, in permille
     pub edge_start: u32,
     /// first permille after that segment

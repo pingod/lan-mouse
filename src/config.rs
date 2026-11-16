@@ -130,6 +130,13 @@ struct TomlClient {
     activate_on_startup: Option<bool>,
     enter_hook: Option<String>,
     leave_hook: Option<String>,
+    /// the local monitor this link is attached to, by name
+    ///
+    /// `display = "DP-3"` scopes `edge` to that monitor's edge. Absent means the
+    /// whole machine, so every configuration written before monitors were
+    /// individual rectangles keeps working unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display: Option<String>,
     /// segment of the local edge this client is reached through
     ///
     /// Written as `[start, end]` fractions of the edge, the way Synergy writes
@@ -393,6 +400,10 @@ pub struct ConfigClient {
     pub active: bool,
     pub enter_hook: Option<String>,
     pub leave_hook: Option<String>,
+    /// the local monitor this link is attached to, by name
+    ///
+    /// `None` = the whole machine: `edge` is a fraction of the bounding box.
+    pub display: Option<String>,
     /// segment of the local edge this client is reached through
     pub edge: EdgeRange,
     /// segment of this client's facing edge the cursor lands in
@@ -416,6 +427,7 @@ impl From<TomlClient> for ConfigClient {
             active,
             enter_hook,
             leave_hook,
+            display: toml.display,
             edge: toml.edge.unwrap_or(EdgeRange::FULL),
             peer_edge: toml.peer_edge.unwrap_or(EdgeRange::FULL),
         }
@@ -435,6 +447,7 @@ impl From<ConfigClient> for TomlClient {
             Some(client.port)
         };
         let position = Some(client.pos);
+        let display = client.display;
         let activate_on_startup = if client.active { Some(true) } else { None };
         let enter_hook = client.enter_hook;
         let leave_hook = client.leave_hook;
@@ -452,6 +465,7 @@ impl From<ConfigClient> for TomlClient {
             activate_on_startup,
             enter_hook,
             leave_hook,
+            display,
             edge,
             peer_edge,
         }
@@ -993,6 +1007,7 @@ mod edge_tests {
             active: false,
             enter_hook: None,
             leave_hook: None,
+            display: None,
             edge,
             peer_edge,
         }

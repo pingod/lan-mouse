@@ -146,8 +146,40 @@ Two rectangles are derived from it and they are not the same thing:
 | `Layout::bounds()` | the bounding box of the enabled monitors | edge ranges, barriers, the corner radius |
 | `Layout::enabled()` | the individual monitors | the arrangement canvas, hit testing |
 
-An edge range is a fraction of the *bounding box*, because that is what a barrier
-spans. The canvas draws the *monitors*, because that is what exists.
+An edge range is a fraction of *whatever the link names*. That is the second thing
+the bounding box gets wrong: on a desk whose monitors have unequal heights, part of
+the box's edge belongs to a screen no link is attached to. Here the box top is the
+rotated panel's, while the upright one's top is 1120 px lower - so "above the
+left-hand screen" cannot be written as a stretch of the box without also naming
+which screen that stretch is on.
+
+A link therefore carries an optional `display`:
+
+```toml
+[[clients]]
+hostname = "192.168.1.5"
+position = "top"
+display = "DP-3"      # edge is a fraction of DP-3's top edge
+edge = [0.0, 1.0]
+```
+
+| `display` | `edge` means | barrier |
+|---|---|---|
+| `Some(name)` | a fraction of *that monitor's* edge | only that monitor |
+| `None` | a fraction of the bounding box | every monitor touching that side |
+
+`None` is what every config written before this means, so nothing had to be
+migrated. The canvas produces `Some` as soon as it can name a screen, which is why
+a peer dropped beside one monitor stays attached to it when another is plugged in:
+the fraction is of that screen's edge, not of a box whose size depends on
+everything else.
+
+Routing still happens in bounding-box terms, because a crossing is reported as a
+fraction of the whole edge - that is what a barrier spans. `Layout::to_bounds_range`
+converts, `Layout::from_bounds_range` converts back for reporting, and a link naming
+a monitor that is no longer in the layout resolves to nothing rather than to the
+whole edge: a machine that was unplugged must not start stealing crossings from one
+that is still there.
 
 The layout travels in the existing `PeerInfo` display slot, as one entry per
 monitor: `name:x,y:WxH:rotation:enabled`, separated by `;`. That is more than the

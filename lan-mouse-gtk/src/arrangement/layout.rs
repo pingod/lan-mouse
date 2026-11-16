@@ -78,10 +78,44 @@ impl Screen {
     }
 }
 
+/// One local monitor: its name and the rectangle it occupies.
+///
+/// The name is what a link stores, so it has to travel with the rectangle; the
+/// geometry alone cannot say which screen a link belongs to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Monitor {
+    pub name: String,
+    pub rect: Screen,
+}
+
+impl Monitor {
+    pub fn new(name: impl Into<String>, rect: Screen) -> Self {
+        Self {
+            name: name.into(),
+            rect,
+        }
+    }
+}
+
+/// The span of a rectangle's edge along the axis a crossing is measured on.
+fn span_of(rect: Screen, position: Position) -> (f64, f64) {
+    match position {
+        Position::Left | Position::Right => (rect.y, rect.bottom()),
+        Position::Top | Position::Bottom => (rect.x, rect.right()),
+    }
+}
+
 /// The part of a peer's configuration the geometry depends on.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Placement {
     pub position: Position,
+    /// the local monitor the link is attached to, by name.
+    ///
+    /// `None` = the whole machine, and then `edge` is a fraction of the bounding
+    /// box. `Some(name)` scopes `edge` to that monitor's edge, which is what makes
+    /// "above the left-hand screen" expressible on a desk whose monitors have
+    /// unequal heights.
+    pub display: Option<String>,
     /// the segment of the local edge the peer is reached through
     pub edge: EdgeRange,
     /// the segment of the peer's facing edge the cursor lands in
@@ -137,23 +171,13 @@ pub fn peer_size(
 /// peer's real size disagrees with that mapping - `our 0-50% -> its 0-100%` on two
 /// identical screens - it sticks out past the local edge, and that is the honest
 /// picture: the cursor is stretched across a longer edge than the one it left.
-pub fn place(local: Screen, monitors: &[Screen], placement: &Placement) -> Screen {
+pub fn place(local: Screen, monitors: &[Monitor], placement: &Placement) -> Screen {
     let position = placement.position;
-    let edge_len = local.extent_along(position);
+    let anchor = anchor_monitor(local, monitors, placement);
+    let (low, edge_len) = span_of(anchor, position);
     let theirs = placement.size_along(position);
-    let low = local.edge_start(position);
     let segment_lo = low + placement.edge.start() as f64 / 1000.0 * edge_len;
     let touching_lo = segment_lo - placement.peer_edge.start() as f64 / 1000.0 * theirs;
-    /* Anchor to the monitor this link actually touches, not to the bounding box.
-     *
-     * `local` is the box around every monitor, and on a desk with unequal heights
-     * its top edge can be a monitor the link does not touch at all: here the box's
-     * top is the rotated panel's, while the link covers the stretch belonging to
-     * the upright one, whose top is 1120 px lower. Anchoring to the box drew the
-     * peer floating far above the screen it belongs to. The barrier is created per
-     * monitor (`segment_barrier` uses that monitor's own edge), so this is also the
-     * only anchor that makes the picture agree with the routing. */
-    let anchor = anchor_monitor(local, monitors, placement);
     match position {
         Position::Left => Screen::new(
             anchor.x - GAP - placement.size.0,
@@ -187,30 +211,42 @@ pub fn place(local: Screen, monitors: &[Screen], placement: &Placement) -> Scree
 /// Falls back to the bounding box when nothing overlaps, so a placement is always
 /// drawable - a link that covers no monitor is a configuration mistake the daemon
 /// reports, not a reason to leave a card at the origin.
-pub fn anchor_monitor(local: Screen, monitors: &[Screen], placement: &Placement) -> Screen {
-    let position = placement.position;
-    let edge_len = local.extent_along(position);
-    if edge_len <= 0.0 || monitors.is_empty() {
+pub fn anchor_monitor(local: Screen, monitors: &[Monitor], placement: &Placement) -> Screen {
+    if monitors.is_empty() {
         return local;
     }
-    let low = local.edge_start(position);
+    /* A named monitor is the answer: the user said which screen the link belongs
+     * to, and second-guessing it from the range would silently move the card if
+     * the range covers two screens. */
+    if let Some(name) = placement.display.as_deref() {
+        if let Some(monitor) = monitors.iter().find(|monitor| monitor.name == name) {
+            return monitor.rect;
+        }
+        /* The named monitor is gone - unplugged, renamed. Falling back to the box
+         * keeps the link visible so the user can re-attach it, instead of dropping
+         * the card off the canvas. */
+        return local;
+    }
+    /* No name: a machine-level link, attributed to the monitor it covers most. */
+    let position = placement.position;
+    let (low, edge_len) = (local.edge_start(position), local.extent_along(position));
+    if edge_len <= 0.0 {
+        return local;
+    }
     let segment_lo = low + placement.edge.start() as f64 / 1000.0 * edge_len;
     let segment_hi = low + placement.edge.end() as f64 / 1000.0 * edge_len;
     monitors
         .iter()
         .map(|monitor| {
-            let (lo, hi) = match position {
-                Position::Left | Position::Right => (monitor.y, monitor.bottom()),
-                Position::Top | Position::Bottom => (monitor.x, monitor.right()),
-            };
+            let (lo, hi) = span_of(monitor.rect, position);
             let overlap = segment_hi.min(hi) - segment_lo.max(lo);
-            (*monitor, overlap.max(0.0))
+            (monitor, overlap.max(0.0))
         })
         /* the largest overlap; on a tie the earlier monitor wins, so the anchor
          * does not change while a card is dragged across two equal ones */
         .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .filter(|(_, overlap)| *overlap > 0.0)
-        .map(|(monitor, _)| monitor)
+        .map(|(monitor, _)| monitor.rect)
         .unwrap_or(local)
 }
 
@@ -231,27 +267,22 @@ impl Placement {
 /// the user positions a screen, and the overlap of the two facing edges becomes
 /// the routing. A drop that does not overlap the local edge is pulled back until
 /// it does, because a peer nothing can reach is not a layout, it is a bug.
-pub fn snap(local: Screen, monitors: &[Screen], candidate: Screen) -> Placement {
+pub fn snap(local: Screen, monitors: &[Monitor], candidate: Screen) -> Placement {
+    let target = nearest_monitor(monitors, candidate);
     let position = nearest_edge(monitors, local, candidate);
-    let edge_len = local.extent_along(position);
-    let low = local.edge_start(position);
-    let touching_lo = candidate.touching_start(position);
-
-    /* The overlap is measured against the monitor the card was dropped on, not
-     * against the whole bounding box: on a desk with unequal heights the box's
-     * edge includes stretches no monitor has, and using it would claim a link
-     * covering area the pointer cannot even be in. */
-    let anchor = nearest_monitor(monitors, local, candidate);
-    let (anchor_lo, anchor_hi) = match position {
-        Position::Left | Position::Right => (anchor.y, anchor.bottom()),
-        Position::Top | Position::Bottom => (anchor.x, anchor.right()),
-    };
+    let anchor_rect = target.map(|monitor| monitor.rect).unwrap_or(local);
+    let (anchor_lo, anchor_hi) = span_of(anchor_rect, position);
     let theirs = match position {
         Position::Left | Position::Right => candidate.h,
         Position::Top | Position::Bottom => candidate.w,
     };
+    let touching_lo = candidate.touching_start(position);
 
-    /* the part of the peer's edge that actually faces the monitor's edge */
+    /* The overlap is measured against the monitor the card was dropped on, so the
+     * resulting range covers exactly that screen. Naming the monitor and scoping
+     * the range to it also makes the link survive a change in the *other*
+     * monitors: the fraction is of this screen's edge, not of a box whose size
+     * depends on everything plugged in. */
     const MIN_PERMILLE: f64 = 2.0;
     let anchor_len = anchor_hi - anchor_lo;
     let min_len = (anchor_len * MIN_PERMILLE / 1000.0).max(1.0);
@@ -278,9 +309,15 @@ pub fn snap(local: Screen, monitors: &[Screen], candidate: Screen) -> Placement 
             .unwrap_or(EdgeRange::FULL)
     };
 
+    /* a link attached to the only monitor is still named, so it stays attached to
+     * that screen if another one is plugged in later */
+    let display = target
+        .filter(|monitor| monitors.len() > 1 || !monitor.name.is_empty())
+        .map(|monitor| monitor.name.clone());
     Placement {
         position,
-        edge: range(overlap_lo, overlap_hi, low, edge_len),
+        display,
+        edge: range(overlap_lo, overlap_hi, anchor_lo, anchor_len),
         peer_edge: range(overlap_lo, overlap_hi, touching_lo, theirs),
         size: (candidate.w, candidate.h),
     }
@@ -294,12 +331,14 @@ pub fn snap(local: Screen, monitors: &[Screen], candidate: Screen) -> Placement 
 /// gap to each edge instead would pick the edge the candidate overlaps *most*,
 /// which flips to the opposite side the moment a big screen is dropped near the
 /// middle.
-pub fn nearest_edge(monitors: &[Screen], local: Screen, candidate: Screen) -> Position {
+pub fn nearest_edge(monitors: &[Monitor], local: Screen, candidate: Screen) -> Position {
     /* Measured against the monitor the card is being dropped on. Against the
      * bounding box, a desk with a rotated panel puts the box's centre in empty
      * space, and a card dragged up-and-left from it has a larger horizontal offset
      * than a vertical one - so "above the left-hand screen" was read as "left". */
-    let reference = nearest_monitor(monitors, local, candidate);
+    let reference = nearest_monitor(monitors, candidate)
+        .map(|monitor| monitor.rect)
+        .unwrap_or(local);
     let (lx, ly) = reference.center();
     let (cx, cy) = candidate.center();
     let (dx, dy) = (cx - lx, cy - ly);
@@ -320,16 +359,17 @@ pub fn nearest_edge(monitors: &[Screen], local: Screen, candidate: Screen) -> Po
 ///
 /// Falls back to the bounding box when the caller knows no monitors, so every
 /// placement stays well defined on a backend that reports no geometry.
-pub fn nearest_monitor(monitors: &[Screen], local: Screen, candidate: Screen) -> Screen {
+pub fn nearest_monitor(monitors: &[Monitor], candidate: Screen) -> Option<&Monitor> {
     if monitors.is_empty() {
-        return local;
+        return None;
     }
     /* Overlap first: a card dropped on top of a monitor obviously belongs to it,
      * and the largest overlap is also the least surprising choice when it covers
      * two. */
-    let overlap = |monitor: &Screen| {
-        let dx = monitor.right().min(candidate.right()) - monitor.x.max(candidate.x);
-        let dy = monitor.bottom().min(candidate.bottom()) - monitor.y.max(candidate.y);
+    let overlap = |monitor: &Monitor| {
+        let rect = monitor.rect;
+        let dx = rect.right().min(candidate.right()) - rect.x.max(candidate.x);
+        let dy = rect.bottom().min(candidate.bottom()) - rect.y.max(candidate.y);
         dx.max(0.0) * dy.max(0.0)
     };
     if let Some(monitor) = monitors
@@ -337,7 +377,7 @@ pub fn nearest_monitor(monitors: &[Screen], local: Screen, candidate: Screen) ->
         .filter(|monitor| overlap(monitor) > 0.0)
         .max_by(|a, b| overlap(a).total_cmp(&overlap(b)))
     {
-        return *monitor;
+        return Some(monitor);
     }
     /* Otherwise the closest by the distance between the centres.
      *
@@ -346,17 +386,13 @@ pub fn nearest_monitor(monitors: &[Screen], local: Screen, candidate: Screen) ->
      * both zero and the wrong monitor wins. The centre distance has no such tie
      * unless the card is exactly between them, which a drop never is. */
     let (cx, cy) = candidate.center();
-    monitors
-        .iter()
-        .min_by(|a, b| {
-            let distance = |monitor: &Screen| {
-                let (mx, my) = monitor.center();
-                (mx - cx).powi(2) + (my - cy).powi(2)
-            };
-            distance(a).total_cmp(&distance(b))
-        })
-        .copied()
-        .unwrap_or(local)
+    monitors.iter().min_by(|a, b| {
+        let distance = |monitor: &Monitor| {
+            let (mx, my) = monitor.rect.center();
+            (mx - cx).powi(2) + (my - cy).powi(2)
+        };
+        distance(a).total_cmp(&distance(b))
+    })
 }
 
 /// Split the whole edge into `count` equal, adjacent ranges.
@@ -396,7 +432,7 @@ pub const GUTTER: f64 = 40.0;
 /// it hangs on, so it reaches past the peer configured for `55-100%`.
 pub fn place_all(
     local: Screen,
-    monitors: &[Screen],
+    monitors: &[Monitor],
     placements: &[(ClientHandle, Placement)],
 ) -> Vec<(ClientHandle, Screen)> {
     let mut out = Vec::with_capacity(placements.len());
@@ -421,7 +457,7 @@ pub fn place_all(
         let offsets = lane_offsets(position, &rects, &lane_of);
         for ((handle, placement), (rect, lane)) in group
             .iter()
-            .map(|(handle, placement)| (*handle, *placement))
+            .map(|(handle, placement)| (*handle, (*placement).clone()))
             .zip(
                 rects
                     .iter()
@@ -511,12 +547,14 @@ mod tests {
     /// `place` for a desk with one monitor: the tests that only care about the
     /// geometry of the link do not need to pass the monitor list.
     fn place_one(local: Screen, placement: &Placement) -> Screen {
-        place(local, &[local], placement)
+        place(local, &[Monitor::new("test", local)], placement)
     }
 
     /// `snap` for a desk with one monitor.
     fn snap_one(local: Screen, candidate: Screen) -> Placement {
-        snap(local, &[local], candidate)
+        /* an unnamed monitor, so the placement stays machine-level and the tests
+         * that only care about the geometry of the link keep their meaning */
+        snap(local, &[Monitor::new("", local)], candidate)
     }
 
     /// A 1920x1080 local screen.
@@ -536,6 +574,7 @@ mod tests {
     ) -> Placement {
         Placement {
             position,
+            display: None,
             edge: range(edge.0, edge.1),
             peer_edge: range(peer_edge.0, peer_edge.1),
             size,
@@ -711,6 +750,7 @@ mod tests {
         let peer_edge = EdgeRange::FULL;
         let size = peer_size(local(), Position::Right, edge, peer_edge, None);
         let original = Placement {
+            display: None,
             position: Position::Right,
             edge,
             peer_edge,
@@ -732,6 +772,7 @@ mod tests {
         let placed = place_one(
             local(),
             &Placement {
+                display: None,
                 position: Position::Right,
                 edge,
                 peer_edge,
@@ -788,7 +829,7 @@ mod tests {
                 placement(Position::Right, (0.5, 1.0), (0.0, 1.0), (1920.0, 540.0)),
             ),
         ];
-        let placed = place_all(local(), &[local()], &placements);
+        let placed = place_all(local(), &[Monitor::new("test", local())], &placements);
         let first = placed[0].1;
         let second = placed[1].1;
         // same distance from the edge, stacked along it
@@ -813,7 +854,7 @@ mod tests {
                 placement(Position::Right, (0.55, 1.0), (0.0, 1.0), (1920.0, 1080.0)),
             ),
         ];
-        let placed = place_all(local(), &[local()], &placements);
+        let placed = place_all(local(), &[Monitor::new("test", local())], &placements);
         let (first, second) = (placed[0].1, placed[1].1);
         assert_ne!(first.x, second.x, "the cards overlap: {first:?} {second:?}");
         // aligned with their own stretch of the edge, untouched
@@ -835,7 +876,7 @@ mod tests {
                 placement(Position::Top, (0.0, 1.0), (0.0, 1.0), (1920.0, 1080.0)),
             ),
         ];
-        let placed = place_all(local(), &[local()], &placements);
+        let placed = place_all(local(), &[Monitor::new("test", local())], &placements);
         assert!(placed[0].1.x > local().right());
         assert!(placed[1].1.y < 0.0);
         assert_eq!(placed[0].1.x, local().right() + GAP);
@@ -853,7 +894,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let placed = place_all(local(), &[local()], &placements);
+        let placed = place_all(local(), &[Monitor::new("test", local())], &placements);
         let mut xs = placed.iter().map(|(_, rect)| rect.x).collect::<Vec<_>>();
         xs.sort_by(|a, b| a.total_cmp(b));
         xs.dedup_by(|a, b| (*a - *b).abs() < 1.0);
@@ -868,13 +909,13 @@ mod tests {
     /// The bounding box is 4000x2560, and its top edge belongs to the *rotated*
     /// panel, while the upright one's top is 1120 px lower. Putting a peer "above
     /// the left-hand screen" therefore cannot be drawn against the box.
-    fn two_monitor_desk() -> (Screen, Vec<Screen>) {
+    fn two_monitor_desk() -> (Screen, Vec<Monitor>) {
         let bounds = Screen::new(0.0, 0.0, 4000.0, 2560.0);
         let monitors = vec![
             // DP-3, upright, bottom left
-            Screen::new(0.0, 1120.0, 2560.0, 1440.0),
+            Monitor::new("DP-3", Screen::new(0.0, 1120.0, 2560.0, 1440.0)),
             // DP-2, rotated, right
-            Screen::new(2560.0, 0.0, 1440.0, 2560.0),
+            Monitor::new("DP-2", Screen::new(2560.0, 0.0, 1440.0, 2560.0)),
         ];
         (bounds, monitors)
     }
@@ -911,19 +952,21 @@ mod tests {
         let candidate = Screen::new(0.0, -400.0, 2560.0, 1440.0);
         let placement = snap(bounds, &monitors, candidate);
         assert_eq!(placement.position, Position::Top);
-        /* and it covers DP-3, not the whole box */
-        assert_eq!(placement.edge.fractions(), [0.0, 0.64]);
+        /* and it is attached to DP-3, covering all of that monitor's edge rather
+         * than a stretch of the box */
+        assert_eq!(placement.display.as_deref(), Some("DP-3"));
+        assert_eq!(placement.edge, EdgeRange::FULL);
     }
 
     #[test]
     fn dropping_a_card_above_the_rotated_monitor_covers_only_that_one() {
         let (bounds, monitors) = two_monitor_desk();
-        let candidate = Screen::new(2600.0, -1600.0, 1440.0, 2560.0);
+        /* exactly DP-2's width, parked above it */
+        let candidate = Screen::new(2560.0, -1600.0, 1440.0, 2560.0);
         let placement = snap(bounds, &monitors, candidate);
         assert_eq!(placement.position, Position::Top);
-        let [start, end] = placement.edge.fractions();
-        assert!(start >= 0.63, "{start}");
-        assert!((end - 1.0).abs() < 0.01, "{end}");
+        assert_eq!(placement.display.as_deref(), Some("DP-2"));
+        assert_eq!(placement.edge, EdgeRange::FULL);
     }
 
     #[test]
@@ -935,8 +978,11 @@ mod tests {
         assert_eq!(placement.position, Position::Left);
         /* the card starts 80 px below DP-3's top edge, so it covers
          * (2560-1200)/2560 of it */
+        assert_eq!(placement.display.as_deref(), Some("DP-3"));
+        /* measured against DP-3's own edge, whose top starts at y=1120: the card
+         * begins 80 px into it, so 80/1440 */
         let [start, end] = placement.edge.fractions();
-        assert!((start - 1200.0 / 2560.0).abs() < 0.01, "{start}");
+        assert!((start - 80.0 / 1440.0).abs() < 0.01, "{start}");
         assert!((end - 1.0).abs() < 0.01, "{end}");
     }
 
@@ -944,13 +990,22 @@ mod tests {
     fn the_anchor_is_the_monitor_with_the_largest_overlap() {
         let (bounds, monitors) = two_monitor_desk();
         let on_lower = placement(Position::Bottom, (0.0, 0.64), (0.0, 1.0), (2560.0, 1440.0));
-        assert_eq!(anchor_monitor(bounds, &monitors, &on_lower), monitors[0]);
+        assert_eq!(
+            anchor_monitor(bounds, &monitors, &on_lower),
+            monitors[0].rect
+        );
         let on_rotated = placement(Position::Bottom, (0.64, 1.0), (0.0, 1.0), (1440.0, 2560.0));
-        assert_eq!(anchor_monitor(bounds, &monitors, &on_rotated), monitors[1]);
+        assert_eq!(
+            anchor_monitor(bounds, &monitors, &on_rotated),
+            monitors[1].rect
+        );
         /* every stretch of this desk belongs to a monitor; a desk with a gap
          * between its monitors is what the fallback is for */
         let spare = Screen::new(0.0, 0.0, 100.0, 100.0);
-        let only_left = vec![Screen::new(0.0, 1120.0, 2560.0, 1440.0)];
+        let only_left = vec![Monitor::new(
+            "DP-3",
+            Screen::new(0.0, 1120.0, 2560.0, 1440.0),
+        )];
         let over_gap = placement(Position::Top, (0.9, 1.0), (0.0, 1.0), (10.0, 10.0));
         assert_eq!(anchor_monitor(bounds, &only_left, &over_gap), bounds);
         let _ = spare;
