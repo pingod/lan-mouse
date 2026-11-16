@@ -326,8 +326,29 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     LAST_POS.replace(entry_point);
 
     /* notify main thread */
-    log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
-    send_event(pos, CaptureEvent::Begin);
+    /* where along the edge the pointer left this display */
+    let fraction = DISPLAYS.with_borrow(|(displays, _)| {
+        let Some(display) = display_util::display_at(prev_pos, displays) else {
+            return 0.5;
+        };
+        let width = (display.right - display.left) as f64;
+        let height = (display.bottom - display.top) as f64;
+        match pos {
+            Position::Top | Position::Bottom if width > 0.0 => {
+                ((prev_pos.0 - display.left) as f64 / width).clamp(0.0, 1.0)
+            }
+            Position::Left | Position::Right if height > 0.0 => {
+                ((prev_pos.1 - display.top) as f64 / height).clamp(0.0, 1.0)
+            }
+            _ => 0.5,
+        }
+    });
+
+    log::debug!(
+        "ENTERED @ {prev_pos:?} -> {curr_pos:?} at {:.0}%",
+        fraction * 100.0
+    );
+    send_event(pos, CaptureEvent::Begin(fraction));
 
     ret
 }

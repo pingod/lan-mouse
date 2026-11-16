@@ -585,7 +585,14 @@ async fn do_capture_session(
                     current_pos.replace(Some(pos));
 
                     // client entered => send event
-                    if event_tx.send((pos, CaptureEvent::Begin)).await.is_err() {
+                    // The portal reports the cursor position but not the
+                    // screen edge it belongs to in a form we could normalize,
+                    // so the peer places its cursor in the middle of the edge.
+                    if event_tx
+                        .send((pos, CaptureEvent::Begin(0.5)))
+                        .await
+                        .is_err()
+                    {
                         log::debug!("capture event channel closed");
                         break;
                     }

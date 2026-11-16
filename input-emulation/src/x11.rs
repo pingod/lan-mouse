@@ -109,6 +109,41 @@ impl Drop for X11Emulation {
 
 #[async_trait]
 impl Emulation for X11Emulation {
+    async fn enter(&mut self, x: f64, y: f64) {
+        /*
+         * Place the cursor at the point the peer crossed its edge instead of
+         * letting it continue from wherever it was parked on this screen.
+         */
+        let (width, height) = unsafe {
+            let screen = xlib::XDefaultScreen(self.display);
+            (
+                xlib::XDisplayWidth(self.display, screen),
+                xlib::XDisplayHeight(self.display, screen),
+            )
+        };
+        if width <= 0 || height <= 0 {
+            log::debug!("cannot position the cursor on a {width}x{height} screen");
+            return;
+        }
+        let x = (x.clamp(0.0, 1.0) * (width - 1) as f64) as i32;
+        let y = (y.clamp(0.0, 1.0) * (height - 1) as f64) as i32;
+        unsafe {
+            xlib::XWarpPointer(
+                self.display,
+                // `None` (0) as the source window: warp the real cursor
+                0,
+                xlib::XDefaultRootWindow(self.display),
+                0,
+                0,
+                0,
+                0,
+                x,
+                y,
+            );
+            xlib::XFlush(self.display);
+        }
+    }
+
     async fn consume(&mut self, event: Event, _: EmulationHandle) -> Result<(), EmulationError> {
         match event {
             Event::Pointer(pointer_event) => match pointer_event {

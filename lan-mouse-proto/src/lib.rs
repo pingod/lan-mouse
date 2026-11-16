@@ -80,7 +80,12 @@ impl Display for Position {
 pub enum ProtoEvent {
     /// notify a client that the cursor entered its region at the given position
     /// [`ProtoEvent::Ack`] with the same serial is used for synchronization between devices
-    Enter(Position),
+    /// The cursor entered this device through the given edge.
+    ///
+    /// The payload is where it crossed that edge as a fraction (0..=1)
+    /// counted from its left or top end, so the receiving device can put its
+    /// cursor at the matching point instead of wherever it happened to be.
+    Enter(Position, f64),
     /// notify a client that the cursor left its region
     /// [`ProtoEvent::Ack`] with the same serial is used for synchronization between devices
     Leave(u32),
@@ -201,7 +206,9 @@ impl Debug for PeerInfo {
 impl Display for ProtoEvent {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            ProtoEvent::Enter(s) => write!(f, "Enter({s})"),
+            ProtoEvent::Enter(s, fraction) => {
+                write!(f, "Enter({s}, {:.0}% of the edge)", fraction * 100.0)
+            }
             ProtoEvent::Leave(s) => write!(f, "Leave({s})"),
             ProtoEvent::Ack(s) => write!(f, "Ack({s})"),
             ProtoEvent::Input(e) => write!(f, "{e}"),
@@ -263,7 +270,7 @@ impl ProtoEvent {
             },
             ProtoEvent::Ping => EventType::Ping,
             ProtoEvent::Pong(_) => EventType::Pong,
-            ProtoEvent::Enter(_) => EventType::Enter,
+            ProtoEvent::Enter(..) => EventType::Enter,
             ProtoEvent::Leave(_) => EventType::Leave,
             ProtoEvent::Ack(_) => EventType::Ack,
             ProtoEvent::Hello { .. } => EventType::Hello,
@@ -321,7 +328,18 @@ impl TryFrom<&[u8]> for ProtoEvent {
             ))),
             EventType::Ping => Ok(Self::Ping),
             EventType::Pong => Ok(Self::Pong(decode_u8(&mut buf)? != 0)),
-            EventType::Enter => Ok(Self::Enter(decode_u8(&mut buf)?.try_into()?)),
+            EventType::Enter => {
+                let position = decode_u8(&mut buf)?.try_into()?;
+                // Older peers end the event after the position; the crossing
+                // fraction was added later, so treat a short payload as
+                // "unknown" instead of rejecting the whole event.
+                let fraction = if buf.len() >= size_of::<f64>() {
+                    decode_f64(&mut buf)?
+                } else {
+                    0.5
+                };
+                Ok(Self::Enter(position, fraction))
+            }
             EventType::Leave => Ok(Self::Leave(decode_u32(&mut buf)?)),
             EventType::Ack => Ok(Self::Ack(decode_u32(&mut buf)?)),
             EventType::PeerInfoRequest => Ok(Self::PeerInfoRequest),
@@ -430,7 +448,10 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                 },
                 ProtoEvent::Ping => {}
                 ProtoEvent::Pong(alive) => encode_u8(buf, len, alive as u8),
-                ProtoEvent::Enter(pos) => encode_u8(buf, len, pos as u8),
+                ProtoEvent::Enter(pos, fraction) => {
+                    encode_u8(buf, len, pos as u8);
+                    encode_f64(buf, len, fraction);
+                }
                 ProtoEvent::Leave(serial) => encode_u32(buf, len, serial),
                 ProtoEvent::Ack(serial) => encode_u32(buf, len, serial),
                 ProtoEvent::Hello { commit } => {

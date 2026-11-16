@@ -758,7 +758,11 @@ impl Dispatch<WlPointer, ()> for State {
                     .find(|w| w.surface == surface)
                     .map(|w| w.pos)
                     .unwrap();
-                app.pending_events.push_back((pos, CaptureEvent::Begin));
+                // The layer shell backend does not report where on the edge the
+                // pointer left (the protocol only gives the barrier), so the
+                // peer places its cursor in the middle of the edge.
+                app.pending_events
+                    .push_back((pos, CaptureEvent::Begin(0.5)));
             }
             wl_pointer::Event::Leave { .. } => {
                 /* There are rare cases, where when a window is opened in

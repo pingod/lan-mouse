@@ -170,10 +170,19 @@ impl ListenTask {
                         log::trace!("{event} <-<-<-<-<- {addr}");
                         last_response.insert(addr, Instant::now());
                         match event {
-                            ProtoEvent::Enter(pos) => {
+                            ProtoEvent::Enter(pos, fraction) => {
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
                                     log::info!("releasing capture: {addr} entered this device");
-                                    self.emulation_proxy.enter(addr);
+                                    // where the peer crossed its edge, mapped
+                                    // onto this screen in per-mille. `pos` is
+                                    // the edge of *this* device it came through.
+                                    let (x, y) = match pos {
+                                        Position::Left => (0.0, fraction),
+                                        Position::Right => (1.0, fraction),
+                                        Position::Top => (fraction, 0.0),
+                                        Position::Bottom => (fraction, 1.0),
+                                    };
+                                    self.emulation_proxy.enter(addr, x, y);
                                     send_event(&self.event_tx, EmulationEvent::ReleaseNotify);
                                     self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                                     send_event(&self.event_tx, EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint});
@@ -305,7 +314,9 @@ pub(crate) struct EmulationProxy {
 enum ProxyRequest {
     Input(Event, SocketAddr),
     /// the peer entered this device again; clears any prior `Leave` latch
-    Enter(SocketAddr),
+    /// The peer entered this device; the payload is the point it crossed
+    /// its edge at, expressed as a fraction of this screen (0..=1 each).
+    Enter(SocketAddr, f64, f64),
     Remove(SocketAddr),
     Terminate,
     Reenable,
@@ -356,8 +367,8 @@ impl EmulationProxy {
         }
     }
 
-    fn enter(&self, addr: SocketAddr) {
-        send_event(&self.request_tx, ProxyRequest::Enter(addr));
+    fn enter(&self, addr: SocketAddr, x: f64, y: f64) {
+        send_event(&self.request_tx, ProxyRequest::Enter(addr, x, y));
     }
 
     fn remove(&self, addr: SocketAddr) {
@@ -495,8 +506,9 @@ impl EmulationTask {
                         };
                         emulation.consume(event, handle).await?;
                     },
-                    Some(ProxyRequest::Enter(addr)) => {
+                    Some(ProxyRequest::Enter(addr, x, y)) => {
                         self.left.remove(&addr);
+                        emulation.enter(x, y).await;
                     }
                     Some(ProxyRequest::Remove(addr)) => {
                         self.left.insert(addr, Instant::now());
@@ -535,7 +547,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
         match rx.recv().await {
             None | Some(ProxyRequest::Terminate) => return,
             Some(ProxyRequest::Input(_, _)) => continue,
-            Some(ProxyRequest::Enter(_)) => continue,
+            Some(ProxyRequest::Enter(..)) => continue,
             Some(ProxyRequest::Remove(_)) => continue,
             Some(ProxyRequest::Reenable) => continue,
             Some(ProxyRequest::Disable) => continue,

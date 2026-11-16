@@ -104,6 +104,7 @@ impl Capture {
         let active = Rc::new(Cell::new(false));
         let capture_task = CaptureTask {
             active_client: None,
+            enter_fraction: 0.5,
             backend,
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
@@ -219,6 +220,10 @@ macro_rules! debounce {
 
 struct CaptureTask {
     active_client: Option<CaptureHandle>,
+    /// where along the edge the pointer crossed when the current capture
+    /// started (see [`CaptureEvent::Begin`]); replayed with the retried
+    /// `Enter` while the handshake is still in flight
+    enter_fraction: f64,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
@@ -525,7 +530,7 @@ impl CaptureTask {
             return Ok(());
         };
 
-        if event == CaptureEvent::Begin {
+        if matches!(event, CaptureEvent::Begin(_)) {
             /* The receiver only goes away while the service is shutting down,
              * so there is nothing left to notify.
              */
@@ -589,22 +594,25 @@ impl CaptureTask {
         // that were already queued upstream when we released (or that arrive
         // before the first `Begin`) must not recreate a session for a peer we
         // just left.
-        if self.active_client.is_none() && event != CaptureEvent::Begin {
+        if self.active_client.is_none() && !matches!(event, CaptureEvent::Begin(_)) {
             return Ok(());
         }
 
         // activated a new client
-        if event == CaptureEvent::Begin && Some(handle) != self.active_client {
-            self.state = State::WaitingForAck;
-            self.active_client.replace(handle);
-            self.active.set(true);
-            if self
-                .event_tx
-                .send(ICaptureEvent::ClientEntered(handle))
-                .is_err()
-            {
-                log::debug!("capture event channel is closed");
-                return Ok(());
+        if let CaptureEvent::Begin(fraction) = event {
+            self.enter_fraction = fraction;
+            if Some(handle) != self.active_client {
+                self.state = State::WaitingForAck;
+                self.active_client.replace(handle);
+                self.active.set(true);
+                if self
+                    .event_tx
+                    .send(ICaptureEvent::ClientEntered(handle))
+                    .is_err()
+                {
+                    log::debug!("capture event channel is closed");
+                    return Ok(());
+                }
             }
         }
 
@@ -621,7 +629,7 @@ impl CaptureTask {
         let events: Vec<ProtoEvent> = match event {
             // already handled above (released the capture)
             CaptureEvent::Interrupted => return Ok(()),
-            CaptureEvent::Begin => vec![ProtoEvent::Enter(opposite_pos)],
+            CaptureEvent::Begin(fraction) => vec![ProtoEvent::Enter(opposite_pos, fraction)],
             CaptureEvent::Input(e) => match self.state {
                 // The handshake is still in flight. Keep the event so it can
                 // be replayed right after the Ack instead of being lost — the
@@ -638,7 +646,7 @@ impl CaptureTask {
                         }
                         self.pending_input.push(ProtoEvent::Input(event));
                     }
-                    vec![ProtoEvent::Enter(opposite_pos)]
+                    vec![ProtoEvent::Enter(opposite_pos, self.enter_fraction)]
                 }
                 State::Sending => self
                     .remap

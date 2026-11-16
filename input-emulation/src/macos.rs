@@ -509,6 +509,23 @@ fn clamp_to_screen_space(
 
 #[async_trait]
 impl Emulation for MacOSEmulation {
+    async fn enter(&mut self, x: f64, y: f64) {
+        /*
+         * Synthesized motion is relative, so without this the pointer would
+         * continue from wherever it was on this screen — which looks like the
+         * cursor teleporting when the peer was left at the top of its screen
+         * while this one had it parked at the bottom.
+         */
+        let bounds = CGDisplay::main().bounds();
+        let point = CGPoint::new(
+            bounds.origin.x + bounds.size.width * x.clamp(0.0, 1.0),
+            bounds.origin.y + bounds.size.height * y.clamp(0.0, 1.0),
+        );
+        if let Err(e) = CGDisplay::warp_mouse_cursor_position(point) {
+            log::warn!("failed to position the cursor: {e}");
+        }
+    }
+
     async fn consume(
         &mut self,
         event: Event,

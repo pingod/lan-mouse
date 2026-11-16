@@ -208,6 +208,35 @@ impl Emulation for WlrootsEmulation {
         Ok(())
     }
 
+    async fn enter(&mut self, x: f64, y: f64) {
+        /*
+         * The pointer continues from wherever it was on this machine, which
+         * looks like the cursor teleported when the user left the peer at the
+         * top of its screen while this one had it parked at the bottom.
+         * Absolute motion is the only way to place it without knowing its
+         * current position; the extent is arbitrary as long as it matches the
+         * coordinates (`1000` therefore means the whole layout).
+         */
+        let Some(input) = self.state.input_for_client.values().next() else {
+            log::debug!("no virtual pointer yet, cannot position the cursor");
+            return;
+        };
+        static START: OnceLock<Instant> = OnceLock::new();
+        let now: u32 = START
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u32::MAX);
+        const EXTENT: u32 = 1000;
+        let x = (x.clamp(0.0, 1.0) * EXTENT as f64) as u32;
+        let y = (y.clamp(0.0, 1.0) * EXTENT as f64) as u32;
+        input.pointer.motion_absolute(now, x, y, EXTENT, EXTENT);
+        input.pointer.frame();
+        if let Err(e) = self.queue.flush() {
+            log::error!("failed to position the cursor: {e}");
+        }
+    }
     async fn create(&mut self, handle: EmulationHandle) {
         self.state.add_client(handle);
         if let Err(e) = self.queue.flush() {

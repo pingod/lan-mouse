@@ -36,8 +36,13 @@ pub type CaptureHandle = u64;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum CaptureEvent {
-    /// capture on this capture handle is now active
-    Begin,
+    /// Capture on this handle is now active.
+    ///
+    /// The payload is where the pointer left the screen as a fraction (0..=1)
+    /// along the shared edge, counted from its left or top end. The peer puts
+    /// its cursor there, so the pointer does not have to travel from wherever
+    /// it happened to be. `0.5` when the backend cannot tell.
+    Begin(f64),
     /// input event coming from capture handle
     Input(Event),
     /// the compositor took the pointer away from us.
@@ -52,7 +57,9 @@ pub enum CaptureEvent {
 impl Display for CaptureEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CaptureEvent::Begin => write!(f, "begin capture"),
+            CaptureEvent::Begin(fraction) => {
+                write!(f, "begin capture at {:.0}% of the edge", fraction * 100.0)
+            }
             CaptureEvent::Input(e) => write!(f, "{e}"),
             CaptureEvent::Interrupted => write!(f, "capture interrupted"),
         }

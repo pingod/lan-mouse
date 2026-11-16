@@ -153,6 +153,12 @@ impl InputEmulation {
         }
     }
 
+    /// Place the cursor at the point a peer crossed its edge, given as a
+    /// fraction of this screen (`0..=1` each). See [`Emulation::enter`].
+    pub async fn enter(&mut self, x: f64, y: f64) {
+        self.emulation.enter(x, y).await;
+    }
+
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
         if self.handles.insert(handle) {
             self.pressed_keys.insert(handle, HashSet::new());
@@ -278,5 +284,12 @@ trait Emulation: Send {
     ) -> Result<(), EmulationError>;
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
+    /// A peer started driving this device: place the cursor at `x`/`y`
+    /// (fractions of the screen, 0..=1) so the pointer continues from the
+    /// point it crossed on the peer instead of from wherever it was parked.
+    ///
+    /// Backends without absolute pointer positioning keep the cursor where it
+    /// is, which is what they did before.
+    async fn enter(&mut self, _x: f64, _y: f64) {}
     async fn terminate(&mut self);
 }

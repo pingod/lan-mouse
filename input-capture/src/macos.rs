@@ -249,7 +249,7 @@ impl InputCaptureState {
     }
 
     /// start the input capture by
-    fn start_capture(&mut self, event: &CGEvent, position: Position) -> Result<(), CaptureError> {
+    fn start_capture(&mut self, event: &CGEvent, position: Position) -> Result<f64, CaptureError> {
         let mut location = event.location();
         let edge_offset = 1.0;
         // move cursor location to display bounds
@@ -259,8 +259,29 @@ impl InputCaptureState {
             Position::Top => location.y = self.bounds.ymin + edge_offset,
             Position::Bottom => location.y = self.bounds.ymax - edge_offset,
         };
+        // where along the shared edge the pointer left this screen
+        let fraction = match position {
+            Position::Left | Position::Right => {
+                let height = self.bounds.ymax - self.bounds.ymin;
+                if height > 0.0 {
+                    ((location.y - self.bounds.ymin) / height).clamp(0.0, 1.0)
+                } else {
+                    0.5
+                }
+            }
+            Position::Top | Position::Bottom => {
+                let width = self.bounds.xmax - self.bounds.xmin;
+                if width > 0.0 {
+                    ((location.x - self.bounds.xmin) / width).clamp(0.0, 1.0)
+                } else {
+                    0.5
+                }
+            }
+        };
+
         self.enter_position = Some(location);
-        self.reset_cursor()
+        self.reset_cursor()?;
+        Ok(fraction)
     }
 
     /// resets the cursor to the position, where the capture started
@@ -726,10 +747,11 @@ fn create_event_tap<'a>(
             // Did we cross a barrier?
             if let Some(new_pos) = state.crossed(cg_ev) {
                 capture_position = Some(new_pos);
-                state
-                    .start_capture(cg_ev, new_pos)
-                    .unwrap_or_else(|e| log::warn!("{e}"));
-                res_events.push(CaptureEvent::Begin);
+                let fraction = state.start_capture(cg_ev, new_pos).unwrap_or_else(|e| {
+                    log::warn!("{e}");
+                    0.5
+                });
+                res_events.push(CaptureEvent::Begin(fraction));
                 if let Err(e) = notify_tx.try_send(ProducerEvent::Grab(new_pos)) {
                     // a dropped grab notification would leave the cursor
                     // hidden, so at least it must not panic across the FFI
