@@ -25,6 +25,10 @@ use std::{
 use thiserror::Error;
 use tokio::{process::Command, signal, sync::Notify};
 
+/// How long to wait between reconnect attempts for a client whose connection
+/// dropped on its own.
+const RECONNECT_DELAY: Duration = Duration::from_secs(3);
+
 #[derive(Debug, Error)]
 pub enum ServiceError {
     #[error(transparent)]
@@ -66,6 +70,8 @@ pub struct Service {
     capture_status: Status,
     /// status of input emulation (enabled / disabled)
     emulation_status: Status,
+    /// earliest time of the next reconnect attempt per client
+    reconnect_at: HashMap<ClientHandle, Instant>,
     /// keep track of registered connections to avoid duplicate barriers
     incoming_conns: HashSet<SocketAddr>,
     /// map from capture handle to connection info
@@ -179,6 +185,7 @@ impl Service {
             emulation_status: Default::default(),
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
+            reconnect_at: Default::default(),
             next_trigger_handle: 0,
             paused: false,
             restart_interval: config_restart_interval,
@@ -265,7 +272,10 @@ impl Service {
                 },
                 _ = self.config.changed() => self.handle_config_change(),
                 _ = log_tick(&mut self.log_stream) => self.flush_log_stream(),
-                _ = runtime_tick.tick() => self.publish_runtime(),
+                _ = runtime_tick.tick() => {
+                    self.publish_runtime();
+                    self.reconnect_dropped_clients();
+                }
                 _ = restart_tick(&self.restart_interval, self.last_restart) => {
                     log::info!("scheduled restart");
                     self.last_restart = Instant::now();
@@ -1171,6 +1181,40 @@ impl Service {
             self.activate_client(handle);
         } else {
             self.deactivate_client(handle);
+        }
+    }
+
+    /// Bring back connections that dropped on their own.
+    ///
+    /// A client only connects on activation, on a capture, or when the pointer
+    /// preconnects on its way to it. A peer that reboots (or a link that blips)
+    /// therefore stays dead until the user touches that client again, which
+    /// looks like "the pointer will not cross to that machine any more".
+    /// Retrying here keeps the configured clients reachable; `preconnect`
+    /// already refcounts in-flight attempts and backs off per handle.
+    fn reconnect_dropped_clients(&mut self) {
+        for (handle, _, state) in self.client_manager.get_client_states() {
+            if state.connected || !state.active {
+                continue;
+            }
+            if state.resolving || state.active_addr.is_some() {
+                continue;
+            }
+            if state.ips.is_empty() {
+                continue;
+            }
+            /* no more than one attempt per client every few seconds */
+            let now = Instant::now();
+            let retry_at = self
+                .reconnect_at
+                .entry(handle)
+                .or_insert_with(|| now + RECONNECT_DELAY);
+            if now < *retry_at {
+                continue;
+            }
+            *retry_at = now + RECONNECT_DELAY;
+            log::debug!("reconnecting to client {handle} after a dropped connection");
+            self.capture.preconnect(handle);
         }
     }
 
