@@ -985,13 +985,26 @@ impl Service {
     async fn push_report(&mut self) {
         let chunks = crate::sysinfo::chunks(&crate::sysinfo::local());
         let peers = self.client_manager.active_clients();
-        log::info!("pushing the report to {} peer(s)", peers.len());
+        log::info!(
+            "pushing the report to {} peer(s), {} datagram(s) each",
+            peers.len(),
+            chunks.len()
+        );
         for handle in peers {
-            for chunk in &chunks {
-                if let Err(e) = self.conn.send(*chunk, handle).await {
-                    log::debug!("could not push the report to client {handle}: {e}");
-                    break;
+            /* Twice, because a report is only usable when every datagram arrives and
+             * UDP drops. One missing piece used to cost the whole report - the peer
+             * kept an older one, which for the display list was invisible (it rarely
+             * changes) and for the arrangement meant a picture that never arrived. A
+             * second round costs a few hundred bytes and makes a single loss harmless;
+             * the reassembler stores pieces by index, so the duplicate is a no-op. */
+            for _ in 0..2 {
+                for chunk in &chunks {
+                    if let Err(e) = self.conn.send(*chunk, handle).await {
+                        log::debug!("could not push the report to client {handle}: {e}");
+                        return;
+                    }
                 }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         }
     }
