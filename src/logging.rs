@@ -316,8 +316,22 @@ pub fn level_name(level: LevelFilter) -> &'static str {
 mod tests {
     use super::*;
 
+    /// Serialises the tests that read or write the process wide log level.
+    ///
+    /// The logger keeps its level in a global, so `level_filters_records`
+    /// could observe the `trace` level that `level_names_round_trip` sets a
+    /// moment earlier and then fail to see its record filtered. That is a test
+    /// isolation problem, not a logger bug, but it only showed up on Windows
+    /// where the tests are scheduled differently.
+    static LEVEL_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn level_guard() -> std::sync::MutexGuard<'static, ()> {
+        LEVEL_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn level_names_round_trip() {
+        let _guard = level_guard();
         for name in ["off", "error", "warn", "info", "debug", "trace"] {
             let level = set_level(name).expect("known level");
             assert_eq!(level_name(level), name);
@@ -331,6 +345,7 @@ mod tests {
 
     #[test]
     fn recent_returns_the_tail() {
+        let _guard = level_guard();
         // The buffer is global and the logger may already be installed by
         // another test, so record through the sink directly rather than
         // assuming `log::info!` reaches it.
@@ -398,6 +413,7 @@ mod tests {
 
     #[test]
     fn level_filters_records() {
+        let _guard = level_guard();
         let _ = set_level("warn");
         let info = log::Record::builder()
             .args(format_args!("should be filtered"))
