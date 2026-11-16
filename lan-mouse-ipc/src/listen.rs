@@ -133,21 +133,41 @@ impl AsyncFrontendListener {
 
     pub async fn broadcast(&mut self, notify: FrontendEvent) {
         // encode event
-        let mut json = serde_json::to_string(&notify).unwrap();
+        let Ok(mut json) = serde_json::to_string(&notify) else {
+            log::error!("could not serialize the frontend event, dropping it");
+            return;
+        };
         json.push('\n');
+        let json = std::sync::Arc::new(json);
 
-        // TODO do simultaneously
-        for slot in self.tx_streams.iter_mut() {
-            let Some(tx) = slot.as_mut() else {
-                // this connection already failed
-                continue;
-            };
-            /* `write` may write only part of the buffer, which would corrupt
-             * the newline delimited stream for the frontend (it reads lines
-             * and would glue the next event onto a truncated one).
-             */
-            if tx.write_all(json.as_bytes()).await.is_err() {
-                // keep the vectors aligned, `poll_next` removes the pair
+        /* Write to every connection concurrently: a slow reader must not delay
+         * the others (they all get the same snapshot). */
+        let mut failed = Vec::new();
+        {
+            let mut writes = futures::stream::FuturesUnordered::new();
+            for (index, slot) in self.tx_streams.iter_mut().enumerate() {
+                let Some(tx) = slot.as_mut() else {
+                    // this connection already failed
+                    continue;
+                };
+                let json = std::sync::Arc::clone(&json);
+                writes.push(async move {
+                    /* `write` may write only part of the buffer, which would
+                     * corrupt the newline delimited stream for the frontend (it
+                     * reads lines and would glue the next event onto a
+                     * truncated one).
+                     */
+                    (index, tx.write_all(json.as_bytes()).await.is_ok())
+                });
+            }
+            while let Some((index, ok)) = writes.next().await {
+                if !ok {
+                    failed.push(index);
+                }
+            }
+        }
+        for index in failed {
+            if let Some(slot) = self.tx_streams.get_mut(index) {
                 *slot = None;
             }
         }

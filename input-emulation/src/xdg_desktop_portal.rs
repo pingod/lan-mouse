@@ -85,6 +85,9 @@ impl Emulation for DesktopPortalEmulation {
                         )
                         .await?;
                 }
+                // the portal has no scroll-stop request: the compositor ends a
+                // kinetic scroll on its own once the axis events stop arriving
+                PointerEvent::AxisStop { .. } | PointerEvent::AxisCancel { .. } => {}
                 PointerEvent::AxisDiscrete120 { axis, value } => {
                     let axis = match axis {
                         0 => Axis::Vertical,

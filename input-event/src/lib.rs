@@ -23,6 +23,11 @@ pub enum PointerEvent {
     Axis { time: u32, axis: u8, value: f64 },
     /// discrete axis event, scroll event for mice - 120 = one scroll tick
     AxisDiscrete120 { axis: u8, value: i32 },
+    /// the scroll gesture ended: the receiving compositor must stop any
+    /// kinetic scrolling it started for this axis
+    AxisStop { time: u32, axis: u8 },
+    /// the scroll gesture was cancelled rather than finished
+    AxisCancel { time: u32, axis: u8 },
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -78,6 +83,8 @@ impl Display for PointerEvent {
             PointerEvent::AxisDiscrete120 { axis, value } => {
                 write!(f, "scroll-120 ({axis}, {value})")
             }
+            PointerEvent::AxisStop { time: _, axis } => write!(f, "scroll-stop ({axis})"),
+            PointerEvent::AxisCancel { time: _, axis } => write!(f, "scroll-cancel ({axis})"),
         }
     }
 }

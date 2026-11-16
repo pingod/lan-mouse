@@ -722,6 +722,9 @@ impl Emulation for MacOSEmulation {
                         };
                         post_synthesized(&event);
                     }
+                    /* macOS/windows inject discrete wheel events only: a stopped or
+                     * cancelled gesture needs no follow up event. */
+                    PointerEvent::AxisStop { .. } | PointerEvent::AxisCancel { .. } => {}
                     PointerEvent::AxisDiscrete120 { axis, value } => {
                         let value = if natural_scroll_enabled(&self.natural_scroll_key) {
                             value

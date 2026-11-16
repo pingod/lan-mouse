@@ -1160,7 +1160,6 @@ unsafe fn configure_cf_settings() -> Result<(), MacosCaptureCreationError> {
     let event_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
         .map_err(|_| MacosCaptureCreationError::EventSourceCreation)?;
     CGEventSourceSetLocalEventsSuppressionInterval(event_source, 0.05);
-    // FIXME Memory Leak
 
     // This is a private settings that allows the cursor to be hidden while in the background.
     // It is used by Barrier and other apps.
@@ -1170,16 +1169,21 @@ unsafe fn configure_cf_settings() -> Result<(), MacosCaptureCreationError> {
         key.as_ptr() as *const c_char,
         kCFStringEncodingUTF8,
     );
-    if CGSSetConnectionProperty(
+    if cf_key.is_null() {
+        log::warn!("could not create the CFString for the cursor property");
+        return Err(MacosCaptureCreationError::CGCursorProperty);
+    }
+    let result = CGSSetConnectionProperty(
         _CGSDefaultConnection(),
         _CGSDefaultConnection(),
         cf_key,
         kCFBooleanTrue,
-    ) != kCGErrorSuccess
-    {
+    );
+    /* Release before returning: this used to leak the string on the error path. */
+    CFRelease(cf_key as *const c_void);
+    if result != kCGErrorSuccess {
         return Err(MacosCaptureCreationError::CGCursorProperty);
     }
-    CFRelease(cf_key as *const c_void);
     Ok(())
 }
 

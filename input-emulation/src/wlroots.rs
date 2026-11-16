@@ -450,6 +450,19 @@ struct VirtualInput {
     modifiers: Arc<Mutex<XMods>>,
 }
 
+/// Map the protocol axis index (0 = vertical, anything else = horizontal) to
+/// the wayland enum, rejecting garbage from the network.
+fn axis_from(axis: u8) -> Option<Axis> {
+    match axis {
+        0 => Some(Axis::VerticalScroll),
+        1 => Some(Axis::HorizontalScroll),
+        axis => {
+            log::warn!("invalid scroll axis: {axis}");
+            None
+        }
+    }
+}
+
 impl VirtualInput {
     fn consume_event(&self, event: Event) -> Result<(), EmulationError> {
         /* The peer's timestamps use its own clock and unit (libei sends
@@ -469,6 +482,21 @@ impl VirtualInput {
         match event {
             Event::Pointer(e) => {
                 match e {
+                    PointerEvent::AxisStop { axis, .. } => {
+                        let Some(axis) = axis_from(axis) else {
+                            return Ok(());
+                        };
+                        self.pointer.axis_stop(now, axis);
+                    }
+                    PointerEvent::AxisCancel { axis, .. } => {
+                        /* wl_pointer has no cancel request; stopping the axis
+                         * is the closest thing and also ends kinetic scroll */
+                        log::debug!("scroll cancelled on axis {axis}, stopping it instead");
+                        let Some(axis) = axis_from(axis) else {
+                            return Ok(());
+                        };
+                        self.pointer.axis_stop(now, axis);
+                    }
                     PointerEvent::Motion { dx, dy, .. } => self.pointer.motion(now, dx, dy),
                     PointerEvent::Button { button, state, .. } => {
                         // the event comes from the network, so the state can be

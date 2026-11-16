@@ -250,6 +250,8 @@ pub enum EventType {
     PointerButton,
     PointerAxis,
     PointerAxisValue120,
+    PointerAxisStop,
+    PointerAxisCancel,
     KeyboardKey,
     KeyboardModifiers,
     Ping,
@@ -273,6 +275,8 @@ impl ProtoEvent {
                     PointerEvent::Button { .. } => EventType::PointerButton,
                     PointerEvent::Axis { .. } => EventType::PointerAxis,
                     PointerEvent::AxisDiscrete120 { .. } => EventType::PointerAxisValue120,
+                    PointerEvent::AxisStop { .. } => EventType::PointerAxisStop,
+                    PointerEvent::AxisCancel { .. } => EventType::PointerAxisCancel,
                 },
                 InputEvent::Keyboard(k) => match k {
                     KeyboardEvent::Key { .. } => EventType::KeyboardKey,
@@ -325,6 +329,18 @@ impl TryFrom<&[u8]> for ProtoEvent {
                     value: decode_i32(&mut buf)?,
                 },
             ))),
+            EventType::PointerAxisStop => {
+                Ok(Self::Input(InputEvent::Pointer(PointerEvent::AxisStop {
+                    time: decode_u32(&mut buf)?,
+                    axis: decode_u8(&mut buf)?,
+                })))
+            }
+            EventType::PointerAxisCancel => {
+                Ok(Self::Input(InputEvent::Pointer(PointerEvent::AxisCancel {
+                    time: decode_u32(&mut buf)?,
+                    axis: decode_u8(&mut buf)?,
+                })))
+            }
             EventType::KeyboardKey => Ok(Self::Input(InputEvent::Keyboard(KeyboardEvent::Key {
                 time: decode_u32(&mut buf)?,
                 key: decode_u32(&mut buf)?,
@@ -439,6 +455,14 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                             encode_u8(buf, len, axis);
                             encode_i32(buf, len, value);
                         }
+                        PointerEvent::AxisStop { time, axis } => {
+                            encode_u32(buf, len, time);
+                            encode_u8(buf, len, axis);
+                        }
+                        PointerEvent::AxisCancel { time, axis } => {
+                            encode_u32(buf, len, time);
+                            encode_u8(buf, len, axis);
+                        }
                     },
                     InputEvent::Keyboard(k) => match k {
                         KeyboardEvent::Key { time, key, state } => {
@@ -540,6 +564,44 @@ encode_impl!(u8);
 encode_impl!(u32);
 encode_impl!(i32);
 encode_impl!(f64);
+
+#[cfg(test)]
+mod scroll_stop_tests {
+    use super::*;
+
+    #[test]
+    fn scroll_stop_round_trips() {
+        let event = ProtoEvent::Input(InputEvent::Pointer(PointerEvent::AxisStop {
+            time: 1_234,
+            axis: 1,
+        }));
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+        match ProtoEvent::decode(&buf[..len]).unwrap() {
+            ProtoEvent::Input(InputEvent::Pointer(PointerEvent::AxisStop { time, axis })) => {
+                assert_eq!(time, 1_234);
+                assert_eq!(axis, 1);
+            }
+            other => panic!("expected AxisStop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scroll_cancel_is_not_a_stop() {
+        let event = ProtoEvent::Input(InputEvent::Pointer(PointerEvent::AxisCancel {
+            time: 7,
+            axis: 0,
+        }));
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+        let decoded = ProtoEvent::decode(&buf[..len]).unwrap();
+        assert!(
+            matches!(
+                decoded,
+                ProtoEvent::Input(InputEvent::Pointer(PointerEvent::AxisCancel { .. }))
+            ),
+            "a cancelled gesture must stay distinguishable from a stopped one"
+        );
+    }
+}
 
 #[cfg(test)]
 mod center_cursor_tests {

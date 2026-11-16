@@ -29,9 +29,16 @@ use crate::error::EmulationError;
 
 use super::{Emulation, EmulationHandle, error::LibeiEmulationCreationError};
 
+/// an absolute pointer interface together with the size of the region it
+/// addresses, as reported by the EIS implementation (logical pixels)
+type AbsolutePointer = (ei::PointerAbsolute, (u32, u32));
+
 #[derive(Clone, Default)]
 struct Devices {
     pointer: Arc<RwLock<Option<(ei::Device, ei::Pointer)>>>,
+    /// absolute pointer, plus the device size the EIS implementation reported
+    /// (in logical pixels) so positions can be given in the peer's own space
+    pointer_absolute: Arc<RwLock<Option<(ei::Device, AbsolutePointer)>>>,
     scroll: Arc<RwLock<Option<(ei::Device, ei::Scroll)>>>,
     button: Arc<RwLock<Option<(ei::Device, ei::Button)>>>,
     keyboard: Arc<RwLock<Option<(ei::Device, ei::Keyboard)>>>,
@@ -51,6 +58,20 @@ impl Devices {
     fn register(&self, device: &event::Device) {
         if let Some(pointer) = device.interface::<ei::Pointer>() {
             Self::set(&self.pointer, device.device(), pointer);
+        }
+        if let Some(pointer) = device.interface::<ei::PointerAbsolute>() {
+            /* `ei_pointer_absolute.motion_absolute` takes logical pixels, so
+             * the device size is needed to place the cursor. The EIS
+             * implementation sends it with the device setup. */
+            let dimensions = device.dimensions().unwrap_or_default();
+            if dimensions == (0, 0) {
+                log::debug!("absolute pointer without dimensions, cursor placement stays disabled");
+            }
+            Self::set(
+                &self.pointer_absolute,
+                device.device(),
+                (pointer, dimensions),
+            );
         }
         if let Some(keyboard) = device.interface::<ei::Keyboard>() {
             Self::set(&self.keyboard, device.device(), keyboard);
@@ -80,6 +101,23 @@ impl Devices {
         Self::clear_if(&self.keyboard, device);
         Self::clear_if(&self.scroll, device);
         Self::clear_if(&self.button, device);
+        if self
+            .pointer_absolute
+            .read()
+            .is_ok_and(|d| d.as_ref().is_some_and(|(el, _)| el == device))
+        {
+            let _ = self.pointer_absolute.write().map(|mut d| *d = None);
+        }
+    }
+
+    /// The EIS device size in logical pixels, if the peer reported one.
+    fn absolute_dimensions(&self) -> Option<(u32, u32)> {
+        let guard = self.pointer_absolute.read().ok()?;
+        let (_, (_, dimensions)) = guard.as_ref()?;
+        if *dimensions == (0, 0) {
+            return None;
+        }
+        Some(*dimensions)
     }
 }
 
@@ -214,6 +252,36 @@ impl Drop for LibeiEmulation {
     }
 }
 
+impl LibeiEmulation {
+    /// Move the absolute pointer to `x`, `y` in the receiver's layout space.
+    fn absolute(&self, x: f64, y: f64) -> Result<(), EmulationError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        let guard = self
+            .devices
+            .pointer_absolute
+            .read()
+            .map_err(|e| EmulationError::Io(io::Error::other(e.to_string())))?;
+        let Some((device, (pointer, dimensions))) = guard.as_ref() else {
+            log::debug!("no absolute pointer device, not placing the cursor");
+            return Ok(());
+        };
+        log::debug!(
+            "placing the cursor at {x:.0}, {y:.0} (device {}x{})",
+            dimensions.0,
+            dimensions.1
+        );
+        pointer.motion_absolute(x as f32, y as f32);
+        device.frame(self.conn.serial(), now);
+        self.context
+            .flush()
+            .map_err(|e| io::Error::new(e.kind(), e))?;
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl Emulation for LibeiEmulation {
     async fn consume(
@@ -271,6 +339,16 @@ impl Emulation for LibeiEmulation {
                         d.frame(self.conn.serial(), now);
                     }
                 }
+                PointerEvent::AxisStop { axis, .. } | PointerEvent::AxisCancel { axis, .. } => {
+                    let scroll_device = self.devices.scroll.read().unwrap();
+                    if let Some((d, s)) = scroll_device.as_ref() {
+                        let x = u32::from(axis == 1);
+                        let y = u32::from(axis == 0);
+                        let is_cancel = u32::from(matches!(p, PointerEvent::AxisCancel { .. }));
+                        s.scroll_stop(x, y, is_cancel);
+                        d.frame(self.conn.serial(), now);
+                    }
+                }
                 PointerEvent::AxisDiscrete120 { axis, value } => {
                     let scroll_device = self.devices.scroll.read().unwrap();
                     if let Some((d, s)) = scroll_device.as_ref() {
@@ -311,6 +389,44 @@ impl Emulation for LibeiEmulation {
 
     async fn create(&mut self, _: EmulationHandle) {}
     async fn destroy(&mut self, _: EmulationHandle) {}
+
+    /// Place the pointer at the edge the peer crossed.
+    ///
+    /// `ei_pointer_absolute.motion_absolute` takes logical pixels of the
+    /// receiver's own layout, which the EIS implementation reports as the
+    /// device size, so this lands exactly - unlike the wlroots virtual pointer,
+    /// whose absolute request Hyprland feeds through the pointer acceleration
+    /// curve.
+    async fn enter(&mut self, _handle: EmulationHandle, edge: crate::ScreenEdge, fraction: f64) {
+        let Some((width, height)) = self.devices.absolute_dimensions() else {
+            log::debug!("no absolute pointer with a known size, not placing the cursor");
+            return;
+        };
+        /* a couple of pixels inside, or the receiver sees the pointer cross
+         * the same edge again and bounces it straight back */
+        const INSET: f64 = 8.0;
+        let (x, y) = edge.point_on_inset(
+            fraction,
+            0.0,
+            0.0,
+            (width - 1) as f64,
+            (height - 1) as f64,
+            INSET,
+        );
+        if let Err(e) = self.absolute(x, y) {
+            log::warn!("failed to place the cursor: {e}");
+        }
+    }
+
+    async fn enter_center(&mut self, _handle: EmulationHandle) {
+        let Some((width, height)) = self.devices.absolute_dimensions() else {
+            log::debug!("no absolute pointer with a known size, not centring the cursor");
+            return;
+        };
+        if let Err(e) = self.absolute(width as f64 / 2.0, height as f64 / 2.0) {
+            log::warn!("failed to centre the cursor: {e}");
+        }
+    }
 
     async fn terminate(&mut self) {
         let _ = self.session.close().await;

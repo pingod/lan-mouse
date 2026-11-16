@@ -63,6 +63,9 @@ impl Emulation for WindowsEmulation {
                     };
                     scroll(axis, (notches * WHEEL_DELTA) as i32);
                 }
+                /* macOS/windows inject discrete wheel events only: a stopped or
+                 * cancelled gesture needs no follow up event. */
+                PointerEvent::AxisStop { .. } | PointerEvent::AxisCancel { .. } => {}
                 PointerEvent::AxisDiscrete120 { axis, value } => {
                     // already in units of 120 (one wheel notch)
                     scroll(axis, value);

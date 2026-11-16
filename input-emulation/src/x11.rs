@@ -168,6 +168,9 @@ impl Emulation for X11Emulation {
     async fn consume(&mut self, event: Event, _: EmulationHandle) -> Result<(), EmulationError> {
         match event {
             Event::Pointer(pointer_event) => match pointer_event {
+                /* X11 has no kinetic scrolling model: a stopped or cancelled
+                 * scroll gesture needs no follow up event. */
+                PointerEvent::AxisStop { .. } | PointerEvent::AxisCancel { .. } => {}
                 PointerEvent::Motion { time: _, dx, dy } => {
                     self.relative_motion(dx as i32, dy as i32);
                 }
