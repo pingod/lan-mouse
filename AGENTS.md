@@ -60,6 +60,30 @@ Run from repo root—no `cd` in scripts.
 ## Workflow
 
 1. Clarify ambiguous requirements, especially OS-specific behavior.
-2. Implement minimal change; flag follow-up work.
-3. Add proportional tests; run `cargo test` on affected crates.
-4. Run `cargo fmt` and `cargo clippy --workspace --all-targets --all-features`.
+2. File a GitHub issue for every reported bug before (or right after) fixing it — see the bug-reporting rules below.
+3. Implement minimal change; flag follow-up work.
+4. Add proportional tests; run `cargo test` on affected crates.
+5. Run `cargo fmt` and `cargo clippy --workspace --all-targets --all-features`.
+
+## Bug reports
+
+Every bug the user reports must end up as a GitHub issue in this repository
+(`GH_REPO=pingod/lan-mouse gh issue create --title … --body-file … --label bug`),
+written by whoever fixes it. Do not wait to be asked.
+
+An issue is only useful if it can be understood without the chat history, so it
+must contain:
+
+- **Symptom**: what the user sees, quoting the report where possible, plus the
+  affected versions/commits.
+- **Reproduction**: the exact commands or steps, and the layout/hardware
+  involved (which machine is the sender, which the receiver).
+- **Root cause**: the mechanism, with `path/file.rs:line` references and the
+  reason the obvious-looking code is wrong.
+- **Fix**: what was changed and why, naming the commits.
+- **Verification**: how it was proven, including the log lines or commands.
+- **Status**: fixed in commit X, or the remaining limitation when only part of
+  the problem could be solved.
+
+Feature requests get the `enhancement` label and describe the request, the data
+model limits that shape the design, and what was built.
