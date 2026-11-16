@@ -544,6 +544,23 @@ switch_corners = ["top-left", "bottom-left"]
 Both are also applied by the arrangement canvas, which draws a blocked corner as
 part of the wall it effectively is.
 
+Wheel scroll can be smoothed on the receiving side, so a wheel notch glides like
+a trackpad instead of jumping:
+
+```toml
+# spread each notch over time instead of injecting one discrete step (default off)
+scroll_smoothing = true
+# how long one notch takes, in milliseconds (clamped to 20..1000, default 120)
+scroll_smoothing_duration = 120
+```
+
+The receiver turns each notch into pixel-precise deltas over that duration, with
+an ease-out curve; the first step is still immediate and a direction change drops
+the unfinished tail. It only applies to backends that can inject continuous
+scroll (wlroots, libei, xdg-desktop-portal and macOS); X11 and Windows only know
+wheel buttons, so they keep discrete scrolling. Read at startup, so restart the
+service after changing it.
+
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)
 - [x] respect xdg-config-home for config file location.

@@ -621,6 +621,13 @@ fn clamp_to_screen_space(
 
 #[async_trait]
 impl Emulation for MacOSEmulation {
+    fn scroll_units_per_notch(&self) -> Option<f64> {
+        /* `Axis` is posted as `ScrollEventUnit::PIXEL`. A notch used to be
+         * `LINES_PER_STEP` (3) lines; AppKit multiplies a line by its line
+         * height (10 points by default), so one notch keeps that distance. */
+        Some(30.0)
+    }
+
     async fn enter_center(&mut self, _handle: EmulationHandle) {
         /*
          * Same reason as `enter`: synthesized motion is relative, so a

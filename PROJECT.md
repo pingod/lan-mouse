@@ -99,6 +99,10 @@ to   = ["KeyLeftCtrl", "KeyInsert"]
 | `switch_double_tap` | 边缘需要在这个毫秒数内被连续穿越两次才切换，`0` 关闭 |
 | `switch_corner_size` | 被屏蔽角落的像素半径，`0` 关闭 |
 | `switch_corners` | 被屏蔽的角落，取值 `top-left` / `top-right` / `bottom-left` / `bottom-right` |
+| `scroll_smoothing` | `true` 时接收端把每个滚轮刻度铺成一段动画（默认 `false`） |
+| `scroll_smoothing_duration` | 一个刻度的动画时长（毫秒，限制在 20–1000，默认 120） |
+
+滚轮平滑只在能注入连续滚动的后端生效（wlroots / libei / xdg-desktop-portal / macOS）；X11 和 Windows 只有滚轮按钮，仍按离散刻度注入。该设置在启动时读取，改完需要重启服务。
 
 `[[clients]]` 里除了 `position`、`hostname`、`ips`、`port`、`activate_on_startup`，还有两个区间：
 

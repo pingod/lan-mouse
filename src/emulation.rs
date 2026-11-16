@@ -94,9 +94,10 @@ enum EmulationRequest {
 impl Emulation {
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
+        smoothing: input_emulation::ScrollSmoothing,
         listener: LanMouseListener,
     ) -> Self {
-        let emulation_proxy = EmulationProxy::new(backend);
+        let emulation_proxy = EmulationProxy::new(backend, smoothing);
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_task = ListenTask {
@@ -330,13 +331,17 @@ enum ProxyRequest {
 }
 
 impl EmulationProxy {
-    fn new(backend: Option<input_emulation::Backend>) -> Self {
+    fn new(
+        backend: Option<input_emulation::Backend>,
+        smoothing: input_emulation::ScrollSmoothing,
+    ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_active = Rc::new(Cell::new(false));
         let exit_requested = Rc::new(Cell::new(false));
         let emulation_task = EmulationTask {
             backend,
+            smoothing,
             exit_requested: exit_requested.clone(),
             request_rx,
             event_tx,
@@ -401,6 +406,7 @@ impl EmulationProxy {
 
 struct EmulationTask {
     backend: Option<input_emulation::Backend>,
+    smoothing: input_emulation::ScrollSmoothing,
     exit_requested: Rc<Cell<bool>>,
     request_rx: Receiver<ProxyRequest>,
     event_tx: Sender<EmulationEvent>,
@@ -447,7 +453,7 @@ impl EmulationTask {
     async fn do_emulation(&mut self) -> Result<(), InputEmulationError> {
         log::info!("creating input emulation ...");
         let mut emulation = tokio::select! {
-            r = InputEmulation::new(self.backend) => r?,
+            r = InputEmulation::new(self.backend, self.smoothing) => r?,
             // allow termination event while requesting input emulation
             _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
         };
@@ -489,7 +495,16 @@ impl EmulationTask {
         emulation: &mut InputEmulation,
     ) -> Result<(), InputEmulationError> {
         loop {
+            /* The smoother has no clock of its own: sleep until its next step
+             * is due, otherwise wait for the network. */
+            let scroll_tick = emulation.next_scroll_tick();
             tokio::select! {
+                _ = async {
+                    match scroll_tick {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending().await,
+                    }
+                } => emulation.scroll_tick().await?,
                 e = self.request_rx.recv() => match e {
                     // the proxy was dropped: stop emulating
                     None => break Ok(()),

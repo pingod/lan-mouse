@@ -287,6 +287,12 @@ impl Dispatch<WlOutput, ()> for State {
 
 #[async_trait]
 impl Emulation for WlrootsEmulation {
+    fn scroll_units_per_notch(&self) -> Option<f64> {
+        /* one wheel notch is 15 degrees of movement in libinput, and
+         * `wl_pointer.axis` values use the same surface units */
+        Some(15.0)
+    }
+
     async fn consume(
         &mut self,
         event: Event,

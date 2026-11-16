@@ -84,6 +84,10 @@ struct ConfigToml {
     switch_corner_size: Option<u32>,
     /// corners the pointer may not leave the screen through
     switch_corners: Option<Vec<SwitchCorner>>,
+    /// spread each wheel notch over time on this receiver
+    scroll_smoothing: Option<bool>,
+    /// how long one notch takes to animate, in milliseconds
+    scroll_smoothing_duration: Option<u64>,
 }
 
 /// A global hotkey: pressing `from` while typing locally sends `to` to the peer.
@@ -639,6 +643,22 @@ impl Config {
             .unwrap_or(DEFAULT_PORT)
     }
 
+    /// Receiver-side wheel smoothing: spread each notch over a short animation.
+    ///
+    /// Read at startup; the backend has to be recreated to change it. `duration`
+    /// is clamped by [`input_emulation::ScrollSmoothing`], so a bad config file
+    /// cannot make the wheel unusable.
+    pub fn scroll_smoothing(&self) -> input_emulation::ScrollSmoothing {
+        let toml = self.config_toml.as_ref();
+        if !toml.and_then(|c| c.scroll_smoothing).unwrap_or(false) {
+            return input_emulation::ScrollSmoothing::OFF;
+        }
+        input_emulation::ScrollSmoothing::from_millis(
+            toml.and_then(|c| c.scroll_smoothing_duration)
+                .unwrap_or(120),
+        )
+    }
+
     /// Edge-crossing thresholds: how close to an edge the pointer has to behave
     /// before it may cross to a peer.
     ///
@@ -1119,6 +1139,21 @@ edge = [0.0, 1.0]
             toml::from_str::<ConfigToml>("[[clients]]\nhostname = \"a\"\nedge = [0.0, 1.5]\n")
                 .expect_err("an out of bounds range must not parse");
         assert!(error.to_string().contains("outside"), "{error}");
+    }
+
+    #[test]
+    fn scroll_smoothing_is_opt_in_and_round_trips() {
+        let config = parse("scroll_smoothing = true\nscroll_smoothing_duration = 200\n");
+        assert_eq!(config.scroll_smoothing, Some(true));
+        assert_eq!(config.scroll_smoothing_duration, Some(200));
+
+        let text = toml_edit::ser::to_string_pretty(&config).expect("toml");
+        assert!(text.contains("scroll_smoothing = true"), "{text}");
+        assert!(text.contains("scroll_smoothing_duration = 200"), "{text}");
+
+        let empty = ConfigToml::default();
+        let text = toml_edit::ser::to_string_pretty(&empty).expect("toml");
+        assert!(!text.contains("scroll_smoothing"), "{text}");
     }
 
     #[test]

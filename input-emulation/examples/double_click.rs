@@ -26,9 +26,12 @@ fn main() {
         .expect("failed to build runtime");
 
     runtime.block_on(async {
-        let mut emulation = InputEmulation::new(Some(Backend::Wlroots))
-            .await
-            .expect("this example requires a running wlroots compositor");
+        let mut emulation = InputEmulation::new(
+            Some(Backend::Wlroots),
+            input_emulation::ScrollSmoothing::OFF,
+        )
+        .await
+        .expect("this example requires a running wlroots compositor");
         emulation.create(0).await;
 
         let start = Instant::now();

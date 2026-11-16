@@ -2,9 +2,10 @@ use async_trait::async_trait;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
+    time::Instant,
 };
 
-use input_event::{Event, KeyboardEvent};
+use input_event::{Event, KeyboardEvent, PointerEvent};
 
 pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError};
 
@@ -29,6 +30,9 @@ mod macos;
 /// fallback input emulation (logs events)
 mod dummy;
 mod error;
+mod scroll;
+
+pub use scroll::ScrollSmoothing;
 
 pub type EmulationHandle = u64;
 
@@ -120,10 +124,15 @@ pub struct InputEmulation {
     emulation: Box<dyn Emulation>,
     handles: HashSet<EmulationHandle>,
     pressed_keys: HashMap<EmulationHandle, HashSet<u32>>,
+    /// receiver-side wheel smoothing, when enabled and supported by the backend
+    smoothing: Option<scroll::Smoother>,
 }
 
 impl InputEmulation {
-    async fn with_backend(backend: Backend) -> Result<InputEmulation, EmulationCreationError> {
+    async fn with_backend(
+        backend: Backend,
+        smoothing: ScrollSmoothing,
+    ) -> Result<InputEmulation, EmulationCreationError> {
         let emulation: Box<dyn Emulation> = match backend {
             #[cfg(wlroots)]
             Backend::Wlroots => Box::new(wlroots::WlrootsEmulation::new()?),
@@ -139,16 +148,40 @@ impl InputEmulation {
             Backend::MacOs => Box::new(macos::MacOSEmulation::new()?),
             Backend::Dummy => Box::new(dummy::DummyEmulation::new()),
         };
+        let smoothing = if !smoothing.is_on() {
+            None
+        } else {
+            match emulation.scroll_units_per_notch() {
+                Some(units_per_notch) => {
+                    log::info!(
+                        "scroll smoothing: {} ms per notch",
+                        smoothing.duration().as_millis()
+                    );
+                    Some(scroll::Smoother::new(smoothing.duration(), units_per_notch))
+                }
+                None => {
+                    log::warn!(
+                        "scroll smoothing is enabled but the {backend} backend cannot \
+                         inject continuous scroll; wheel notches stay discrete"
+                    );
+                    None
+                }
+            }
+        };
         Ok(Self {
             emulation,
             handles: HashSet::new(),
             pressed_keys: HashMap::new(),
+            smoothing,
         })
     }
 
-    pub async fn new(backend: Option<Backend>) -> Result<InputEmulation, EmulationCreationError> {
+    pub async fn new(
+        backend: Option<Backend>,
+        smoothing: ScrollSmoothing,
+    ) -> Result<InputEmulation, EmulationCreationError> {
         if let Some(backend) = backend {
-            let b = Self::with_backend(backend).await;
+            let b = Self::with_backend(backend, smoothing).await;
             if b.is_ok() {
                 log::info!("using emulation backend: {backend}");
             }
@@ -170,7 +203,7 @@ impl InputEmulation {
             Backend::MacOs,
             Backend::Dummy,
         ] {
-            match Self::with_backend(backend).await {
+            match Self::with_backend(backend, smoothing).await {
                 Ok(b) => {
                     log::info!("using emulation backend: {backend}");
                     return Ok(b);
@@ -188,6 +221,27 @@ impl InputEmulation {
         event: Event,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
+        if self.smoothing.is_some() {
+            match &event {
+                Event::Pointer(PointerEvent::AxisDiscrete120 { axis, value }) => {
+                    self.smoothing.as_mut().expect("checked above").add_notches(
+                        handle,
+                        *axis,
+                        *value,
+                        Instant::now(),
+                    );
+                    return Ok(());
+                }
+                /* A click or a key must not be overtaken by the rest of a
+                 * scroll animation. Pointer motion is independent and may
+                 * arrive while the wheel is still settling. */
+                Event::Pointer(PointerEvent::Button { .. }) | Event::Keyboard(_) => {
+                    self.flush_scroll(handle).await?;
+                }
+                _ => {}
+            }
+        }
+
         match event {
             Event::Keyboard(KeyboardEvent::Key { key, state, .. }) => {
                 // prevent double pressed / released keys
@@ -198,6 +252,54 @@ impl InputEmulation {
             }
             _ => self.emulation.consume(event, handle).await,
         }
+    }
+
+    /// When the next smoothing tick is due, if an animation is running.
+    ///
+    /// The caller sleeps until this instant and then calls [`Self::scroll_tick`];
+    /// the emulation backend has no clock of its own.
+    pub fn next_scroll_tick(&self) -> Option<Instant> {
+        self.smoothing.as_ref().and_then(scroll::Smoother::deadline)
+    }
+
+    /// Emit the part of every wheel animation that is due now.
+    pub async fn scroll_tick(&mut self) -> Result<(), EmulationError> {
+        let mut due = Vec::new();
+        if let Some(smoothing) = self.smoothing.as_mut() {
+            smoothing.tick(Instant::now(), &mut due);
+        }
+        self.emit_scroll(due).await
+    }
+
+    /// Emit everything still queued for `handle` and forget it.
+    async fn flush_scroll(&mut self, handle: EmulationHandle) -> Result<(), EmulationError> {
+        let mut due = Vec::new();
+        if let Some(smoothing) = self.smoothing.as_mut() {
+            smoothing.flush(handle, &mut due);
+        }
+        self.emit_scroll(due).await
+    }
+
+    async fn emit_scroll(
+        &mut self,
+        due: Vec<(EmulationHandle, u8, f64)>,
+    ) -> Result<(), EmulationError> {
+        for (handle, axis, value) in due {
+            if value == 0.0 {
+                continue;
+            }
+            self.emulation
+                .consume(
+                    Event::Pointer(PointerEvent::Axis {
+                        time: 0,
+                        axis,
+                        value,
+                    }),
+                    handle,
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     /// Place the cursor where the peer crossed the matching edge of this
@@ -229,11 +331,18 @@ impl InputEmulation {
         let _ = self.release_keys(handle).await;
         if self.handles.remove(&handle) {
             self.pressed_keys.remove(&handle);
+            if let Some(smoothing) = self.smoothing.as_mut() {
+                smoothing.remove(handle);
+            }
             self.emulation.destroy(handle).await
         }
     }
 
     pub async fn terminate(&mut self) {
+        if let Some(smoothing) = self.smoothing.as_mut() {
+            /* the backend is about to go away: emit nothing more */
+            smoothing.clear();
+        }
         for handle in self.handles.iter().cloned().collect::<Vec<_>>() {
             self.destroy(handle).await
         }
@@ -354,5 +463,13 @@ trait Emulation: Send {
     /// crossing point (a "switch device" request instead of a barrier).
     /// Backends without absolute pointer positioning keep the default.
     async fn enter_center(&mut self, _handle: EmulationHandle) {}
+    /// Continuous axis units corresponding to one wheel notch, when the
+    /// backend can inject continuous scrolling at all.
+    ///
+    /// `None` means wheel notches have to stay discrete (X11 and Windows only
+    /// expose wheel buttons), which turns receiver-side smoothing off.
+    fn scroll_units_per_notch(&self) -> Option<f64> {
+        None
+    }
     async fn terminate(&mut self);
 }

@@ -284,6 +284,11 @@ impl LibeiEmulation {
 
 #[async_trait]
 impl Emulation for LibeiEmulation {
+    fn scroll_units_per_notch(&self) -> Option<f64> {
+        /* EI scroll deltas use the same continuous units as wl_pointer */
+        Some(15.0)
+    }
+
     async fn consume(
         &mut self,
         event: Event,

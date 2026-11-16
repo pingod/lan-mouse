@@ -35,7 +35,7 @@ pub async fn run(config: Config, args: TestEmulationArgs) -> Result<(), InputEmu
     );
 
     let backend = config.emulation_backend().map(|b| b.into());
-    let mut emulation = InputEmulation::new(backend).await?;
+    let mut emulation = InputEmulation::new(backend, config.scroll_smoothing()).await?;
     emulation.create(0).await;
 
     let start = Instant::now();
@@ -48,6 +48,15 @@ pub async fn run(config: Config, args: TestEmulationArgs) -> Result<(), InputEmu
     let mut scroll_direction = 1;
     loop {
         tokio::time::sleep(Duration::from_millis(1)).await;
+
+        /* The daemon's event loop drives the smoother; this test has its own
+         * loop, so it has to tick it here. */
+        if emulation
+            .next_scroll_tick()
+            .is_some_and(|at| at <= Instant::now())
+        {
+            emulation.scroll_tick().await?;
+        }
 
         if (keyboard || scroll) && last_toggle.elapsed() >= Duration::from_millis(500) {
             last_toggle = Instant::now();
@@ -74,7 +83,7 @@ pub async fn run(config: Config, args: TestEmulationArgs) -> Result<(), InputEmu
                     .consume(
                         Event::Pointer(PointerEvent::AxisDiscrete120 {
                             axis: 0,
-                            value: scroll_direction,
+                            value: scroll_direction * 120,
                         }),
                         0,
                     )

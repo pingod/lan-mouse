@@ -55,6 +55,11 @@ impl DesktopPortalEmulation {
 
 #[async_trait]
 impl Emulation for DesktopPortalEmulation {
+    fn scroll_units_per_notch(&self) -> Option<f64> {
+        /* the portal forwards continuous axis deltas, same scale as wl_pointer */
+        Some(15.0)
+    }
+
     async fn consume(
         &mut self,
         event: input_event::Event,

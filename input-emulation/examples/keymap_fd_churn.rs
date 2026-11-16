@@ -61,7 +61,12 @@ fn main() {
         .expect("failed to build runtime");
 
     runtime.block_on(async {
-        let mut emulation = match InputEmulation::new(Some(Backend::Wlroots)).await {
+        let mut emulation = match InputEmulation::new(
+            Some(Backend::Wlroots),
+            input_emulation::ScrollSmoothing::OFF,
+        )
+        .await
+        {
             Ok(e) => e,
             Err(e) => {
                 eprintln!("could not create wlroots emulation backend: {e}");

@@ -180,7 +180,7 @@ impl Service {
         );
         capture.set_switch_options(switch_options.clone());
         let emulation_backend = config.emulation_backend().map(|b| b.into());
-        let emulation = Emulation::new(emulation_backend, listener);
+        let emulation = Emulation::new(emulation_backend, config.scroll_smoothing(), listener);
 
         // create dns resolver
         let resolver = DnsResolver::new()?;
