@@ -98,6 +98,42 @@ impl CaptureTask {
 /// unknown for the lifetime of the process.
 const SCREEN_SIZE_POLL: Duration = Duration::from_secs(1);
 
+/// How long to wait before restarting a capture that failed.
+///
+/// Short enough that a compositor restart is barely noticeable, long enough that a
+/// backend which fails instantly does not spin. Doubles on each consecutive
+/// failure, up to [`CAPTURE_RETRY_MAX`].
+const CAPTURE_RETRY_MIN: Duration = Duration::from_millis(500);
+
+/// How long to wait for a backend to come up before giving up on it.
+///
+/// The portal can accept a session and then never answer the next call. Without a
+/// bound, `InputCapture::new` would sit there forever, the capture would never be
+/// retried, and the pointer would stop crossing edges with nothing in the log to
+/// say why - which is exactly what happened before this was added.
+const CAPTURE_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The longest wait between capture restart attempts.
+///
+/// Capped so a backend that recovers after a long outage - a monitor unplugged for
+/// a minute, a portal that was not available at all - comes back on its own instead
+/// of needing a restart of the daemon.
+const CAPTURE_RETRY_MAX: Duration = Duration::from_secs(5);
+
+/// Why a capture run ended.
+///
+/// The two cases look identical from the return value alone - both are `Ok` - but
+/// they need opposite handling: a cancellation is on its way out and must not
+/// restart, while a stream that ended leaves the pointer unable to cross an edge
+/// until something starts it again, and nothing else ever does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureOutcome {
+    /// the capture stopped on its own and should be started again
+    Restart,
+    /// the service is shutting down
+    Cancelled,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CaptureType {
     /// a normal input capture
@@ -573,9 +609,44 @@ impl CaptureTask {
     }
 
     async fn run(mut self) {
+        /* Restart the capture when it fails, with a backoff.
+         *
+         * The backend dying is not the same as the user disabling capture: a portal
+         * request that fails once (a compositor restart, a monitor hotplug, the
+         * portal's own session being replaced) used to leave the capture stopped
+         * until something sent `Reenable` - and nothing ever did, so the pointer
+         * could not cross an edge again for the lifetime of the process. The
+         * request loop below only waits for the *next* thing to happen; without a
+         * retry here there was nothing to wait for.
+         */
+        let mut backoff = CAPTURE_RETRY_MIN;
         loop {
-            if let Err(e) = self.do_capture().await {
-                log::warn!("input capture exited: {e}");
+            let retry = match self.do_capture().await {
+                /* the capture stopped on its own - the stream ended, the compositor
+                 * took the seat away, the portal session was replaced. Not an
+                 * error, but the pointer cannot cross an edge until it is running
+                 * again, so it is restarted just like a failure. */
+                Ok(CaptureOutcome::Restart) => {
+                    log::info!("capture stopped, restarting in {} ms", backoff.as_millis());
+                    true
+                }
+                /* only a cancellation gets here, and it is on its way out */
+                Ok(CaptureOutcome::Cancelled) => false,
+                Err(e) => {
+                    log::warn!(
+                        "input capture exited: {e} — retrying in {} ms",
+                        backoff.as_millis()
+                    );
+                    true
+                }
+            };
+            if retry {
+                log::info!("restarting capture in {} ms", backoff.as_millis());
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = self.cancellation_token.cancelled() => return,
+                }
+                backoff = (backoff * 2).min(CAPTURE_RETRY_MAX);
             }
             loop {
                 tokio::select! {
@@ -610,11 +681,20 @@ impl CaptureTask {
         }
     }
 
-    async fn do_capture(&mut self) -> Result<(), InputCaptureError> {
-        /* allow cancelling capture request */
+    async fn do_capture(&mut self) -> Result<CaptureOutcome, InputCaptureError> {
+        /* allow cancelling capture request, and do not hang forever on a backend
+         * that never answers: the portal can accept a session and then go quiet,
+         * and a capture task stuck in `new` would never be retried */
         let mut capture = tokio::select! {
             r = InputCapture::new(self.backend) => r?,
-            _ = self.cancellation_token.cancelled() => return Ok(()),
+            _ = self.cancellation_token.cancelled() => return Ok(CaptureOutcome::Cancelled),
+            _ = tokio::time::sleep(CAPTURE_START_TIMEOUT) => {
+                log::warn!(
+                    "the capture backend did not start within {} s",
+                    CAPTURE_START_TIMEOUT.as_secs()
+                );
+                return Err(InputCaptureError::from(CaptureError::BeginUnsupported));
+            }
         };
 
         let _capture_guard = DropGuard::new(
@@ -623,6 +703,7 @@ impl CaptureTask {
             ICaptureEvent::CaptureDisabled,
         );
 
+        log::debug!("capture backend created, registering barriers");
         /* create barriers for active clients */
         let r = self.create_captures(&mut capture).await;
         if let Err(e) = r {
@@ -630,6 +711,7 @@ impl CaptureTask {
             return Err(e.into());
         }
 
+        log::debug!("barriers registered, entering the capture session");
         let r = self.do_capture_session(&mut capture).await;
 
         // FIXME replace with async drop when stabilized
@@ -690,7 +772,7 @@ impl CaptureTask {
     async fn do_capture_session(
         &mut self,
         capture: &mut InputCapture,
-    ) -> Result<(), InputCaptureError> {
+    ) -> Result<CaptureOutcome, InputCaptureError> {
         /* Ask the backend for its geometry until it answers. The first read in
          * `create_captures` happens before the backend has a session - libei
          * queues the request and only then talks to the portal - so it returns
@@ -734,7 +816,7 @@ impl CaptureTask {
                         // lan-mouse is restarted (issue #545).
                         log::warn!("capture stream ended — releasing before restarting it");
                         self.release_capture(capture).await?;
-                        return Ok(());
+                        return Ok(CaptureOutcome::Restart);
                     }
                 },
                 (handle, event) = self.conn.recv() => {
@@ -940,7 +1022,9 @@ impl CaptureTask {
                 _ = self.cancellation_token.cancelled() => break,
             }
         }
-        Ok(())
+        /* the event stream is over: the backend is gone, so this is a restart, not
+         * a shutdown */
+        Ok(CaptureOutcome::Restart)
     }
 
     async fn handle_capture_event(

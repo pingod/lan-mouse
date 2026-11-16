@@ -497,6 +497,9 @@ async fn libei_event_handler(
     }
 }
 
+/// How long to wait for the capture task to stop before abandoning it.
+const TERMINATE_TIMEOUT: Duration = Duration::from_secs(3);
+
 impl LibeiInputCapture {
     pub async fn new() -> std::result::Result<Self, LibeiCaptureCreationError> {
         let input_capture = Arc::new(InputCapture::new().await?);
@@ -1042,6 +1045,24 @@ async fn handle_ei_event(
     Ok(())
 }
 
+impl LibeiInputCapture {
+    /// Hand one message to the capture task.
+    ///
+    /// The channel has room for a single message and the task is the only reader,
+    /// so a `send` blocks as soon as the task is gone. That is not hypothetical:
+    /// the task ends when the portal session dies, and the next `create_captures`
+    /// would then wait for a reader that will never come - the capture never
+    /// restarted and nothing was logged, which is the worst of both. A closed
+    /// channel is reported as a disconnect instead, so the retry loop can act on
+    /// it.
+    async fn notify(&self, event: LibeiNotifyEvent) -> Result<(), CaptureError> {
+        self.notify_capture
+            .send(event)
+            .await
+            .map_err(|_| CaptureError::Disconnected("libei capture task is gone".to_owned()))
+    }
+}
+
 #[async_trait]
 impl LanMouseInputCapture for LibeiInputCapture {
     async fn begin(&mut self, _pos: Position) -> Result<(), CaptureError> {
@@ -1055,11 +1076,7 @@ impl LanMouseInputCapture for LibeiInputCapture {
         pos: Position,
         segments: Vec<EdgeRange>,
     ) -> Result<(), CaptureError> {
-        let _ = self
-            .notify_capture
-            .send(LibeiNotifyEvent::Create(pos, segments))
-            .await;
-        Ok(())
+        self.notify(LibeiNotifyEvent::Create(pos, segments)).await
     }
 
     async fn update(
@@ -1069,19 +1086,11 @@ impl LanMouseInputCapture for LibeiInputCapture {
     ) -> Result<(), CaptureError> {
         /* the same message as a new client: the task replaces the segments it
          * registers for this position */
-        let _ = self
-            .notify_capture
-            .send(LibeiNotifyEvent::Create(pos, segments))
-            .await;
-        Ok(())
+        self.notify(LibeiNotifyEvent::Create(pos, segments)).await
     }
 
     async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
-        let _ = self
-            .notify_capture
-            .send(LibeiNotifyEvent::Destroy(pos))
-            .await;
-        Ok(())
+        self.notify(LibeiNotifyEvent::Destroy(pos)).await
     }
 
     async fn layout(&mut self) -> Option<Layout> {
@@ -1108,13 +1117,29 @@ impl LanMouseInputCapture for LibeiInputCapture {
         let task = &mut self.capture_task;
         log::debug!("waiting for capture to terminate...");
         let res = if !task.is_finished() {
-            match task.await {
-                Ok(res) => res,
-                Err(e) => {
+            /* Bounded, because the task can be stuck in a portal call that will
+             * never answer. Waiting forever here is what stopped the capture from
+             * ever being restarted: `do_capture` never returned, so the retry loop
+             * never ran, and the pointer silently stopped crossing edges. */
+            match tokio::time::timeout(TERMINATE_TIMEOUT, &mut *task).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(e)) => {
                     log::error!("libei capture task panicked: {e}");
                     Err(CaptureError::Io(io::Error::other(format!(
                         "libei capture task panicked: {e}"
                     ))))
+                }
+                Err(_) => {
+                    /* The task is abandoned rather than awaited: it holds a portal
+                     * session that the portal itself will reclaim when the process
+                     * closes it or the session times out. Leaking one task is much
+                     * better than a daemon that never captures again. */
+                    log::warn!(
+                        "libei capture task did not stop within {} s, abandoning it",
+                        TERMINATE_TIMEOUT.as_secs()
+                    );
+                    task.abort();
+                    Ok(())
                 }
             }
         } else {
