@@ -27,7 +27,6 @@ pub struct Palette {
     pub card: (f64, f64, f64),
     pub accent: (f64, f64, f64),
     pub success: (f64, f64, f64),
-    pub warning: (f64, f64, f64),
     pub danger: (f64, f64, f64),
 }
 
@@ -44,7 +43,6 @@ impl Palette {
                 card: (0.20, 0.20, 0.23),
                 accent: (0.36, 0.62, 0.95),
                 success: (0.35, 0.82, 0.47),
-                warning: (0.93, 0.73, 0.25),
                 danger: (0.90, 0.38, 0.36),
             }
         } else {
@@ -53,7 +51,6 @@ impl Palette {
                 card: (1.0, 1.0, 1.0),
                 accent: (0.20, 0.47, 0.85),
                 success: (0.15, 0.65, 0.32),
-                warning: (0.75, 0.55, 0.05),
                 danger: (0.78, 0.22, 0.20),
             }
         }
@@ -284,7 +281,6 @@ mod tests {
                 palette.foreground,
                 palette.accent,
                 palette.success,
-                palette.warning,
                 palette.danger,
             ];
             for color in colors {

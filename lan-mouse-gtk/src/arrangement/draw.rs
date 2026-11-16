@@ -10,7 +10,7 @@ use lan_mouse_ipc::{EdgeRange, Position};
 
 use super::layout::Screen;
 use super::paint::{self, Palette, Text};
-use super::{Drag, GAP, Machine, State, positions};
+use super::{Drag, Machine, State, positions};
 
 /// Paint the canvas.
 pub(super) fn draw(cr: &cairo::Context, width: f64, height: f64, state: &State, palette: &Palette) {
@@ -32,28 +32,6 @@ pub(super) fn draw(cr: &cairo::Context, width: f64, height: f64, state: &State, 
         };
         draw_link(cr, state, machine, *piece, rect, palette);
     }
-    for position in positions() {
-        /* The walls are the complement of what is reachable, per edge: a stretch
-         * nobody claims and a stretch a blocked corner eats look the same to the
-         * pointer, so they are drawn the same way. An edge with nothing on it is
-         * left blank - a wall there would claim the user attached a machine. */
-        let claimed = state
-            .machines
-            .iter()
-            .any(|machine| machine.position == position && machine.active);
-        if !claimed {
-            continue;
-        }
-        let pieces = reachable
-            .iter()
-            .filter(|(machine, _)| machine.position == position)
-            .map(|(_, piece)| *piece)
-            .collect::<Vec<_>>();
-        for gap in EdgeRange::gaps(&pieces) {
-            draw_wall(cr, state, local, position, gap, palette);
-        }
-    }
-
     /* the stretch of edge a dragged card is about to claim */
     if let Some(drag) = state.drag.as_ref() {
         draw_snap_preview(cr, state, drag, palette);
@@ -186,29 +164,6 @@ pub(super) fn draw(cr: &cairo::Context, width: f64, height: f64, state: &State, 
         }
     }
 
-    /* The handles, on top of what they adjust - and only for the machine the
-     * pointer is on.
-     *
-     * Drawn for every machine they are eight identical blue squares with nothing
-     * saying what they belong to or what they do, which reads as decoration or as
-     * an error. Showing them for one machine at a time makes them part of that
-     * machine's card. */
-    let focused = state.drag.as_ref().map(|drag| drag.handle).or(state.hover);
-    for handle in state
-        .geometry
-        .handles
-        .iter()
-        .filter(|handle| Some(handle.handle) == focused)
-    {
-        let canvas = state.to_canvas(handle.rect);
-        paint::set(cr, palette.accent, 0.95);
-        paint::rounded_rect(cr, canvas, 3.0);
-        let _ = cr.fill_preserve();
-        paint::set(cr, palette.foreground, 0.4);
-        cr.set_line_width(1.0);
-        let _ = cr.stroke();
-    }
-
     if state.machines.iter().all(|m| !m.active) {
         paint::set(cr, palette.foreground, 0.55);
         let text = Text::new(
@@ -333,80 +288,57 @@ fn draw_link(
     peer: Screen,
     palette: &Palette,
 ) {
-    /* The band spans the gap between the peer's card and the monitor it is
-     * attached to - not the bounding box.
+    /* The band fills the gap between the peer's card and this machine's screens,
+     * across the part of the edge the link covers.
      *
-     * `piece` is measured against the monitor the link names, and on a desk with
-     * unequal heights the box's edge is a different line from that monitor's: the
-     * box top belongs to the rotated panel while the link sits on the upright one,
-     * 1120 px lower. Anchoring to the box made the height of this band negative, so
-     * the link disappeared and the two screens stopped looking connected. */
+     * Measured from the two rectangles that are actually drawn - the peer's card and
+     * the local monitors - rather than from the link's edge and the anchor monitor.
+     * Those two can disagree: an adopted picture carries exact rectangles, while the
+     * link is an edge plus two fractions and cannot reproduce them, so deriving the
+     * band from the link put it somewhere the cards are not and the screens stopped
+     * looking connected.
+     */
     let anchor = state.anchor_of(machine);
-    let edge_len = anchor.extent_along(machine.position);
-    if edge_len <= 0.0 {
-        return;
-    }
-    let low = anchor.edge_start(machine.position);
-    let start = low + piece.start() as f64 / 1000.0 * edge_len;
-    let stop = low + piece.end() as f64 / 1000.0 * edge_len;
-    let band = match machine.position {
-        Position::Left => Screen::new(peer.right(), start, anchor.x - peer.right(), stop - start),
-        Position::Right => {
-            Screen::new(anchor.right(), start, peer.x - anchor.right(), stop - start)
+    let (start, stop) = {
+        let edge_len = anchor.extent_along(machine.position);
+        if edge_len <= 0.0 {
+            return;
         }
-        Position::Top => Screen::new(start, peer.bottom(), stop - start, anchor.y - peer.bottom()),
-        Position::Bottom => Screen::new(
-            start,
-            anchor.bottom(),
-            stop - start,
-            peer.y - anchor.bottom(),
-        ),
+        let low = anchor.edge_start(machine.position);
+        (
+            low + piece.start() as f64 / 1000.0 * edge_len,
+            low + piece.end() as f64 / 1000.0 * edge_len,
+        )
+    };
+    /* The gap along the crossing axis, clamped to nothing when the cards already
+     * touch. No `max`/`min` juggling: each side knows which of the two edges comes
+     * first, and getting that wrong collapsed the band to zero width. */
+    let band = match machine.position {
+        Position::Left => {
+            let width = anchor.x - peer.right();
+            Screen::new(peer.right(), start, width.max(0.0), stop - start)
+        }
+        Position::Right => {
+            let width = peer.x - anchor.right();
+            Screen::new(anchor.right(), start, width.max(0.0), stop - start)
+        }
+        Position::Top => {
+            let height = anchor.y - peer.bottom();
+            Screen::new(start, peer.bottom(), stop - start, height.max(0.0))
+        }
+        Position::Bottom => {
+            let height = peer.y - anchor.bottom();
+            Screen::new(start, anchor.bottom(), stop - start, height.max(0.0))
+        }
     };
     if band.w <= 0.0 || band.h <= 0.0 {
-        /* the peer is inside the anchor's own row, which a drag does momentarily;
-         * a negative rectangle is not a link */
+        /* the cards already touch, so there is no gap to draw a band in */
         return;
     }
     let canvas = state.to_canvas(band);
     paint::set(cr, palette.success, 0.5);
     cr.rectangle(canvas.x, canvas.y, canvas.w.max(1.0), canvas.h.max(1.0));
     let _ = cr.fill();
-}
-
-/// A stretch of edge that reaches nothing, drawn as a hatched wall.
-fn draw_wall(
-    cr: &cairo::Context,
-    state: &State,
-    local: Screen,
-    position: Position,
-    gap: EdgeRange,
-    palette: &Palette,
-) {
-    let edge_len = local.extent_along(position);
-    let low = local.edge_start(position);
-    let start = low + gap.start() as f64 / 1000.0 * edge_len;
-    let stop = low + gap.end() as f64 / 1000.0 * edge_len;
-    /* A wall is the complement of what is reachable along the whole edge, so it is
-     * drawn against the box: it spans several monitors, and no single one of them
-     * owns it. */
-    let band = match position {
-        Position::Left => Screen::new(local.x - GAP, start, GAP, stop - start),
-        Position::Right => Screen::new(local.right(), start, GAP, stop - start),
-        Position::Top => Screen::new(start, local.y - GAP, stop - start, GAP),
-        Position::Bottom => Screen::new(start, local.bottom(), stop - start, GAP),
-    };
-    let canvas = state.to_canvas(band);
-    paint::set(cr, palette.warning, 0.55);
-    cr.set_line_width(1.5);
-    /* hatched, so it reads as blocked rather than as an empty link */
-    let step = 8.0f64.max(canvas.h / 6.0);
-    let mut x = canvas.x;
-    while x < canvas.right() {
-        cr.move_to(x, canvas.y);
-        cr.line_to((x + step).min(canvas.right()), canvas.bottom());
-        let _ = cr.stroke();
-        x += step * 2.0;
-    }
 }
 
 /// Highlight the stretch of edge a dragged card is about to claim.

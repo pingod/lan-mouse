@@ -232,21 +232,8 @@ fn normalise_monitors(rects: &[input_event::ScreenRect]) -> Vec<layout::Monitor>
         .collect()
 }
 
-/// The space between a card and the local screen, in layout units.
-///
-/// Generous, because the link is drawn inside it and because two screens touching
-/// exactly would read as one.
-const GAP: f64 = 60.0;
 /// The canvas height the page asks for before the window grows it.
 const CANVAS_HEIGHT: i32 = 460;
-/// Half the side of a handle's grab area, in **canvas** units.
-///
-/// Canvas units, not layout units: a handle that is a fixed number of pixels of
-/// the screen it sits on becomes ungrabbable on a 4K panel and invisible when the
-/// canvas is zoomed out, while a constant on-screen size is what the pointer needs.
-const HANDLE_HALF: f64 = 9.0;
-/// Range ends are quantized to this many permille: 2% of the edge.
-const RANGE_STEP: u16 = 20;
 
 /// All four edges, in the order the daemon resolves them in.
 fn positions() -> [Position; 4] {
@@ -269,17 +256,6 @@ struct Geometry {
     offset: (f64, f64),
     /// where each peer ended up
     peers: Vec<(ClientHandle, Screen)>,
-    /// the grab areas of the range handles
-    handles: Vec<Handle>,
-}
-
-/// One end of one peer's coverage of the local edge.
-#[derive(Clone, Copy, Debug)]
-struct Handle {
-    handle: ClientHandle,
-    /// `false` = the low end, `true` = the high end of the coverage
-    high: bool,
-    rect: Screen,
 }
 
 /// A peer being dragged.
@@ -293,18 +269,6 @@ struct Drag {
     placement: Placement,
 }
 
-/// A range end being dragged.
-struct Resize {
-    handle: ClientHandle,
-    high: bool,
-    /// where the press landed, in canvas units: the gesture reports offsets from it
-    origin: (f64, f64),
-    /// the ranges at the start of the drag, for the no-op check
-    start: (EdgeRange, EdgeRange),
-    /// the ranges the pointer currently implies
-    current: (EdgeRange, EdgeRange),
-}
-
 struct State {
     local_hostname: String,
     /// every monitor of this machine, in pixels; empty when no backend reported
@@ -315,7 +279,6 @@ struct State {
     on_request: Rc<dyn Fn(MachineRequest)>,
     geometry: Geometry,
     drag: Option<Drag>,
-    resize: Option<Resize>,
     /// the card the pointer is over, which is also the keyboard-selected one
     hover: Option<ClientHandle>,
     /// the view's pan when a pan began, while the view is being dragged
@@ -669,10 +632,19 @@ impl State {
         )
     }
 
-    /// The card of `handle`, with a drag taking precedence over the layout.
+    /// The card of `handle`: a drag first, then the picture, then the placement.
+    ///
+    /// The picture before the placement, because those two disagree by construction:
+    /// the placement is derived from the link (an edge and two fractions) and cannot
+    /// reproduce an arbitrary rectangle, while an adopted picture carries the exact
+    /// rectangles both machines agreed on. Reading the placement here made the link
+    /// band, the hit test and the drawn card use three different answers.
     fn rect_of(&self, handle: ClientHandle) -> Option<Screen> {
         if let Some(drag) = self.drag.as_ref().filter(|d| d.handle == handle) {
             return Some(drag.current);
+        }
+        if let Some(rect) = self.machine(handle).and_then(|machine| machine.peer_rect) {
+            return Some(rect);
         }
         self.geometry
             .peers
@@ -754,15 +726,6 @@ impl State {
             .map(|(handle, _)| *handle)
     }
 
-    fn handle_at(&self, x: f64, y: f64) -> Option<Handle> {
-        let (x, y) = self.to_layout(x, y);
-        self.geometry
-            .handles
-            .iter()
-            .copied()
-            .find(|handle| handle.rect.contains(x, y))
-    }
-
     /// Recompute the layout for a canvas of `width` x `height`.
     ///
     /// A pure function of the machines and the view, so it is redone on every draw
@@ -787,13 +750,11 @@ impl State {
             (width - bounds.w * scale) / 2.0 - bounds.x * scale + self.pan.0,
             (height - bounds.h * scale) / 2.0 - bounds.y * scale + self.pan.1,
         );
-        let handles = self.handles(&local, &peers, scale);
         self.geometry = Geometry {
             local,
             scale,
             offset,
             peers,
-            handles,
         };
         /* Hand the picture this canvas is drawing to the daemon, which puts it in
          * the report it sends peers - that is what makes the other window show this
@@ -803,7 +764,7 @@ impl State {
         /* Not while something is being dragged: the picture would be the transient
          * geometry of a card mid-gesture, published dozens of times a second to a peer
          * that cannot use it. The commit that ends the drag publishes the result. */
-        let settled = self.drag.is_none() && self.resize.is_none() && self.moving_local.is_none();
+        let settled = self.drag.is_none() && self.moving_local.is_none();
         if settled && self.newer_peer_picture().is_none() {
             let encoded = self.local_picture().encode();
             if encoded != self.published {
@@ -813,70 +774,13 @@ impl State {
         }
     }
 
-    /// The grab areas of the range handles: on the local edge, at both ends of
-    /// every peer's coverage of it.
-    fn handles(&self, local: &Screen, peers: &[(ClientHandle, Screen)], scale: f64) -> Vec<Handle> {
-        let mut out = Vec::new();
-        for machine in self.machines.iter().filter(|m| m.active) {
-            if !peers.iter().any(|(other, _)| *other == machine.handle) {
-                continue;
-            }
-            let edge_len = local.extent_along(machine.position);
-            if edge_len <= 0.0 {
-                continue;
-            }
-            let low = local.edge_start(machine.position);
-            for (high, permille) in [(false, machine.edge.start()), (true, machine.edge.end())] {
-                let at = low + permille as f64 / 1000.0 * edge_len;
-                out.push(Handle {
-                    handle: machine.handle,
-                    high,
-                    rect: handle_rect(*local, machine.position, at, scale),
-                });
-            }
-        }
-        out
-    }
-
-    /// The ranges implied by dragging a handle to `point` along the local edge.
-    fn resized(&self, machine: &Machine, high: bool, point: f64) -> (EdgeRange, EdgeRange) {
-        let local = self.geometry.local;
-        let edge_len = local.extent_along(machine.position);
-        if edge_len <= 0.0 {
-            return (machine.edge, machine.peer_edge);
-        }
-        let origin = local.edge_start(machine.position);
-        let permille = |value: f64| -> u16 {
-            let raw = ((value - origin) / edge_len * 1000.0).clamp(0.0, 1000.0);
-            ((raw / RANGE_STEP as f64).round() * RANGE_STEP as f64) as u16
-        };
-        let (mut start, mut stop) = (machine.edge.start(), machine.edge.end());
-        if high {
-            stop = permille(point);
-            if stop <= start {
-                stop = (start + RANGE_STEP).min(1000);
-            }
-        } else {
-            start = permille(point);
-            if start >= stop {
-                start = stop.saturating_sub(RANGE_STEP);
-            }
-        }
-        let edge = EdgeRange::new(start.min(999), stop.clamp(1, 1000)).unwrap_or(machine.edge);
-        /* The peer's own range does not follow a local handle: the two ends of a
-         * link are set independently - Synergy writes both - and sliding the local
-         * stretch keeps the mapping onto the peer's edge as it was configured.
-         * Dragging the card itself is what changes both at once. */
-        (edge, machine.peer_edge)
-    }
-
+    /// The peers that do not get the whole stretch of edge they asked for.
     /// Reset the zoom and pan.
     fn reset_view(&mut self) {
         self.zoom = 1.0;
         self.pan = (0.0, 0.0);
     }
 
-    /// The peers that do not get the whole stretch of edge they asked for.
     fn unreachable(&self) -> Vec<ClientHandle> {
         let mut out = Vec::new();
         for position in positions() {
@@ -919,39 +823,6 @@ impl State {
                 });
             }
         }
-        if let Some(resize) = self.resize.take() {
-            let link = self
-                .machine(resize.handle)
-                .map(|machine| (machine.position, machine.display.clone()));
-            if resize.current != resize.start {
-                if let Some((position, display)) = link {
-                    self.mark_edited();
-                    (self.on_request)(MachineRequest::Move {
-                        handle: resize.handle,
-                        position,
-                        display,
-                        edge: resize.current.0,
-                        peer_edge: resize.current.1,
-                    });
-                }
-            }
-        }
-    }
-}
-
-/// The grab rectangle of the handle at `at` along `position`'s edge.
-///
-/// Straddles the local edge - half on the screen, half in the gap - so it reads as
-/// the end of a coverage of that edge rather than as part of a card. `scale` turns
-/// the constant on-screen size back into layout units.
-fn handle_rect(local: Screen, position: Position, at: f64, scale: f64) -> Screen {
-    let half = HANDLE_HALF / scale.max(f64::EPSILON);
-    let size = half * 2.0;
-    match position {
-        Position::Left => Screen::new(local.x - half, at - half, size, size),
-        Position::Right => Screen::new(local.right() - half, at - half, size, size),
-        Position::Top => Screen::new(at - half, local.y - half, size, size),
-        Position::Bottom => Screen::new(at - half, local.bottom() - half, size, size),
     }
 }
 
@@ -984,7 +855,6 @@ impl Canvas {
             on_request: Rc::new(on_request),
             geometry: Geometry::default(),
             drag: None,
-            resize: None,
             hover: None,
             panning: None,
             moving_local: None,
@@ -1082,7 +952,7 @@ impl Canvas {
             let mut state = self.state.borrow_mut();
             /* a daemon answer must not yank a card out from under the pointer: the
              * drag owns the machine it started on until it ends */
-            if state.drag.is_none() && state.resize.is_none() {
+            if state.drag.is_none() {
                 state.local_hostname = local_hostname.to_string();
                 state.local_displays = input_event::Layout::decode(displays)
                     .map(|l| l.displays)
@@ -1312,24 +1182,17 @@ fn describe(options: &SwitchOptions) -> String {
 /// claims a press that lands on a handle, so the same press never starts a card
 /// drag. Everything else falls through to the drag; the middle button pans.
 fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
-    /* hover: the cursor changes over a card or a handle, and the card lights up */
+    /* hover: the cursor changes over a card, and the card lights up */
     let motion = gtk::EventControllerMotion::new();
     {
         let state = Rc::clone(state);
         let area = area.clone();
         motion.connect_motion(move |_motion, x, y| {
             let mut state = state.borrow_mut();
-            let handle = state.handle_at(x, y);
-            let hover = handle.map(|handle| handle.handle).or(state.hit(x, y));
+            let hover = state.hit(x, y);
             if state.hover != hover {
                 state.hover = hover;
-                let cursor = if handle.is_some() {
-                    "ew-resize"
-                } else if hover.is_some() {
-                    "grab"
-                } else {
-                    "default"
-                };
+                let cursor = if hover.is_some() { "grab" } else { "default" };
                 area.set_cursor_from_name(Some(cursor));
                 area.queue_draw();
             }
@@ -1338,71 +1201,6 @@ fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
     area.add_controller(motion);
 
     /* range handles: capture phase, so a press on one never drags a card */
-    let resize_gesture = gtk::GestureDrag::new();
-    resize_gesture.set_button(1);
-    resize_gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
-    {
-        let state = Rc::clone(state);
-        let area = area.clone();
-        resize_gesture.connect_drag_begin(move |_gesture, x, y| {
-            let mut state = state.borrow_mut();
-            let Some(found) = state.handle_at(x, y) else {
-                return;
-            };
-            let Some(machine) = state.machine(found.handle) else {
-                return;
-            };
-            let start = (machine.edge, machine.peer_edge);
-            state.resize = Some(Resize {
-                handle: found.handle,
-                high: found.high,
-                origin: (x, y),
-                start,
-                current: start,
-            });
-            area.queue_draw();
-        });
-    }
-    {
-        let state = Rc::clone(state);
-        let area = area.clone();
-        resize_gesture.connect_drag_update(move |_gesture, dx, dy| {
-            let mut state = state.borrow_mut();
-            let Some(resize) = state.resize.as_ref() else {
-                return;
-            };
-            let (handle, high) = (resize.handle, resize.high);
-            let origin = resize.origin;
-            let Some(machine) = state.machine(handle).cloned() else {
-                return;
-            };
-            let (x, y) = state.to_layout(origin.0 + dx, origin.1 + dy);
-            let point = match machine.position {
-                Position::Left | Position::Right => y,
-                Position::Top | Position::Bottom => x,
-            };
-            let current = state.resized(&machine, high, point);
-            if let Some(resize) = state.resize.as_mut() {
-                resize.current = current;
-            }
-            /* preview the new stretch: the card slides as the range changes, which
-             * is the feedback that makes a handle worth grabbing */
-            if let Some(machine) = state.machines.iter_mut().find(|m| m.handle == handle) {
-                machine.edge = current.0;
-                machine.peer_edge = current.1;
-            }
-            area.queue_draw();
-        });
-    }
-    {
-        let state = Rc::clone(state);
-        let area = area.clone();
-        resize_gesture.connect_drag_end(move |_gesture, _dx, _dy| {
-            state.borrow_mut().commit();
-            area.queue_draw();
-        });
-    }
-    area.add_controller(resize_gesture);
 
     /* drag a card */
     let drag = gtk::GestureDrag::new();
@@ -1412,9 +1210,7 @@ fn add_gestures(area: &gtk::DrawingArea, state: &Rc<RefCell<State>>) {
         let area = area.clone();
         drag.connect_drag_begin(move |_gesture, x, y| {
             let mut state = state.borrow_mut();
-            if state.resize.is_some() || state.handle_at(x, y).is_some() {
-                return;
-            }
+
             /* A press on this machine's own screens moves them, which is how the
              * user changes where this machine sits relative to the peers. The
              * monitors are drawn from an offset so the peers stay where they are;
@@ -1689,7 +1485,6 @@ mod tests {
             on_request: Rc::new(|_| {}),
             geometry: Geometry::default(),
             drag: None,
-            resize: None,
             hover: None,
             panning: None,
             moving_local: None,
@@ -1727,46 +1522,6 @@ mod tests {
         state.relayout(800.0, 460.0);
         assert!(state.geometry.peers.is_empty());
         assert_eq!(state.hit(700.0, 200.0), None);
-    }
-
-    #[test]
-    fn handles_sit_at_both_ends_of_every_coverage() {
-        let mut state = state(vec![machine(0, Position::Right, (0.25, 0.75))]);
-        state.relayout(800.0, 460.0);
-        assert_eq!(state.geometry.handles.len(), 2);
-        let (low, high) = (state.geometry.handles[0], state.geometry.handles[1]);
-        assert!(!low.high && high.high);
-        // the low end is above the high end on the canvas
-        assert!(low.rect.y < high.rect.y);
-        // and both straddle the local screen's right edge
-        let local = state.geometry.local;
-        for handle in [low, high] {
-            let centre = (handle.rect.x + handle.rect.w / 2.0 - local.right()).abs();
-            assert!(centre < 1.0, "handle not on the edge: {handle:?}");
-        }
-    }
-
-    #[test]
-    fn dragging_a_handle_moves_only_the_end_it_grabbed() {
-        let mut state = state(vec![machine(0, Position::Right, (0.2, 0.8))]);
-        state.relayout(800.0, 460.0);
-        let machine = state.machine(0).cloned().expect("machine");
-        // grab the low end and drag it to 60% of the edge
-        let point = local_edge_point(&state, Position::Right, 0.6);
-        let (edge, peer_edge) = state.resized(&machine, false, point);
-        assert_eq!(edge.fractions(), [0.6, 0.8]);
-        assert_eq!(peer_edge, EdgeRange::FULL);
-    }
-
-    #[test]
-    fn a_handle_cannot_cross_the_other_end() {
-        let mut state = state(vec![machine(0, Position::Right, (0.2, 0.4))]);
-        state.relayout(800.0, 460.0);
-        let machine = state.machine(0).cloned().expect("machine");
-        let point = local_edge_point(&state, Position::Right, 0.9);
-        let (edge, _) = state.resized(&machine, false, point);
-        assert!(edge.start() < edge.end(), "{edge}");
-        assert_eq!(edge.end(), 400);
     }
 
     #[test]
@@ -1911,13 +1666,6 @@ mod tests {
         );
         assert_eq!((low, high), (1000, 0));
     }
-
-    /// The canvas point that is `fraction` along `position`'s edge.
-    fn local_edge_point(state: &State, position: Position, fraction: f64) -> f64 {
-        let local = state.geometry.local;
-        let low = local.edge_start(position);
-        low + fraction * local.extent_along(position)
-    }
 }
 
 /// Render the canvas off screen.
@@ -1966,7 +1714,6 @@ mod render {
             on_request: Rc::new(|_| {}),
             geometry: Geometry::default(),
             drag: None,
-            resize: None,
             hover: None,
             panning: None,
             moving_local: None,
@@ -2113,27 +1860,6 @@ mod render {
             &[(palette.success, 0.6), (palette.danger, 0.95)],
         );
         assert!(blue > 100, "the local screen is missing ({blue} pixels)");
-    }
-
-    #[test]
-    fn a_wall_is_painted_where_nothing_is_reachable() {
-        // 0-40% and 60-100%: the 40-60% stretch reaches nobody and must show as blocked
-        let mut state = state(vec![
-            machine(0, Position::Right, (0.0, 0.4), true),
-            machine(1, Position::Right, (0.6, 1.0), true),
-        ]);
-        let mut surface = render(&mut state, 900, 500);
-        let palette = Palette::resolve(false);
-        let blocked = count_closest(
-            &mut surface,
-            palette.warning,
-            0.55,
-            &[(palette.success, 0.5), (palette.accent, 0.9)],
-        );
-        assert!(
-            blocked > 20,
-            "the gap between 40% and 60% was not drawn as a wall ({blocked} pixels)"
-        );
     }
 
     #[test]
