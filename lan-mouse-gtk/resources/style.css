@@ -10,36 +10,3 @@
 .peer-unknown > box > list .subtitle {
     color: @warning_color;
 }
-
-/* ── visual screen arrangement (Screens page) ───────────────────────── */
-
-.arrangement-cell {
-    padding: 8px;
-    border-radius: 12px;
-    border: 1px dashed alpha(@borders, 0.9);
-    background-color: alpha(@card_bg_color, 0.4);
-}
-
-.arrangement-cell.drop-hover {
-    border-color: @accent_color;
-    background-color: alpha(@accent_bg_color, 0.2);
-}
-
-.arrangement-local {
-    padding: 8px;
-    border-radius: 12px;
-    border: 1px solid alpha(@accent_color, 0.7);
-    background-color: alpha(@accent_bg_color, 0.18);
-}
-
-.arrangement-tile {
-    padding: 6px 10px;
-    border-radius: 8px;
-    background-color: @card_bg_color;
-    border: 1px solid alpha(@borders, 0.8);
-}
-
-.arrangement-tile.active-peer {
-    border-color: @accent_color;
-    background-color: alpha(@accent_bg_color, 0.25);
-}

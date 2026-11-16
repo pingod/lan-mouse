@@ -146,11 +146,22 @@ Leave，所以即使重建失败也不会永久卡死。
 
 ## GUI：Screens 页（可视化编排）
 
-`lan-mouse-gtk/src/arrangement.rs` 画一个十字：中间是本机，四边是上/下/左/右四个
-拖放区，每台设备一个可拖拽的方块。把方块拖到另一条边就发
-`FrontendRequest::UpdatePosition`（和 Devices 页的下拉框是同一条路径），所以拖动后
-配置立刻落盘、Devices 页下拉框同步；反过来 CLI `set-position` / 下拉框改动也会
-即时重画（`window.rs` 的 `refresh_arrangement` 在 new/delete/update_config 三处调用）。
+`lan-mouse-gtk/src/arrangement.rs` 是一个自绘的画布（`gtk::DrawingArea` + cairo），
+按 Synergy 3 的屏幕编辑器做的：点阵背景、圆角屏幕卡片（显示器图标 + 主机名 + 边标签
+药丸 + 右上角三点菜单）、相邻屏幕之间用粗连线表示"可达"，本机用强调色描边。
+
+- 拖动卡片到本机的某条边就发 `FrontendRequest::UpdatePosition`（和 Devices 页下拉框
+  同一条路径），配置立刻落盘；CLI `set-position` / 下拉框改动也会即时重画
+  （`window.rs` 的 `refresh_arrangement` 在 new/delete/update_config 三处调用）。
+- 卡片右上角的三点在**捕获阶段**被 `GestureClick` 认领，弹出 "Move to the left/right/
+  top/bottom" 菜单；按在卡片其它位置则落到 `GestureDrag` 上，拖动时实时高亮将要吸附
+  的那条边。
+- 布局按卡片数量自适应：`State::fit` 计算整体包围盒，用 `scale`/`origin` 把它缩放居中
+  画进画布，所以一条边上挂很多台设备也不会跑出面板。
+- 颜色不查 style context（`gtk_style_context_lookup_color` 已废弃、`WidgetExt::color`
+  需要 gtk4 的 `v4_10` feature，本仓库只开 `v4_2`），改用
+  `adw::StyleManager::default().is_dark()` 选两套固定配色。
+- 文字用 cairo toy API（`select_font_face` + `show_text`）绘制，不引入 pangocairo。
 
 模型限制：一台设备只能占一条边；多条边共用的场景下按 `position_map` 的既有顺序
-由"先在列表里出现的那台"接管，页面上就是把多个方块并排画在同一格里。
+由"先在列表里出现的那台"接管，页面上就是把多个方块并排画在同一个方向上。
