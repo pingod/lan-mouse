@@ -631,16 +631,21 @@ impl CaptureTask {
             })
             .collect::<Vec<_>>();
         clients.sort_by_key(|(_, handle, _)| *handle);
-        /* a link whose monitor is gone takes part in the resolution as a link that
+        /* A link whose monitor is gone takes part in the resolution as a link that
          * asked for nothing, so the others are not narrowed by a range that cannot
-         * be placed */
-        let requested: Vec<EdgeRange> = clients
+         * be placed. `EdgeRange::resolve` answers in the same order it was given, so
+         * walking both lists together keeps every answer with its owner. */
+        let placed = clients
             .iter()
-            .filter_map(|(_, _, range)| *range)
+            .filter(|(_, _, bounds)| bounds.is_some())
+            .map(|(_, _, bounds)| bounds.expect("filtered"))
             .collect::<Vec<_>>();
-        let mut effective = EdgeRange::resolve(&requested).into_iter();
+        let mut resolved = EdgeRange::resolve(&placed).into_iter();
         for (index, _, bounds) in &clients {
-            let range = bounds.and_then(|_| effective.next().flatten());
+            let range = match bounds {
+                Some(_) => resolved.next().flatten(),
+                None => None,
+            };
             self.captures[*index].effective = range;
             let display = self.captures[*index].display.clone();
             self.captures[*index].effective_own =
