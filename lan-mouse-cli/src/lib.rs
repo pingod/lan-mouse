@@ -90,6 +90,15 @@ enum CliSubcommand {
     SetPort { id: ClientHandle, port: u16 },
     /// set position
     SetPosition { id: ClientHandle, pos: Position },
+    /// Publish an arrangement as if the canvas had drawn it.
+    ///
+    /// The window normally does this; the command exists to check the transport
+    /// without one, which is the difference between "the picture never arrived" and
+    /// "the picture arrived and was not used".
+    PublishArrangement {
+        /// the encoded arrangement, see `Arrangement::encode`
+        arrangement: String,
+    },
     /// set the part of its edge a client is reached through, and the part of the
     /// client's edge the cursor lands in
     SetEdge {
@@ -298,6 +307,11 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         CliSubcommand::SetPosition { id, pos } => {
             ensure_client_exists(&mut rx, &mut tx, id).await?;
             tx.request(FrontendRequest::UpdatePosition(id, pos)).await?
+        }
+        CliSubcommand::PublishArrangement { arrangement } => {
+            tx.request(FrontendRequest::PublishArrangement { arrangement })
+                .await?;
+            println!("published");
         }
         CliSubcommand::SetEdge {
             id,
