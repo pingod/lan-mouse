@@ -47,16 +47,56 @@ pub(crate) struct KeySample {
     pub value: u32,
 }
 
+/// Why hotkeys are not working, when they are not.
+///
+/// The distinction matters because the two causes need different fixes, and the
+/// old message ("add this user to the `input` group") was wrong for the common
+/// one: a desktop that grants `/dev/uinput` through a udev rule or an ACL but
+/// never touched `/dev/input/event*` gives the daemon working emulation and
+/// silent hotkeys, and telling the user to change their group membership is a
+/// much bigger ask than the real fix.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyboardAccess {
+    /// at least one keyboard was opened
+    Ok,
+    /// keyboards exist but every one of them was denied
+    Denied,
+    /// no keyboard device was found at all
+    NoneFound,
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl KeyboardAccess {
+    /// What to tell the user, with the fix that actually applies.
+    pub(crate) fn advice(self) -> Option<&'static str> {
+        match self {
+            KeyboardAccess::Ok => None,
+            KeyboardAccess::Denied => Some(
+                "hotkeys need read access to /dev/input/event*: \
+                 either add this user to the `input` group and re-login, \
+                 or install a udev rule that grants it (see README, \
+                 \"Global hotkeys on Linux\"). Until then hotkeys are inactive; \
+                 input capture and emulation are unaffected.",
+            ),
+            KeyboardAccess::NoneFound => Some(
+                "hotkeys configured but no keyboard device was found under /dev/input; \
+                 if this is a container, /dev/input is probably not passed through",
+            ),
+        }
+    }
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 /// Open every keyboard device under `/dev/input`.
 ///
-/// Devices the process cannot read are skipped with a warning rather than
-/// failing the whole feature: a missing permission on one keyboard should not
-/// disable hotkeys for the others.
-pub(crate) fn open_keyboards() -> Vec<(PathBuf, AsyncFd<File>)> {
+/// Devices the process cannot read are skipped rather than failing the whole
+/// feature: a missing permission on one keyboard should not disable hotkeys for
+/// the others.
+pub(crate) fn open_keyboards() -> (Vec<(PathBuf, AsyncFd<File>)>, KeyboardAccess) {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir("/dev/input") else {
-        return out;
+        return (out, KeyboardAccess::NoneFound);
     };
     let mut paths: Vec<PathBuf> = entries
         .flatten()
@@ -69,16 +109,31 @@ pub(crate) fn open_keyboards() -> Vec<(PathBuf, AsyncFd<File>)> {
         .collect();
     paths.sort();
 
+    let mut keyboards = 0usize;
+    let mut denied = 0usize;
     for path in paths {
         if !is_keyboard(&path) {
             continue;
         }
+        keyboards += 1;
         match open_device(&path) {
             Ok(dev) => out.push((path, dev)),
-            Err(e) => log::debug!("hotkeys: skipping {}: {e}", path.display()),
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    denied += 1;
+                }
+                log::debug!("hotkeys: skipping {}: {e}", path.display());
+            }
         }
     }
-    out
+    let access = if !out.is_empty() {
+        KeyboardAccess::Ok
+    } else if denied > 0 || keyboards > 0 {
+        KeyboardAccess::Denied
+    } else {
+        KeyboardAccess::NoneFound
+    };
+    (out, access)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -346,6 +401,27 @@ pub(crate) fn tap_events(keys: &[u32]) -> Vec<Event> {
 mod tests {
     use super::*;
     use input_event::scancode;
+
+    /// The two ways hotkeys can be unavailable need different fixes, and the old
+    /// message gave the group-membership advice for both.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn the_advice_names_the_reason_it_was_given() {
+        assert_eq!(KeyboardAccess::Ok.advice(), None);
+
+        let denied = KeyboardAccess::Denied.advice().expect("advice");
+        assert!(denied.contains("input"), "{denied}");
+        assert!(denied.contains("udev"), "{denied}");
+        // it must not claim the feature is broken as a whole
+        assert!(denied.contains("unaffected"), "{denied}");
+
+        let none = KeyboardAccess::NoneFound.advice().expect("advice");
+        assert!(none.contains("no keyboard device"), "{none}");
+        // the container case is the one this actually happens in
+        assert!(none.contains("container"), "{none}");
+        // and it must not repeat the group advice, which cannot help here
+        assert!(!none.contains("re-login"), "{none}");
+    }
     use input_event::scancode::Linux::*;
 
     fn press(key: scancode::Linux) -> KeySample {

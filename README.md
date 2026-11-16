@@ -484,6 +484,33 @@ lan-mouse cli screens          # what each edge is covered by, and where the wal
 lan-mouse cli set-edge 0 --edge 0.0,0.6
 ```
 
+### Global hotkeys on Linux
+
+A `[[hotkey]]` rule fires while the pointer is still on this machine, so it cannot
+ride on the capture backend: lan-mouse reads `/dev/input/event*` directly. That
+read is passive - nothing is grabbed, the local machine still sees the keys - but
+the devices are `root:input 0660`, so an unprivileged daemon cannot open them.
+
+Grant the access with the udev rule (recommended):
+
+```sh
+sudo install -m 644 packaging/70-lan-mouse.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+or add yourself to the `input` group and log back in:
+
+```sh
+sudo usermod -aG input "$USER"
+```
+
+The rule is the narrower grant: the group exposes every input device to every
+process you run, while the rule only adds an ACL for the logged-in user.
+
+Input capture and emulation do **not** need either - they go through the portal.
+Without the access the daemon logs `hotkeys are inactive: ...` and everything else
+keeps working.
+
 Edge crossing can be made harder to trigger:
 
 ```toml

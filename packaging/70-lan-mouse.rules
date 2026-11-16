@@ -1,0 +1,23 @@
+# Read access to the raw keyboard devices, so global hotkeys work.
+#
+# lan-mouse reads /dev/input/event* passively to notice a hotkey chord while the
+# pointer is still local. Reading needs no grab, so nothing is intercepted, but
+# the nodes are root:input 0660 by default and an unprivileged daemon cannot open
+# them.
+#
+# Installing this rule is an alternative to adding the user to the `input` group.
+# The group is a permanent, broad grant: it also exposes every other input device
+# to every process that user runs. The rule grants exactly the access hotkeys
+# need.
+#
+# The tag makes systemd-logind apply the ACL to the logged-in user, which is what
+# lets the rule work without knowing the user name. Desktops that already ship a
+# rule like this (some do for /dev/uinput only) still need this one for
+# /dev/input.
+#
+#     sudo install -m 644 packaging/70-lan-mouse.rules /etc/udev/rules.d/
+#     sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# Re-plug a keyboard, or log out and back in, for the ACL to be applied.
+
+KERNEL=="event*", SUBSYSTEM=="input", TAG+="uaccess"

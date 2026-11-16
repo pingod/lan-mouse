@@ -165,12 +165,15 @@ mod imp {
         fn spawn_readers(
             key_tx: mpsc::UnboundedSender<KeySample>,
         ) -> Vec<tokio::task::JoinHandle<()>> {
-            let devices = hotkey::open_keyboards();
-            if devices.is_empty() {
-                log::warn!(
-                    "hotkeys configured but no readable keyboard found; \
-                     add this user to the `input` group and re-login"
-                );
+            let (devices, access) = hotkey::open_keyboards();
+            if let Some(advice) = access.advice() {
+                /* A warning, not an error: hotkeys are one feature and the rest
+                 * of the daemon works without them. The message names the fix
+                 * that applies to the reason that was actually detected - the
+                 * old text told everybody to change their group membership, which
+                 * is the wrong advice on a desktop that only ever granted
+                 * /dev/uinput. */
+                log::warn!("hotkeys are inactive: {advice}");
                 return Vec::new();
             }
             log::info!("hotkeys: listening on {} keyboard device(s)", devices.len());
