@@ -1,3 +1,4 @@
+mod arrangement;
 mod authorization_window;
 mod client_object;
 mod client_row;

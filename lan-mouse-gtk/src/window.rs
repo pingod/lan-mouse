@@ -16,8 +16,8 @@ use lan_mouse_ipc::{
 };
 
 use crate::{
-    authorization_window::AuthorizationWindow, fingerprint_window::FingerprintWindow,
-    key_object::KeyObject, key_row::KeyRow,
+    arrangement::Machine, authorization_window::AuthorizationWindow,
+    fingerprint_window::FingerprintWindow, key_object::KeyObject, key_row::KeyRow,
 };
 
 use super::{client_object::ClientObject, client_row::ClientRow};
@@ -281,6 +281,44 @@ impl Window {
         row
     }
 
+    /// Redraw the visual arrangement from the client store. Called from every
+    /// place that can change a peer (a new snapshot entry, a position change or
+    /// an activation), so the grid never shows stale edges.
+    fn refresh_arrangement(&self) {
+        let machines = self
+            .clients()
+            .iter::<ClientObject>()
+            .filter_map(|client| client.ok())
+            .map(|client| {
+                let data = client.get_data();
+                Machine {
+                    handle: client.handle(),
+                    hostname: data
+                        .hostname
+                        .filter(|hostname| !hostname.is_empty())
+                        .unwrap_or_else(|| "unknown host".to_string()),
+                    position: data.position.parse().unwrap_or_default(),
+                    active: data.active,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let local_hostname = self.imp().hostname_label.text().to_string();
+        crate::arrangement::rebuild(
+            &self.imp().arrangement_box,
+            &local_hostname,
+            &machines,
+            clone!(
+                #[weak(rename_to = window)]
+                self,
+                move |handle: ClientHandle, position: Position| {
+                    log::debug!("request: moving client {handle} to the {position} edge");
+                    window.request(FrontendRequest::UpdatePosition(handle, position));
+                }
+            ),
+        );
+    }
+
     pub(super) fn new_client(
         &self,
         handle: ClientHandle,
@@ -293,6 +331,7 @@ impl Window {
 
         self.update_dns_state(handle, !state.ips.is_empty());
         self.update_active_device_row();
+        self.refresh_arrangement();
     }
 
     pub(super) fn update_client_list(
@@ -682,6 +721,7 @@ impl Window {
         if self.clients().n_items() == 0 {
             self.update_placeholder_visibility();
         }
+        self.refresh_arrangement();
     }
 
     pub(super) fn update_client_config(&self, handle: ClientHandle, client: ClientConfig) {
@@ -692,6 +732,7 @@ impl Window {
         row.set_hostname(client.hostname);
         row.set_port(client.port);
         row.set_position(client.pos);
+        self.refresh_arrangement();
     }
 
     pub(super) fn update_client_state(&self, handle: ClientHandle, state: ClientState) {

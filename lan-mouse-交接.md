@@ -143,3 +143,14 @@ Leave，所以即使重建失败也不会永久卡死。
 
 锁屏时日志会出现：`releasing capture: input stream interrupted by the compositor`
 或 `capture stream ended — releasing before restarting it`
+
+## GUI：Screens 页（可视化编排）
+
+`lan-mouse-gtk/src/arrangement.rs` 画一个十字：中间是本机，四边是上/下/左/右四个
+拖放区，每台设备一个可拖拽的方块。把方块拖到另一条边就发
+`FrontendRequest::UpdatePosition`（和 Devices 页的下拉框是同一条路径），所以拖动后
+配置立刻落盘、Devices 页下拉框同步；反过来 CLI `set-position` / 下拉框改动也会
+即时重画（`window.rs` 的 `refresh_arrangement` 在 new/delete/update_config 三处调用）。
+
+模型限制：一台设备只能占一条边；多条边共用的场景下按 `position_map` 的既有顺序
+由"先在列表里出现的那台"接管，页面上就是把多个方块并排画在同一格里。

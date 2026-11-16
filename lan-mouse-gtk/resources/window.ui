@@ -320,6 +320,37 @@
                   </object>
                 </child>
 
+                <!-- ─────────────── Screens ─────────────── -->
+                <child>
+                  <object class="AdwViewStackPage">
+                    <property name="name">screens</property>
+                    <property name="title" translatable="yes">Screens</property>
+                    <property name="icon-name">video-display-symbolic</property>
+                    <property name="child">
+                      <object class="AdwPreferencesPage">
+                        <property name="title" translatable="yes">Screens</property>
+                        <property name="icon-name">video-display-symbolic</property>
+                        <child>
+                          <object class="AdwPreferencesGroup">
+                            <property name="title" translatable="yes">Arrangement</property>
+                            <property name="description" translatable="yes">Drag a machine onto an edge of this screen. The pointer crosses the edge you drop it on, and machines sharing an edge release the pointer in list order.</property>
+                            <child>
+                              <object class="GtkBox" id="arrangement_box">
+                                <property name="orientation">vertical</property>
+                                <property name="spacing">14</property>
+                                <property name="margin-top">18</property>
+                                <property name="margin-bottom">18</property>
+                                <property name="margin-start">12</property>
+                                <property name="margin-end">12</property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                      </object>
+                    </property>
+                  </object>
+                </child>
+
                 <!-- ─────────────── Settings ─────────────── -->
                 <child>
                   <object class="AdwViewStackPage">

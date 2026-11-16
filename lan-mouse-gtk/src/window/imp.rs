@@ -50,6 +50,8 @@ pub struct Window {
     #[template_child]
     pub hotkey_placeholder_row: TemplateChild<ActionRow>,
     #[template_child]
+    pub arrangement_box: TemplateChild<gtk::Box>,
+    #[template_child]
     pub release_bind_entry: TemplateChild<gtk::Entry>,
     #[template_child]
     pub version_row: TemplateChild<ActionRow>,
