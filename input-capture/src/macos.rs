@@ -1022,7 +1022,7 @@ impl MacOSInputCapture {
 
         let task_error_tx = task_event_tx.clone();
         /* the task owns a handle of its own: `state` itself is kept for the struct,
-         * because `screen_size()` and `create`/`update` read the same state from
+         * because `layout()` and `create`/`update` read the same state from
          * outside the task */
         let task_state = Arc::clone(&state);
         let _tap_task: tokio::task::JoinHandle<()> = tokio::task::spawn_local(async move {

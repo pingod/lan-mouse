@@ -8,6 +8,7 @@ use std::task::ready;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use super::{Capture, CaptureError, CaptureEvent, EdgeRange, Position};
+use input_event::{DisplayInfo, Layout, Rotation};
 
 mod display_util;
 mod event_thread;
@@ -39,8 +40,23 @@ impl Capture for WindowsInputCapture {
         Ok(())
     }
 
-    async fn screen_size(&mut self) -> Option<(u32, u32)> {
-        event_thread::screen_size()
+    async fn layout(&mut self) -> Option<Layout> {
+        /* Windows reports the bounding box of the desktop, not the individual
+         * monitors: `SCREEN_SIZE` is what the event thread keeps up to date and it is
+         * packed from `layout_bounds`. One `DisplayInfo` covering that box is what this
+         * backend can honestly say - it is the area the pointer can reach, which is what
+         * the edge ranges are measured against. Reporting per-monitor rectangles here
+         * would mean reading the enumerated list across threads, and a wrong rectangle
+         * is worse than a coarse one. */
+        let (width, height) = event_thread::screen_size()?;
+        Some(Layout::new(vec![DisplayInfo::new(
+            "desktop",
+            0,
+            0,
+            width,
+            height,
+            Rotation::Normal,
+        )]))
     }
 
     async fn begin(&mut self, _pos: Position) -> Result<(), CaptureError> {
