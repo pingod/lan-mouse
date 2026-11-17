@@ -604,6 +604,7 @@ impl Service {
                 self.notify_frontend(FrontendEvent::Paused(self.paused));
                 let secs = self.restart_interval.map(|d| d.as_secs());
                 self.notify_frontend(FrontendEvent::RestartInterval(secs));
+                self.notify_scroll_smoothing();
             }
             FrontendRequest::EnableCapture => self.capture.reenable(),
             FrontendRequest::EnableEmulation => self.emulation.reenable(),
@@ -673,6 +674,10 @@ impl Service {
             FrontendRequest::RemoveRemap(idx) => self.remove_remap(idx),
             FrontendRequest::EnumerateVersion => self.notify_version(),
             FrontendRequest::SetAutostart(enabled) => self.set_autostart(enabled),
+            FrontendRequest::SetScrollSmoothing {
+                enabled,
+                duration_ms,
+            } => self.set_scroll_smoothing(enabled, duration_ms),
         }
     }
 
@@ -896,6 +901,26 @@ impl Service {
         });
     }
 
+    /// Apply and persist a smoothing toggle from the frontend.
+    ///
+    /// The emulation backend reads the configuration only once, but the
+    /// smoothing queue lives in `InputEmulation`, so this takes effect while a
+    /// peer is connected: no reconnect and no lost keys.
+    fn set_scroll_smoothing(&mut self, enabled: bool, duration_ms: u64) {
+        self.config.set_scroll_smoothing(enabled, duration_ms);
+        self.save_config();
+        self.emulation
+            .set_scroll_smoothing(self.config.scroll_smoothing());
+        self.notify_scroll_smoothing();
+    }
+
+    fn notify_scroll_smoothing(&mut self) {
+        self.notify_frontend(FrontendEvent::ScrollSmoothing {
+            enabled: self.config.scroll_smoothing_enabled(),
+            duration_ms: self.config.scroll_smoothing_duration_ms(),
+        });
+    }
+
     fn set_autostart(&mut self, enabled: bool) {
         match crate::autostart::set_enabled(enabled) {
             Ok(()) => {
@@ -958,6 +983,10 @@ impl Service {
         self.capture.set_release_bind(release_bind);
         self.capture.set_remap_rules(self.config.remap_rules());
         self.hotkeys.reload(&self.config);
+        /* the smoothing queue lives in the emulation layer, so a value edited in
+         * the file applies now instead of at the next service start */
+        self.emulation
+            .set_scroll_smoothing(self.config.scroll_smoothing());
         let authorized_keys = self.config.authorized_fingerprints();
         self.authorized_keys
             .write()
@@ -1227,6 +1256,7 @@ impl Service {
         // commands travel on their own inside each client's configuration.
         self.notify_remap();
         self.notify_switch_options();
+        self.notify_scroll_smoothing();
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;

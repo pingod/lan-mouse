@@ -88,6 +88,7 @@ enum EmulationRequest {
     Disable,
     Release(SocketAddr),
     ChangePort(u16),
+    SetScrollSmoothing(input_emulation::ScrollSmoothing),
     Terminate,
 }
 
@@ -126,6 +127,13 @@ impl Emulation {
     /// Stop emulating input until [`Self::reenable`].
     pub(crate) fn disable(&self) {
         let _ = self.request_tx.send(EmulationRequest::Disable);
+    }
+
+    /// Change receiver-side wheel smoothing without restarting the backend.
+    pub(crate) fn set_scroll_smoothing(&self, smoothing: input_emulation::ScrollSmoothing) {
+        let _ = self
+            .request_tx
+            .send(EmulationRequest::SetScrollSmoothing(smoothing));
     }
 
     pub(crate) fn request_port_change(&self, port: u16) {
@@ -272,6 +280,9 @@ impl ListenTask {
                     // reenable emulation
                     Some(EmulationRequest::Reenable) => self.emulation_proxy.reenable(),
                     Some(EmulationRequest::Disable) => self.emulation_proxy.disable(),
+                    Some(EmulationRequest::SetScrollSmoothing(smoothing)) => {
+                        self.emulation_proxy.set_scroll_smoothing(smoothing)
+                    }
                     // notify the other end that we hit a barrier (should release capture)
                     Some(EmulationRequest::Release(addr)) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
                     Some(EmulationRequest::ChangePort(port)) => {
@@ -324,6 +335,8 @@ enum ProxyRequest {
     /// middle of this screen.
     CenterCursor(SocketAddr),
     Remove(SocketAddr),
+    /// replace the wheel smoothing configuration while the session runs
+    SetScrollSmoothing(input_emulation::ScrollSmoothing),
     Terminate,
     Reenable,
     /// drop every handle so nothing is injected until `Reenable`
@@ -397,6 +410,12 @@ impl EmulationProxy {
         let _ = self.request_tx.send(ProxyRequest::Disable);
     }
 
+    fn set_scroll_smoothing(&self, smoothing: input_emulation::ScrollSmoothing) {
+        let _ = self
+            .request_tx
+            .send(ProxyRequest::SetScrollSmoothing(smoothing));
+    }
+
     async fn terminate(&mut self) {
         self.exit_requested.replace(true);
         send_event(&self.request_tx, ProxyRequest::Terminate);
@@ -444,6 +463,7 @@ impl EmulationTask {
                     Some(ProxyRequest::Enter(..)) => { /* emulation inactive => ignore */ }
                     Some(ProxyRequest::CenterCursor(..)) => { /* inactive => ignore */ }
                     Some(ProxyRequest::Remove(..)) => { /* emulation inactive => ignore */ }
+                    Some(ProxyRequest::SetScrollSmoothing(smoothing)) => self.smoothing = smoothing,
                     Some(ProxyRequest::Disable) => { /* already inactive */ }
                 }
             }
@@ -571,6 +591,10 @@ impl EmulationTask {
                     }
                     Some(ProxyRequest::Terminate) => break Ok(()),
                     Some(ProxyRequest::Reenable) => continue,
+                    Some(ProxyRequest::SetScrollSmoothing(smoothing)) => {
+                        self.smoothing = smoothing;
+                        emulation.set_scroll_smoothing(smoothing);
+                    }
                     Some(ProxyRequest::Disable) => {
                         // Drop every handle so a resumed session starts clean;
                         // the peer keeps sending until it leaves, and those
@@ -611,7 +635,8 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             Some(ProxyRequest::Input(_, _)) => continue,
             Some(ProxyRequest::Enter(..)) => continue,
             Some(ProxyRequest::CenterCursor(_)) => continue,
-            Some(ProxyRequest::Remove(_)) => continue,
+            Some(ProxyRequest::Remove(..)) => continue,
+            Some(ProxyRequest::SetScrollSmoothing(_)) => continue,
             Some(ProxyRequest::Reenable) => continue,
             Some(ProxyRequest::Disable) => continue,
         }

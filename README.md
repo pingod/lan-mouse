@@ -558,8 +558,8 @@ The receiver turns each notch into pixel-precise deltas over that duration, with
 an ease-out curve; the first step is still immediate and a direction change drops
 the unfinished tail. It only applies to backends that can inject continuous
 scroll (wlroots, libei, xdg-desktop-portal and macOS); X11 and Windows only know
-wheel buttons, so they keep discrete scrolling. Read at startup, so restart the
-service after changing it.
+wheel buttons, so they keep discrete scrolling. Also available as a switch with a
+duration field in Settings; changes apply immediately, no restart required.
 
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)

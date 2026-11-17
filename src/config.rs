@@ -645,18 +645,36 @@ impl Config {
 
     /// Receiver-side wheel smoothing: spread each notch over a short animation.
     ///
-    /// Read at startup; the backend has to be recreated to change it. `duration`
-    /// is clamped by [`input_emulation::ScrollSmoothing`], so a bad config file
+    /// Applies immediately when toggled through the frontend; `duration` is
+    /// clamped by [`input_emulation::ScrollSmoothing`], so a bad config file
     /// cannot make the wheel unusable.
     pub fn scroll_smoothing(&self) -> input_emulation::ScrollSmoothing {
-        let toml = self.config_toml.as_ref();
-        if !toml.and_then(|c| c.scroll_smoothing).unwrap_or(false) {
+        if !self.scroll_smoothing_enabled() {
             return input_emulation::ScrollSmoothing::OFF;
         }
-        input_emulation::ScrollSmoothing::from_millis(
-            toml.and_then(|c| c.scroll_smoothing_duration)
-                .unwrap_or(120),
-        )
+        input_emulation::ScrollSmoothing::from_millis(self.scroll_smoothing_duration_ms())
+    }
+
+    pub fn scroll_smoothing_enabled(&self) -> bool {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.scroll_smoothing)
+            .unwrap_or(false)
+    }
+
+    pub fn scroll_smoothing_duration_ms(&self) -> u64 {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.scroll_smoothing_duration)
+            .map(|ms| ms.clamp(20, 1000))
+            .unwrap_or(120)
+    }
+
+    /// Store the smoothing choice; the caller persists the file.
+    pub fn set_scroll_smoothing(&mut self, enabled: bool, duration_ms: u64) {
+        let config = self.toml_mut();
+        config.scroll_smoothing = Some(enabled);
+        config.scroll_smoothing_duration = Some(duration_ms.clamp(20, 1000));
     }
 
     /// Edge-crossing thresholds: how close to an edge the pointer has to behave

@@ -7,7 +7,7 @@ release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 port = 4242
 
 # Spread each wheel notch over a short animation on the receiving side, so
-# scrolling glides like a trackpad. Off by default; read at startup.
+# scrolling glides like a trackpad. Off by default; also in Settings.
 # scroll_smoothing = true
 # Duration of one notch in milliseconds (clamped to 20..1000, default 120).
 # scroll_smoothing_duration = 120

@@ -148,10 +148,26 @@ impl InputEmulation {
             Backend::MacOs => Box::new(macos::MacOSEmulation::new()?),
             Backend::Dummy => Box::new(dummy::DummyEmulation::new()),
         };
-        let smoothing = if !smoothing.is_on() {
+        let mut emulation = Self {
+            emulation,
+            handles: HashSet::new(),
+            pressed_keys: HashMap::new(),
+            smoothing: None,
+        };
+        emulation.set_scroll_smoothing(smoothing);
+        Ok(emulation)
+    }
+
+    /// Enable, disable or retime receiver-side wheel smoothing.
+    ///
+    /// Takes effect immediately: the backend itself is untouched, only the
+    /// queue that spreads notches over time is replaced. That is why the
+    /// daemon can toggle this while a peer is connected.
+    pub fn set_scroll_smoothing(&mut self, smoothing: ScrollSmoothing) {
+        self.smoothing = if !smoothing.is_on() {
             None
         } else {
-            match emulation.scroll_units_per_notch() {
+            match self.emulation.scroll_units_per_notch() {
                 Some(units_per_notch) => {
                     log::info!(
                         "scroll smoothing: {} ms per notch",
@@ -161,19 +177,13 @@ impl InputEmulation {
                 }
                 None => {
                     log::warn!(
-                        "scroll smoothing is enabled but the {backend} backend cannot \
-                         inject continuous scroll; wheel notches stay discrete"
+                        "scroll smoothing is enabled but this backend cannot inject \
+                         continuous scroll; wheel notches stay discrete"
                     );
                     None
                 }
             }
         };
-        Ok(Self {
-            emulation,
-            handles: HashSet::new(),
-            pressed_keys: HashMap::new(),
-            smoothing,
-        })
     }
 
     pub async fn new(

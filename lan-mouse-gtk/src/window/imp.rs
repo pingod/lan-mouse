@@ -75,6 +75,10 @@ pub struct Window {
     #[template_child]
     pub autostart_switch: TemplateChild<gtk::Switch>,
     #[template_child]
+    pub scroll_smoothing_switch: TemplateChild<gtk::Switch>,
+    #[template_child]
+    pub scroll_smoothing_duration: TemplateChild<gtk::SpinButton>,
+    #[template_child]
     pub pause_switch: TemplateChild<gtk::Switch>,
     #[template_child]
     pub restart_interval_entry: TemplateChild<gtk::Entry>,
@@ -109,6 +113,8 @@ pub struct Window {
     pub authorization_window: RefCell<Option<AuthorizationWindow>>,
     /// set while the autostart switch is being updated from the daemon
     pub autostart_updating: Cell<bool>,
+    /// set while the smoothing widgets are being updated from the daemon
+    pub scroll_smoothing_updating: Cell<bool>,
     /// set while the pause switch is being updated from the daemon
     pub pause_updating: Cell<bool>,
     pub log_buffer: RefCell<gtk::TextBuffer>,
@@ -179,6 +185,30 @@ impl Window {
         }
         let active = self.autostart_switch.is_active();
         self.obj().request_autostart(active);
+    }
+
+    #[template_callback]
+    fn handle_scroll_smoothing_toggled(&self, _param: glib::ParamSpec) {
+        if self.scroll_smoothing_updating.get() {
+            return;
+        }
+        let enabled = self.scroll_smoothing_switch.is_active();
+        self.scroll_smoothing_duration.set_sensitive(enabled);
+        self.obj().request_scroll_smoothing(
+            enabled,
+            self.scroll_smoothing_duration.value_as_int() as u64,
+        );
+    }
+
+    #[template_callback]
+    fn handle_scroll_smoothing_duration_changed(&self, _spin: &gtk::SpinButton) {
+        if self.scroll_smoothing_updating.get() {
+            return;
+        }
+        self.obj().request_scroll_smoothing(
+            self.scroll_smoothing_switch.is_active(),
+            self.scroll_smoothing_duration.value_as_int() as u64,
+        );
     }
 
     #[template_callback]

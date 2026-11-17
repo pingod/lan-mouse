@@ -459,6 +459,36 @@
                               </object>
                             </child>
                             <child>
+                              <object class="AdwActionRow" id="scroll_smoothing_row">
+                                <property name="title" translatable="yes">Smooth wheel scrolling</property>
+                                <property name="subtitle" translatable="yes">spread each notch over a short animation on this machine's receiver</property>
+                                <property name="icon-name">input-mouse-symbolic</property>
+                                <child>
+                                  <object class="GtkSpinButton" id="scroll_smoothing_duration">
+                                    <property name="valign">center</property>
+                                    <property name="width-chars">4</property>
+                                    <property name="tooltip-text" translatable="yes">milliseconds per notch</property>
+                                    <property name="adjustment">
+                                      <object class="GtkAdjustment">
+                                        <property name="lower">20</property>
+                                        <property name="upper">1000</property>
+                                        <property name="step-increment">10</property>
+                                        <property name="page-increment">100</property>
+                                        <property name="value">120</property>
+                                      </object>
+                                    </property>
+                                    <signal name="value-changed" handler="handle_scroll_smoothing_duration_changed" swapped="true"/>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkSwitch" id="scroll_smoothing_switch">
+                                    <property name="valign">center</property>
+                                    <signal name="notify::active" handler="handle_scroll_smoothing_toggled" swapped="true"/>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                            <child>
                               <object class="AdwActionRow" id="restart_interval_row">
                                 <property name="title" translatable="yes">Scheduled restart</property>
                                 <property name="subtitle" translatable="yes">restart every N seconds; empty disables it</property>

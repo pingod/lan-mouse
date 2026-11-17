@@ -478,6 +478,10 @@ fn build_ui(app: &Application) {
                         window.set_autostart(autostart);
                     }
                     FrontendEvent::Autostart(enabled) => window.set_autostart(enabled),
+                    FrontendEvent::ScrollSmoothing {
+                        enabled,
+                        duration_ms,
+                    } => window.set_scroll_smoothing(enabled, duration_ms),
                     FrontendEvent::Paused(paused) => window.set_paused(paused),
                     FrontendEvent::RestartInterval(secs) => window.set_restart_interval(secs),
                     /* The daemon narrowed an edge range because two machines

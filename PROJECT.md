@@ -102,7 +102,7 @@ to   = ["KeyLeftCtrl", "KeyInsert"]
 | `scroll_smoothing` | `true` 时接收端把每个滚轮刻度铺成一段动画（默认 `false`） |
 | `scroll_smoothing_duration` | 一个刻度的动画时长（毫秒，限制在 20–1000，默认 120） |
 
-滚轮平滑只在能注入连续滚动的后端生效（wlroots / libei / xdg-desktop-portal / macOS）；X11 和 Windows 只有滚轮按钮，仍按离散刻度注入。该设置在启动时读取，改完需要重启服务。
+滚轮平滑只在能注入连续滚动的后端生效（wlroots / libei / xdg-desktop-portal / macOS）；X11 和 Windows 只有滚轮按钮，仍按离散刻度注入。设置页有开关和时长输入框，改动立即生效（配置文件热重载同样会应用），不需要重启。
 
 `[[clients]]` 里除了 `position`、`hostname`、`ips`、`port`、`activate_on_startup`，还有两个区间：
 

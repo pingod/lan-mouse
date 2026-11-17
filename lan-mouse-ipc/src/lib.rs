@@ -360,6 +360,12 @@ pub enum FrontendEvent {
     },
     /// whether autostart is installed (sent after a toggle)
     Autostart(bool),
+    /// receiver-side wheel smoothing on this machine
+    ScrollSmoothing {
+        enabled: bool,
+        /// duration of one notch, in milliseconds
+        duration_ms: u64,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
@@ -493,6 +499,12 @@ pub enum FrontendRequest {
     EnumerateVersion,
     /// enable or disable starting with the session
     SetAutostart(bool),
+    /// enable/disable receiver-side wheel smoothing and set its duration
+    SetScrollSmoothing {
+        enabled: bool,
+        /// milliseconds per notch; clamped by the daemon
+        duration_ms: u64,
+    },
     /// re-read the configuration file now
     ReloadConfig,
     /// suspend or resume input capture and emulation without exiting

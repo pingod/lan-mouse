@@ -640,6 +640,23 @@ impl Window {
         self.request(FrontendRequest::SetAutostart(enabled));
     }
 
+    /// Mirror the daemon's smoothing state into the settings row.
+    pub(super) fn set_scroll_smoothing(&self, enabled: bool, duration_ms: u64) {
+        let imp = self.imp();
+        imp.scroll_smoothing_updating.set(true);
+        imp.scroll_smoothing_switch.set_active(enabled);
+        imp.scroll_smoothing_duration.set_value(duration_ms as f64);
+        imp.scroll_smoothing_duration.set_sensitive(enabled);
+        imp.scroll_smoothing_updating.set(false);
+    }
+
+    pub(super) fn request_scroll_smoothing(&self, enabled: bool, duration_ms: u64) {
+        self.request(FrontendRequest::SetScrollSmoothing {
+            enabled,
+            duration_ms,
+        });
+    }
+
     pub(super) fn set_paused(&self, paused: bool) {
         let imp = self.imp();
         imp.pause_updating.set(true);
